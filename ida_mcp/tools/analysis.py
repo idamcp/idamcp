@@ -78,12 +78,20 @@ def get_xrefs_from(
 @idaread
 def decompile_function(
     address: Annotated[str, "Address of the function to decompile"],
+    include_line_prefix: Annotated[
+        bool,
+        "Whether to include the line prefix (line numbers and addresses) in the"
+        " decompiled output",
+    ] = True,
 ) -> str:
   """Decompile a function at the given address."""
   start = helper.parse_and_check_ea(address)
   cfunc = helper.decompile_checked(start)
 
   sv = cfunc.get_pseudocode()
+  if not include_line_prefix:
+    return "\n".join(ida_lines.tag_remove(sl.line) for sl in sv)
+
   lines = []
   for i, sl in enumerate(sv):
     sl: ida_kernwin.simpleline_t

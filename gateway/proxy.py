@@ -70,6 +70,11 @@ async def decompile_function(
         " resource, or by opening a new database via idalib_headless_open.",
     ],
     address: Annotated[str, "Address of the function to decompile"],
+    include_line_prefix: Annotated[
+        bool,
+        "Whether to include the line prefix (line numbers and addresses) in the"
+        " decompiled output",
+    ] = True,
 ) -> str:
   """Decompile a function at the given address."""
   return await forward_to(database_id, "decompile_function", locals())
