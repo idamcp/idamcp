@@ -134,6 +134,9 @@ def decompile_function(
 def disassemble_code(
     address: Annotated[str, "Address to disassemble code"],
     count: Annotated[int, "Number of instructions to disassemble"] = 1,
+    include_bytes: Annotated[
+        bool, "Whether to include opcode bytes in the disassembly output"
+    ] = False,
 ) -> str:
   """Disassemble instructions starting at the given address.
 
@@ -171,8 +174,10 @@ def disassemble_code(
       else:
         label_text = name + ":"
 
-      label_line = f"{prefix}"
-      label_line += "             " + label_text
+      if include_bytes:
+        label_line = f"{prefix}" + "             " + label_text
+      else:
+        label_line = f"{prefix} {label_text}"
       lines.append(label_line)
     # Instruction line
     disasm = idc.generate_disasm_line(
@@ -180,27 +185,31 @@ def disassemble_code(
     )
     disasm = ida_lines.tag_remove(disasm)
 
-    # Get opcode bytes
-    opcode_bytes = ida_bytes.get_bytes(ea, length)
-    bytes_str = (
-        " ".join(f"{b:02X}" for b in opcode_bytes[:8])
-        if opcode_bytes[:8]
-        else ""
-    )
-
-    line_start = f"{prefix} {bytes_str}"
-    line = line_start + " " * max(1, 55 - len(line_start)) + disasm
-    lines.append(line)
-    opcode_bytes = opcode_bytes[8:]
-    while opcode_bytes:
+    if include_bytes:
+      # Get opcode bytes
+      opcode_bytes = ida_bytes.get_bytes(ea, length)
       bytes_str = (
           " ".join(f"{b:02X}" for b in opcode_bytes[:8])
           if opcode_bytes[:8]
           else ""
       )
+
       line_start = f"{prefix} {bytes_str}"
-      lines.append(line_start)
+      line = line_start + " " * max(1, 55 - len(line_start)) + disasm
+      lines.append(line)
       opcode_bytes = opcode_bytes[8:]
+      while opcode_bytes:
+        bytes_str = (
+            " ".join(f"{b:02X}" for b in opcode_bytes[:8])
+            if opcode_bytes[:8]
+            else ""
+        )
+        line_start = f"{prefix} {bytes_str}"
+        lines.append(line_start)
+        opcode_bytes = opcode_bytes[8:]
+    else:
+      line = prefix + " " * max(1, 40 - len(prefix)) + disasm
+      lines.append(line)
 
     ea += length
 
@@ -214,15 +223,13 @@ def disassemble_code(
     prefix = segment + f":{address_str}"
   else:
     prefix = "<unknown seg>" + f":{address_str}"
+  sep = "                         " if include_bytes else " "
   if failed:
-    lines.append(
-        prefix
-        + f"                         ; Failed to disassemble at address {ea:#x}"
-    )
+    lines.append(prefix + f"{sep}; Failed to disassemble at address {ea:#x}")
   lines.append(
       prefix
-      + "                         "
-      "; ------------------------------------------------------------------"
+      + f"{sep};"
+      " ------------------------------------------------------------------"
   )
   return "\n".join(lines)
 
@@ -292,6 +299,9 @@ def _get_ida_view(start_ea: "idaapi.ea_t", end_ea: "idaapi.ea_t") -> str:
 def get_ida_view(
     start_ea: Annotated[str, "Start address of the view"],
     end_ea: Annotated[str, "End address of the view"],
+    include_bytes: Annotated[
+        bool, "Whether to include opcode or data bytes in the view output"
+    ] = False,
 ) -> str:
   """Retrieves the formatted text view directly from IDA Pro's 'IDA View-A'.
 
@@ -321,8 +331,8 @@ def get_ida_view(
     # We accept this edge case
     end_addr += 1
 
-  helper.enable_showing_opcode_internal()
-  return _get_ida_view(start_addr, end_addr)
+  with helper.set_showing_opcode_internal(include_bytes):
+    return _get_ida_view(start_addr, end_addr)
 
 
 def _get_func_block_ranges(
@@ -344,6 +354,9 @@ def _get_func_block_ranges(
 @idaread
 def disassemble_function(
     address: Annotated[str, "Address of the function to disassemble"],
+    include_bytes: Annotated[
+        bool, "Whether to include opcode bytes in the disassembly output"
+    ] = False,
 ) -> str:
   """Get assembly code for a function (API-compatible with older IDA builds)."""
   ea = helper.parse_and_check_ea(address)
@@ -355,12 +368,12 @@ def disassemble_function(
         " disassemble"
     )
 
-  helper.enable_showing_opcode_internal()
   func_text = []
-  for start_ea, end_ea in addr_range:
-    text = _get_ida_view(start_ea, end_ea)
-    if text:
-      func_text.append(text)
+  with helper.set_showing_opcode_internal(include_bytes):
+    for start_ea, end_ea in addr_range:
+      text = _get_ida_view(start_ea, end_ea)
+      if text:
+        func_text.append(text)
 
   if func_text:
     return "\n".join(func_text)

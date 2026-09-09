@@ -1009,7 +1009,7 @@ def dump_ida_view() -> dict:
       (0x40E0, 0x40EE),
   ]
 
-  # Replicate helper.enable_showing_opcode_internal using modern API
+  # Set OPCODE_BYTES=8 to dump with opcode bytes
   old_size = ida_ida.inf_get_bin_prefix_size()
   if old_size != 8:
     ida_idp.process_config_directive("OPCODE_BYTES=8")

@@ -422,34 +422,19 @@ def get_prototype(fn: "idaapi.func_t") -> str | None:
   return None
 
 
-def enable_showing_opcode_internal() -> None:
-  """Enable showing opcode bytes in disassembly."""
-  config = load_config()
-  if not config["set_opcode_bytes"]:
-    return
-
-  n = config["opcode_bytes"]
-  if ida_ida.inf_get_bin_prefix_size() != n:
-    # Caveat: ida_ida.inf_set_bin_prefix_size does not trigger update to the
-    # disasrm view, we have to use the proces_config_directive to update the
-    # setting.
-    ida_idp.process_config_directive(f"OPCODE_BYTES={n}")
-
-
-@idaread
-def enable_showing_opcode() -> None:
-  """Enable showing opcode bytes in disassembly.
-
-  OPCODE_BYTES            = 8
-
-  display this many instruction/data bytes:
-     0 = disable
-     N = up to N bytes on one line; go to next line to show remaining bytes
-    -N = up to N bytes on one line; truncate remaining bytes
-  The 'default' configuration in the registry may
-  override this value
-  """
-  enable_showing_opcode_internal()
+@contextlib.contextmanager
+def set_showing_opcode_internal(enabled: bool = False):
+  """Context manager to set showing opcode bytes and restore original setting on exit."""
+  orig_size = ida_ida.inf_get_bin_prefix_size()
+  target_size = load_config()["opcode_bytes"] if enabled else 0
+  if orig_size == target_size:
+    yield
+  else:
+    ida_idp.process_config_directive(f"OPCODE_BYTES={target_size}")
+    try:
+      yield
+    finally:
+      ida_idp.process_config_directive(f"OPCODE_BYTES={orig_size}")
 
 
 __all__ = [
@@ -459,8 +444,7 @@ __all__ = [
     "compile_regex",
     "convert_regex_flags",
     "decompile_checked",
-    "enable_showing_opcode",
-    "enable_showing_opcode_internal",
+    "set_showing_opcode_internal",
     "get_ida_version",
     "get_image_size",
     "get_prototype",

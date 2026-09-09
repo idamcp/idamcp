@@ -42,7 +42,6 @@ _DEFAULT_CONFIG = {
     "enable_all_unsafe_tools": False,
     "enabled_unsafe_tools": [],
     "opcode_bytes": 8,
-    "set_opcode_bytes": True,
     "populate_tables_on_startup": False,
     "sqlite_persistent": False,
     "check_entries_freshness": False,

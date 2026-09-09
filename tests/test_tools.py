@@ -1154,9 +1154,26 @@ hex(tid) if tid is not None else ""
     with open(golden_path, "r") as f:
       golden = json.load(f)["disasm"]["0x1240_2"]
 
+    # Explicit include_bytes=True matches golden
+    result_with_bytes = await self.run_tool(
+        "disassemble_code", address="0x1240", count=2, include_bytes=True
+    )
+    self.assertEqual(result_with_bytes, golden)
+
+    # Default include_bytes is False
     result = await self.run_tool("disassemble_code", address="0x1240", count=2)
     self.assertIsInstance(result, str)
-    self.assertEqual(result, golden)
+    self.assertIn("_Z11caller_funci:", result)
+    self.assertIn("push    rbp", result)
+    self.assertIn("mov     rbp, rsp", result)
+    self.assertNotIn(" 55 ", result)
+    self.assertNotIn(" 48 89 E5 ", result)
+
+    # Explicit include_bytes=False matches default
+    result_no_bytes = await self.run_tool(
+        "disassemble_code", address="0x1240", count=2, include_bytes=False
+    )
+    self.assertEqual(result_no_bytes, result)
 
   async def verify_disassemble_function(self):
     # Load golden data (callee_func is 0x11e0 to 0x1208)
@@ -1164,9 +1181,31 @@ hex(tid) if tid is not None else ""
     with open(golden_path, "r") as f:
       golden = json.load(f)["disassemble_function"]["0x11e0"]
 
+    # Explicit include_bytes=True matches golden
+    result_with_bytes = await self.run_tool(
+        "disassemble_function", address="0x11e0", include_bytes=True
+    )
+    self.assertEqual(normalize_text(result_with_bytes), normalize_text(golden))
+
+    # Default include_bytes is False
     result = await self.run_tool("disassemble_function", address="0x11e0")
     self.assertIsInstance(result, str)
-    self.assertEqual(normalize_text(result), normalize_text(golden))
+    self.assertIn("push    rbp", result)
+    self.assertIn("mov     rbp, rsp", result)
+    self.assertNotIn(" 55 ", result)
+    self.assertNotIn(" 48 89 E5 ", result)
+
+    # Explicit include_bytes=False matches default
+    result_no_bytes = await self.run_tool(
+        "disassemble_function", address="0x11e0", include_bytes=False
+    )
+    self.assertEqual(normalize_text(result_no_bytes), normalize_text(result))
+
+    # Verify opcode setting is restored after include_bytes=False
+    restored = await self.run_tool(
+        "disassemble_function", address="0x11e0", include_bytes=True
+    )
+    self.assertEqual(normalize_text(restored), normalize_text(golden))
 
   async def verify_get_ida_view(self):
     # Load golden data
@@ -1174,11 +1213,32 @@ hex(tid) if tid is not None else ""
     with open(golden_path, "r") as f:
       golden = json.load(f)["ida_view"]["0x11e0_0x120e"]
 
+    # Explicit include_bytes=True matches golden
+    result_with_bytes = await self.run_tool(
+        "get_ida_view", start_ea="0x11e0", end_ea="0x120e", include_bytes=True
+    )
+    self.assertIsInstance(result_with_bytes, str)
+    self.assertEqual(normalize_text(result_with_bytes), normalize_text(golden))
+
+    # Default include_bytes is False
     result = await self.run_tool(
         "get_ida_view", start_ea="0x11e0", end_ea="0x120e"
     )
     self.assertIsInstance(result, str)
-    self.assertEqual(normalize_text(result), normalize_text(golden))
+    self.assertIn("push    rbp", result)
+    self.assertNotIn(" 55 ", result)
+
+    # Explicit include_bytes=False matches default
+    result_no_bytes = await self.run_tool(
+        "get_ida_view", start_ea="0x11e0", end_ea="0x120e", include_bytes=False
+    )
+    self.assertEqual(normalize_text(result_no_bytes), normalize_text(result))
+
+    # Verify opcode/bytes setting is restored after include_bytes=False
+    restored = await self.run_tool(
+        "get_ida_view", start_ea="0x11e0", end_ea="0x120e", include_bytes=True
+    )
+    self.assertEqual(normalize_text(restored), normalize_text(golden))
 
   async def verify_get_stack_frame_variables(self):
     # Load golden data
@@ -1351,7 +1411,9 @@ hex(tid) if tid is not None else ""
 
   async def verify_patching_lifecycle(self):
     # 1. Verify initial instruction is 'push rbp' (55)
-    initial = await self.run_tool("disassemble_code", address="0x1240", count=1)
+    initial = await self.run_tool(
+        "disassemble_code", address="0x1240", count=1, include_bytes=True
+    )
     self.assertIsInstance(initial, str)
     self.assertIn("55", initial)
     self.assertIn("push    rbp", initial)
@@ -1363,7 +1425,9 @@ hex(tid) if tid is not None else ""
     self.assertIn("success", patch_bytes_result.lower())
 
     # 3. Verify patched to 'nop' (90)
-    patched = await self.run_tool("disassemble_code", address="0x1240", count=1)
+    patched = await self.run_tool(
+        "disassemble_code", address="0x1240", count=1, include_bytes=True
+    )
     self.assertIsInstance(patched, str)
     self.assertIn("90", patched)
     self.assertIn("nop", patched)
@@ -1381,7 +1445,9 @@ hex(tid) if tid is not None else ""
     self.assertIn("success", restore_result.lower())
 
     # 6. Verify restored to 'push rbp' (55)
-    final = await self.run_tool("disassemble_code", address="0x1240", count=1)
+    final = await self.run_tool(
+        "disassemble_code", address="0x1240", count=1, include_bytes=True
+    )
     self.assertIsInstance(final, str)
     self.assertIn("55", final)
     self.assertIn("push    rbp", final)

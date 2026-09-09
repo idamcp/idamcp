@@ -45,8 +45,7 @@ check_address = _helper_common.check_address
 compile_regex = _helper_common.compile_regex
 convert_regex_flags = _helper_common.convert_regex_flags
 decompile_checked = _helper_common.decompile_checked
-enable_showing_opcode = _helper_common.enable_showing_opcode
-enable_showing_opcode_internal = _helper_common.enable_showing_opcode_internal
+set_showing_opcode_internal = _helper_common.set_showing_opcode_internal
 get_ida_version = _helper_common.get_ida_version
 get_image_size = _helper_common.get_image_size
 get_prototype = _helper_common.get_prototype
@@ -187,8 +186,7 @@ __all__ = [
     "decompile_checked",
     "refresh_decompiler_ctext",
     "refresh_decompiler_widget",
-    "enable_showing_opcode",
-    "enable_showing_opcode_internal",
+    "set_showing_opcode_internal",
     "FuncBounds",
     "SegmentInfo",
     "get_segments",

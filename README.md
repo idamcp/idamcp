@@ -208,7 +208,6 @@ For the best experience, save these recommended settings to `~/.idamcp.json`:
   "enable_all_unsafe_tools": false,
   "enabled_unsafe_tools": ["idapython_eval"],
   "opcode_bytes": 8,
-  "set_opcode_bytes": true,
   "populate_tables_on_startup": true,
   "sqlite_persistent": true
 }
@@ -233,7 +232,6 @@ example of all available settings (showing defaults):
   "enable_all_unsafe_tools": false,
   "enabled_unsafe_tools": ["idapython_eval", "dbg_step_over"],
   "opcode_bytes": 8,
-  "set_opcode_bytes": true,
   "populate_tables_on_startup": false,
   "sqlite_persistent": false,
   "check_entries_freshness": false,
@@ -253,9 +251,7 @@ example of all available settings (showing defaults):
     instance. Increase this value if you're experiencing timeout errors with
     large binaries or on slower hardware.
 *   **opcode_bytes**: Specifies how many instruction/data bytes to display in
-    the disassembly view (0 to disable, N to show up to N bytes).
-*   **set_opcode_bytes**: If `True`, the plugin will automatically configure
-    IDA's `OPCODE_BYTES` setting on startup using the value of `opcode_bytes`.
+    the disassembly or listing view when bytes are requested (defaults to 8).
 *   **sqlite_persistent**: If `True`, the Sqlite database used by `sql_query`
     will be saved to a `.db` file in the same directory as your IDA IDB file.
     This avoids re-populating tables every time you open the database.

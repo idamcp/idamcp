@@ -144,8 +144,6 @@ def mcp_server_thread(identifier: str):
     print("[MCP] Windows detected, forcing usage of TCP instead of UDS.")
     channel = "tcp"
 
-  helper.enable_showing_opcode()
-
   # Fetch metadata to register with the service
   try:
     metadata = get_metadata.sync_call()

@@ -90,6 +90,9 @@ async def disassemble_code(
     ],
     address: Annotated[str, "Address to disassemble code"],
     count: Annotated[int, "Number of instructions to disassemble"] = 1,
+    include_bytes: Annotated[
+        bool, "Whether to include opcode bytes in the disassembly output"
+    ] = False,
 ) -> str:
   """Disassemble instructions starting at the given address.
 
@@ -114,6 +117,9 @@ async def get_ida_view(
     ],
     start_ea: Annotated[str, "Start address of the view"],
     end_ea: Annotated[str, "End address of the view"],
+    include_bytes: Annotated[
+        bool, "Whether to include opcode or data bytes in the view output"
+    ] = False,
 ) -> str:
   """Retrieves the formatted text view directly from IDA Pro's 'IDA View-A'.
 
@@ -135,6 +141,9 @@ async def disassemble_function(
         " resource, or by opening a new database via idalib_headless_open.",
     ],
     address: Annotated[str, "Address of the function to disassemble"],
+    include_bytes: Annotated[
+        bool, "Whether to include opcode bytes in the disassembly output"
+    ] = False,
 ) -> str:
   """Get assembly code for a function (API-compatible with older IDA builds)."""
   return await forward_to(database_id, "disassemble_function", locals())
