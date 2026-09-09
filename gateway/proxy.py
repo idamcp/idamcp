@@ -74,7 +74,7 @@ async def decompile_function(
         bool,
         "Whether to include the line prefix (line numbers and addresses) in the"
         " decompiled output",
-    ] = True,
+    ] = False,
 ) -> str:
   """Decompile a function at the given address."""
   return await forward_to(database_id, "decompile_function", locals())

@@ -1124,10 +1124,14 @@ hex(tid) if tid is not None else ""
     with open(golden_path, "r") as f:
       golden = json.load(f)["decompiled"]["0x11e0"]
 
-    # Default include_line_prefix is True
+    # Default include_line_prefix is False
+    expected_no_prefix = "\n".join(
+        line.split("| ", 1)[1] if "| " in line else ""
+        for line in golden.splitlines()
+    )
     result = await self.run_tool("decompile_function", address="0x11e0")
     self.assertIsInstance(result, str)
-    self.assertEqual(normalize_text(result), normalize_text(golden))
+    self.assertEqual(normalize_text(result), normalize_text(expected_no_prefix))
 
     # Test with explicit include_line_prefix=True
     result_with_prefix = await self.run_tool(
@@ -1135,15 +1139,11 @@ hex(tid) if tid is not None else ""
     )
     self.assertEqual(normalize_text(result_with_prefix), normalize_text(golden))
 
-    # Test with include_line_prefix=False
+    # Test with explicit include_line_prefix=False
     result_no_prefix = await self.run_tool(
         "decompile_function", address="0x11e0", include_line_prefix=False
     )
     self.assertIsInstance(result_no_prefix, str)
-    expected_no_prefix = "\n".join(
-        line.split("| ", 1)[1] if "| " in line else ""
-        for line in golden.splitlines()
-    )
     self.assertEqual(
         normalize_text(result_no_prefix), normalize_text(expected_no_prefix)
     )
