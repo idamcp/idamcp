@@ -143,6 +143,67 @@ _global_client_state: dict[str, ClientState] = collections.defaultdict(
 _backend_events: dict[str, asyncio.Event] = collections.defaultdict(
     asyncio.Event
 )
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _create_background_task(coro) -> asyncio.Task:
+  """Create a background task and hold a strong reference until done."""
+  task = asyncio.create_task(coro)
+  _background_tasks.add(task)
+  task.add_done_callback(_background_tasks.discard)
+  return task
+
+
+async def _kill_process_gracefully(pid: int) -> None:
+  """Terminate a process gracefully or force kill if unresponsive."""
+  try:
+    # On Windows, try CTRL_BREAK_EVENT for graceful shutdown if available
+    if sys.platform == "win32" and hasattr(signal, "CTRL_BREAK_EVENT"):
+      try:
+        logging.info(
+            "[HeadlessManager] Sending CTRL_BREAK_EVENT to PID %d", pid
+        )
+        os.kill(pid, signal.CTRL_BREAK_EVENT)
+      except Exception:
+        # On Windows, the SIGTERM signal terminates the target process
+        # immediately. The logic here is that if CTRL_BREAK_EVENT failed
+        # somehow, we're not going to wait for a grace period.
+        sig = getattr(signal, "SIGTERM", 15)
+        logging.info(
+            "[HeadlessManager] CTRL_BREAK_EVENT failed, sending SIGTERM to"
+            " PID %d",
+            pid,
+        )
+        os.kill(pid, sig)
+        return
+    else:
+      # Use SIGTERM if available (Graceful on Unix)
+      sig = getattr(signal, "SIGTERM", 15)
+      logging.info("[HeadlessManager] Sending SIGTERM to PID %d", pid)
+      os.kill(pid, sig)
+
+    # Wait a bit for graceful shutdown
+    for _ in range(20):
+      if not _is_process_running(pid):
+        logging.info("[HeadlessManager] Process %d exited gracefully", pid)
+        break
+      await asyncio.sleep(1)
+    else:
+      # Still running, force kill
+      logging.warning(
+          "[Gateway] Process %d did not exit gracefully, sending force kill",
+          pid,
+      )
+      sig = getattr(signal, "SIGKILL", 9)
+      logging.info("[HeadlessManager] Sending SIGKILL to PID %d", pid)
+      os.kill(pid, sig)
+  except (ProcessLookupError, PermissionError):
+    logging.info(
+        "[HeadlessManager] Process %d already dead (Lookup/Permission error)",
+        pid,
+    )
+  except Exception as e:  # pylint: disable=broad-exception-caught
+    logging.warning("Failed to kill process %s: %s", pid, e)
 
 
 class HeadlessManager:
@@ -151,6 +212,7 @@ class HeadlessManager:
   def __init__(self, max_instances: int):
     self.max_instances = max_instances
     self.spawned_instances: set[str] = set()
+    self._pending_spawns: int = 0
 
   def register(self, database_id: str, pid: int):
     """Register a new active headless instance."""
@@ -163,59 +225,11 @@ class HeadlessManager:
     self.spawned_instances.discard(database_id)
     pid = _global_database_id_to_pid.pop(database_id, None)
     if pid is not None and _is_process_running(pid):
-      try:
-        # On Windows, try CTRL_BREAK_EVENT for graceful shutdown if available
-        if sys.platform == "win32" and hasattr(signal, "CTRL_BREAK_EVENT"):
-          try:
-            logging.info(
-                "[HeadlessManager] Sending CTRL_BREAK_EVENT to PID %d", pid
-            )
-            os.kill(pid, signal.CTRL_BREAK_EVENT)
-          except Exception:
-            # On Windows, the SIGTERM signal terminates the target process
-            # immediately. The logic here is that if CTRL_BREAK_EVENT failed
-            # somehow, we're not going to wait for a grace period.
-            sig = getattr(signal, "SIGTERM", 15)
-            logging.info(
-                "[HeadlessManager] CTRL_BREAK_EVENT failed, sending SIGTERM to"
-                " PID %d",
-                pid,
-            )
-            os.kill(pid, sig)
-            return
-        else:
-          # Use SIGTERM if available (Graceful on Unix)
-          sig = getattr(signal, "SIGTERM", 15)
-          logging.info("[HeadlessManager] Sending SIGTERM to PID %d", pid)
-          os.kill(pid, sig)
-
-        # Wait a bit for graceful shutdown
-        for _ in range(20):
-          if not _is_process_running(pid):
-            logging.info("[HeadlessManager] Process %d exited gracefully", pid)
-            break
-          await asyncio.sleep(1)
-        else:
-          # Still running, force kill
-          logging.warning(
-              "[Gateway] Process %d did not exit gracefully, sending force"
-              " kill",
-              pid,
-          )
-          sig = getattr(signal, "SIGKILL", 9)
-          logging.info("[HeadlessManager] Sending SIGKILL to PID %d", pid)
-          os.kill(pid, sig)
-      except (ProcessLookupError, PermissionError):
-        logging.info(
-            "[HeadlessManager] Process %d already dead (Lookup/Permission"
-            " error)",
-            pid,
-        )
-      except Exception as e:  # pylint: disable=broad-exception-caught
-        logging.warning("Failed to kill process %s: %s", pid, e)
+      _create_background_task(_kill_process_gracefully(pid))
 
   async def close(self, database_id: str) -> None:
     """Close a specific headless instance gracefully."""
+    self.spawned_instances.discard(database_id)
     await disconnect_backend(database_id)
 
   async def spawn(self, path: str) -> DatabaseInfo:
@@ -237,97 +251,101 @@ class HeadlessManager:
               " directly.",
           )
 
-    if len(self.spawned_instances) >= self.max_instances:
+    if len(self.spawned_instances) + self._pending_spawns >= self.max_instances:
       raise ToolError(
           f"Cannot open '{path}': Maximum number of headless IDA instances"
           f" ({self.max_instances}) reached. Please close an unused instance"
           " using idalib_headless_close before opening a new one."
       )
 
-    # Determine command
-    python_path = CONFIG.get("python_path", sys.executable)
-
-    # Run as module from repo root
-    current_dir = pathlib.Path(__file__).resolve().parent
-    repo_root = current_dir.parent
-
-    # Prepare creation flags for Windows
-    if sys.platform == "win32":
-      creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
-    else:
-      creationflags = 0
-
-    new_env = os.environ.copy()
-    env_pythonpath = new_env.get("PYTHONPATH", "")
-    new_env["PYTHONPATH"] = str(repo_root)
-    if env_pythonpath:
-      new_env["PYTHONPATH"] += os.pathsep + env_pythonpath
-
-    process = await asyncio.create_subprocess_exec(
-        python_path,
-        "-m",
-        "ida_mcp.headless",
-        path,
-        stdin=asyncio.subprocess.DEVNULL,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        cwd=repo_root,
-        env=new_env,
-        creationflags=creationflags,
-    )
-
-    metadata: DatabaseInfo | None = None
-
-    # Wait for JSON metadata with timeout
+    self._pending_spawns += 1
     try:
-      if process.stdout is None:
-        raise ToolError("Failed to open stdout pipe")
+      # Determine command
+      python_path = CONFIG.get("python_path", sys.executable)
 
-      # We check line by line
-      while True:
-        line_bytes = await asyncio.wait_for(
-            process.stdout.readline(),
-            timeout=CONFIG.get("headless_open_timeout", 600.0),  # type: ignore
-        )
-        if not line_bytes:
-          break
-        line = line_bytes.decode("utf-8", errors="replace").strip()
+      # Run as module from repo root
+      current_dir = pathlib.Path(__file__).resolve().parent
+      repo_root = current_dir.parent
 
-        if line.startswith("[MCP_JSON] "):
-          json_str = line[len("[MCP_JSON] ") :]
-          metadata = json.loads(json_str)  # type: ignore
-          break
-    except json.JSONDecodeError as e:
-      raise ToolError("Failed to parse metadata JSON") from e
-    except asyncio.TimeoutError as e:
-      process.terminate()
-      raise ToolError("Timeout waiting for IDA to start/emit metadata") from e
-    except asyncio.CancelledError:
-      with contextlib.suppress(Exception):
-        process.terminate()
-      raise
+      # Prepare creation flags for Windows
+      if sys.platform == "win32":
+        creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
+      else:
+        creationflags = 0
 
-    if not metadata:
-      with contextlib.suppress(Exception):
-        process.terminate()
+      new_env = os.environ.copy()
+      env_pythonpath = new_env.get("PYTHONPATH", "")
+      new_env["PYTHONPATH"] = str(repo_root)
+      if env_pythonpath:
+        new_env["PYTHONPATH"] += os.pathsep + env_pythonpath
 
-      if process.stderr:
-        stderr_str = ""
-        with contextlib.suppress(Exception, asyncio.TimeoutError):
-          stderr_bytes = await asyncio.wait_for(
-              process.stderr.read(65535), timeout=0.2
+      process = await asyncio.create_subprocess_exec(
+          python_path,
+          "-m",
+          "ida_mcp.headless",
+          path,
+          stdin=asyncio.subprocess.DEVNULL,
+          stdout=asyncio.subprocess.PIPE,
+          stderr=asyncio.subprocess.PIPE,
+          cwd=repo_root,
+          env=new_env,
+          creationflags=creationflags,
+      )
+
+      metadata: DatabaseInfo | None = None
+
+      # Wait for JSON metadata with timeout
+      try:
+        if process.stdout is None:
+          raise ToolError("Failed to open stdout pipe")
+
+        # We check line by line
+        while True:
+          line_bytes = await asyncio.wait_for(
+              process.stdout.readline(),
+              timeout=CONFIG.get("headless_open_timeout", 600.0),  # type: ignore
           )
-          stderr_str = stderr_bytes.decode("utf-8", errors="replace").strip()
+          if not line_bytes:
+            break
+          line = line_bytes.decode("utf-8", errors="replace").strip()
 
-        if stderr_str:
-          raise ToolError(f"metadata is None. stderr: {stderr_str}")
-      raise ToolError("metadata is None")
+          if line.startswith("[MCP_JSON] "):
+            json_str = line[len("[MCP_JSON] ") :]
+            metadata = json.loads(json_str)  # type: ignore
+            break
+      except json.JSONDecodeError as e:
+        raise ToolError("Failed to parse metadata JSON") from e
+      except asyncio.TimeoutError as e:
+        process.terminate()
+        raise ToolError("Timeout waiting for IDA to start/emit metadata") from e
+      except asyncio.CancelledError:
+        with contextlib.suppress(Exception):
+          process.terminate()
+        raise
 
-    db_id = metadata["database_id"]
-    # Ensure pid matches what we spawned (for tracking)
-    metadata["pid"] = process.pid
-    async with _global_client_state[db_id].condition:
-      self.register(db_id, process.pid)
+      if not metadata:
+        with contextlib.suppress(Exception):
+          process.terminate()
+
+        if process.stderr:
+          stderr_str = ""
+          with contextlib.suppress(Exception, asyncio.TimeoutError):
+            stderr_bytes = await asyncio.wait_for(
+                process.stderr.read(65535), timeout=0.2
+            )
+            stderr_str = stderr_bytes.decode("utf-8", errors="replace").strip()
+
+          if stderr_str:
+            raise ToolError(f"metadata is None. stderr: {stderr_str}")
+        raise ToolError("metadata is None")
+
+      db_id = metadata["database_id"]
+      # Ensure pid matches what we spawned (for tracking)
+      metadata["pid"] = process.pid
+      async with _global_client_state[db_id].condition:
+        self.register(db_id, process.pid)
+    finally:
+      self._pending_spawns -= 1
     try:
       await asyncio.wait_for(_backend_events[db_id].wait(), timeout=15.0)
     except asyncio.TimeoutError:
@@ -465,6 +483,8 @@ async def disconnect_backend(backend_id: str, unregister: bool = True) -> None:
         )
         return
       _global_client_state[backend_id].is_closed = True
+      if unregister:
+        _headless_manager.spawned_instances.discard(backend_id)
       if _global_client_state[backend_id].number_of_ongoing_calls:
         logging.info(
             "[Gateway] disconnect_backend: waiting for %d ongoing calls to"
@@ -514,7 +534,7 @@ async def disconnect_backend(backend_id: str, unregister: bool = True) -> None:
           "[Gateway] Error disconnecting from backend %s: %s", backend_id, e
       )
     finally:
-      if unregister:
+      if unregister and _global_client_state[backend_id].is_closed:
         logging.info("[Gateway] Calling unregister for %s", backend_id)
         await _headless_manager.unregister(backend_id)
 
@@ -659,6 +679,8 @@ async def cleanup_logic():
   # Your original logic wrapped in a task
   for name in list(_global_clients):
     await disconnect_backend(name)
+  if _background_tasks:
+    await asyncio.gather(*_background_tasks, return_exceptions=True)
 
 
 original_handlers = {}
@@ -834,6 +856,9 @@ async def idalib_headless_open(
 @mcp_tool
 async def idalib_headless_close(database_id: str) -> None:
   """Close a headless IDA instance."""
-  # Only close the database opened by us.
-  if _global_database_id_to_pid.get(database_id, None) is not None:
+  # Only close the database opened by us and not already closed.
+  if (
+      _global_database_id_to_pid.get(database_id, None) is not None
+      and not _global_client_state[database_id].is_closed
+  ):
     await _headless_manager.close(database_id)

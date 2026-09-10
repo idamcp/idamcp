@@ -322,14 +322,16 @@ When the MCP client opens a binary via `idalib_headless_open`, the Gateway's
 enforces a strict quota based on `max_headless_instances`:
 
 1.  **Quota Enforcement**: Before spawning a new headless instance, the manager
-    checks whether `len(self.spawned_instances) >= self.max_instances`.
+    checks whether active and pending instances reach `max_instances`
+    (`len(self.spawned_instances) + self._pending_spawns >= self.max_instances`).
 2.  **Explicit Actionable Error**: If the limit is reached,
     `idalib_headless_open` raises a `ToolError` prompting the caller to close an
     unused instance using `idalib_headless_close(database_id)` before opening a
     new one.
 3.  **Clean Teardown**: When `idalib_headless_close` is invoked, the gateway
-    gracefully requests the database to save and close (`close_database`),
-    closes the RPC connection, and terminates the process.
+    immediately frees the capacity slot, gracefully requests the database to
+    save and close (`close_database`), closes the RPC connection, and
+    terminates the process asynchronously.
 
 --------------------------------------------------------------------------------
 
