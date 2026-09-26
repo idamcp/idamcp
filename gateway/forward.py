@@ -46,6 +46,8 @@ from fastmcp.server.transforms.search import serialize_tools_for_output_markdown
 from fastmcp.tools import Tool
 from fastmcp.tools import ToolResult
 
+from gateway import annotations as tool_annotations
+
 try:
   # FastMCP 4 ships the MCP types as mcp_types; FastMCP 3 uses the mcp SDK,
   # which in both cases provides the same classes under mcp.types.
@@ -1442,7 +1444,11 @@ if _response_limit:
 
 
 def mcp_tool(func=None, *args, **kwargs):
-  """Decorator to add a tool to the MCP server if it's not disabled."""
+  """Decorator to add a tool to the MCP server if it's not disabled.
+
+  Attaches the tool's MCP annotations from gateway/annotations.py unless the
+  caller passes annotations explicitly.
+  """
 
   def decorator(f):
     disabled_tools = CONFIG.get("disabled_tools", [])
@@ -1450,7 +1456,12 @@ def mcp_tool(func=None, *args, **kwargs):
       if re.search(pattern, f.__name__, re.IGNORECASE):
         logging.info("Skipping disabled tool: %s", f.__name__)
         return f
-    return mcp_server.tool(*args, **kwargs)(f)
+    tool_kwargs = dict(kwargs)
+    if "annotations" not in tool_kwargs:
+      hints = tool_annotations.annotations_for(f.__name__)
+      if hints is not None:
+        tool_kwargs["annotations"] = hints
+    return mcp_server.tool(*args, **tool_kwargs)(f)
 
   if func is not None and callable(func):
     return decorator(func)
