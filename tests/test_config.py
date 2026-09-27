@@ -147,6 +147,34 @@ class TestConfig(unittest.TestCase):
       config = shared.config.load_config(config_path="/nonexistent")
       self.assertTrue(config.get("check_entries_freshness"))
 
+  def test_async_interrupt_default(self):
+    """Test async_interrupt is on by default."""
+    config = shared.config.load_config(config_path="/nonexistent")
+    self.assertTrue(config.get("async_interrupt"))
+
+  def test_async_interrupt_env(self):
+    """Test ASYNC_INTERRUPT environment variable."""
+    with mock.patch.dict("os.environ", {"ASYNC_INTERRUPT": "0"}):
+      config = shared.config.load_config(config_path="/nonexistent")
+      self.assertFalse(config.get("async_interrupt"))
+
+  def test_eval_timeout_default(self):
+    """Test eval_timeout is unset (no limit) by default."""
+    config = shared.config.load_config(config_path="/nonexistent")
+    self.assertIsNone(config.get("eval_timeout"))
+
+  def test_eval_timeout_env(self):
+    """Test EVAL_TIMEOUT environment variable."""
+    with mock.patch.dict("os.environ", {"EVAL_TIMEOUT": "2.5"}):
+      config = shared.config.load_config(config_path="/nonexistent")
+      self.assertEqual(config.get("eval_timeout"), 2.5)
+
+  def test_eval_timeout_env_invalid_ignored(self):
+    """Test an invalid EVAL_TIMEOUT is ignored."""
+    with mock.patch.dict("os.environ", {"EVAL_TIMEOUT": "soon"}):
+      config = shared.config.load_config(config_path="/nonexistent")
+      self.assertIsNone(config.get("eval_timeout"))
+
   def test_no_user_config_env(self):
     """Test that IDAMCP_NO_USER_CONFIG ignores user configuration files."""
     with mock.patch.dict("os.environ", {"IDAMCP_NO_USER_CONFIG": "1"}):

@@ -1066,12 +1066,18 @@ async def idapython_eval(
         " resource, or by opening a new database via idalib_headless_open.",
     ],
     code: Annotated[str, "Python code to execute"],
+    timeout: Annotated[
+        float | None,
+        "Seconds after which the code is interrupted. Omit to use the server"
+        " default (config eval_timeout; no limit unless configured).",
+    ] = None,
 ) -> Dict[str, Any]:
   """Execute Python code in IDA context.
 
   Returns dict with result/stdout/stderr. Has access to all IDA API modules.
   Supports Jupyter-style evaluation (returns the value of the last expression).
-  Maintains persistent state across calls.
+  Maintains persistent state across calls. If the timeout is hit, the code is
+  interrupted, output captured so far is returned, and `timed_out` is true.
   """
   return await forward_to(database_id, "idapython_eval", locals())
 

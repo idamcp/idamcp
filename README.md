@@ -238,7 +238,9 @@ example of all available settings (showing defaults):
   "disabled_tools": [],
   "proxy_host": "localhost",
   "proxy_port": 8000,
-  "flush_after_write": false
+  "flush_after_write": false,
+  "async_interrupt": true,
+  "eval_timeout": null
 }
 ```
 
@@ -278,6 +280,16 @@ example of all available settings (showing defaults):
     `flush_buffers` call per modifying tool call and defaults to `False`. If
     `flush_buffers` is unavailable or fails, one error is logged and flushing
     stops for that session.
+*   **async_interrupt**: If `True` (default), cancelling a tool call interrupts
+    the Python code running on the IDA thread with
+    `PyThreadState_SetAsyncExc`, which also stops loops that make no function
+    calls. `idapython_eval` code cannot swallow the interruption with `except:`
+    or `except BaseException:`. If `False`, only the previous `sys.setprofile`
+    hook is used, which fires on function calls only.
+*   **eval_timeout**: Default timeout in seconds for `idapython_eval` when the
+    call does not pass `timeout`. `null` (default) means no limit. On timeout
+    the code is interrupted and the result has `"timed_out": true`. Needs
+    `async_interrupt`.
 
 </details>
 
@@ -294,6 +306,8 @@ example of all available settings (showing defaults):
     Sqlite storage.
 *   **CHECK_ENTRIES_FRESHNESS**: Set to `true`, `1`, or `yes` to enable entry
     points freshness verification before querying the `entries` table.
+*   **ASYNC_INTERRUPT**: Set to `false` or `0` to disable `async_interrupt`.
+*   **EVAL_TIMEOUT**: Seconds; overrides `eval_timeout`.
 *   **ENABLE_ALL_UNSAFE_TOOLS**: Set to `true` to enable all unsafe tools.
 *   **ENABLED_UNSAFE_TOOLS**: A comma-separated list of specific unsafe tools to
     enable (e.g., `idapython_eval,dbg_step_over`).

@@ -24,10 +24,13 @@
 import ast
 import contextlib
 import io
+import math
 import sys
+import threading
 import traceback
 from typing import Annotated, Any, Dict
 
+from ida_mcp.core import interrupt
 from ida_mcp.core.decorators import jsonrpc
 from ida_mcp.core.decorators import unsafe
 from ida_mcp.core.synchronization import idawrite
@@ -117,23 +120,90 @@ def _init_session_globals():
   _session_globals["get_function"] = helper.get_function
 
 
+class _Deadline:
+  """Interrupts the running tool once `seconds` have elapsed, unless cancelled."""
+
+  def __init__(self, seconds: float, call: interrupt.InterruptibleCall):
+    self.seconds = seconds
+    self._call = call
+    self._lock = threading.Lock()
+    self._cancelled = False
+    self.timed_out = False
+    self._timer = threading.Timer(seconds, self._fire)
+    self._timer.daemon = True
+    self._timer.start()
+
+  def _fire(self) -> None:
+    with self._lock:
+      if self._cancelled:
+        return
+      self.timed_out = True
+      self._call.request()
+
+  def cancel(self) -> None:
+    """After this returns, no new interrupt will be requested."""
+    with self._lock:
+      self._cancelled = True
+    self._timer.cancel()
+
+
+def _start_deadline(timeout: float | None) -> _Deadline | None:
+  """Starts a deadline for this call, or returns None if there is none.
+
+  Args:
+    timeout: The per-call value; None means use config `eval_timeout`.
+
+  Returns:
+    The running deadline, or None when no timeout applies.
+
+  Raises:
+    ValueError: The timeout is not a positive finite number.
+    RuntimeError: Asynchronous interruption is not available for this call.
+  """
+  if timeout is None:
+    # pylint: disable-next=g-import-not-at-top
+    from shared.config import load_config
+
+    timeout = load_config().get("eval_timeout")
+  if timeout is None:
+    return None
+  seconds = float(timeout)
+  if not math.isfinite(seconds) or seconds <= 0:
+    raise ValueError("timeout must be a positive number of seconds")
+  call = interrupt.current()
+  if call is None:
+    raise RuntimeError(
+        "timeout is unavailable: it needs the async_interrupt option enabled"
+        " and PyThreadState_SetAsyncExc"
+    )
+  return _Deadline(seconds, call)
+
+
 @jsonrpc
 @unsafe
 @idawrite
 def idapython_eval(
     code: Annotated[str, "Python code to execute"],
+    timeout: Annotated[
+        float | None,
+        "Seconds after which the code is interrupted. Omit to use the server"
+        " default (config eval_timeout; no limit unless configured).",
+    ] = None,
 ) -> Dict[str, Any]:
   """Execute Python code in IDA context.
 
   Returns dict with result/stdout/stderr. Has access to all IDA API modules.
   Supports Jupyter-style evaluation (returns the value of the last expression).
-  Maintains persistent state across calls.
+  Maintains persistent state across calls. If the timeout is hit, the code is
+  interrupted, output captured so far is returned, and `timed_out` is true.
   """
   _init_session_globals()
 
   stdout_capture = io.StringIO()
   stderr_capture = io.StringIO()
   result_value = None
+  timed_out = False
+  deadline = _start_deadline(timeout)
 
   # Use context managers to redirect stdout/stderr safely
   try:
@@ -157,6 +227,11 @@ def idapython_eval(
             "stdout": stdout_capture.getvalue(),
             "stderr": stderr_capture.getvalue(),
         }
+
+      # Keep `except:` / `except BaseException:` in the submitted code from
+      # swallowing a cancellation.
+      interrupt.protect_handlers(tree)
+      _session_globals[interrupt.INTERRUPT_GLOBAL] = interrupt.ToolInterrupt
 
       # 2. Analyze the AST to handle Jupyter-style last-expression logic
       last_node = None
@@ -184,14 +259,32 @@ def idapython_eval(
         # pylint: disable=eval-used
         result_value = eval(expr_code, _session_globals)
 
+      if deadline is not None:
+        deadline.cancel()
+
+  except interrupt.ToolInterrupt:
+    if deadline is None or not deadline.timed_out:
+      raise  # Cancelled by the client.
+    timed_out = True
+    print(
+        f"TimeoutError: execution exceeded {deadline.seconds:g}s and was"
+        " interrupted",
+        file=stderr_capture,
+    )
   except Exception:  # pylint: disable=broad-exception-caught
     # The broad exception is intentional here to catch any error during the
     # execution of the user-provided code.
     # Capture traceback into stderr
     print(traceback.format_exc(), file=stderr_capture)
+  finally:
+    if deadline is not None:
+      deadline.cancel()
 
-  return {
+  output = {
       "result": str(result_value) if result_value is not None else "",
       "stdout": stdout_capture.getvalue(),
       "stderr": stderr_capture.getvalue(),
   }
+  if timed_out:
+    output["timed_out"] = True
+  return output
