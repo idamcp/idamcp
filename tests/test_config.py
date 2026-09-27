@@ -147,6 +147,17 @@ class TestConfig(unittest.TestCase):
       config = shared.config.load_config(config_path="/nonexistent")
       self.assertTrue(config.get("check_entries_freshness"))
 
+  def test_crash_recovery_default(self):
+    with mock.patch.dict("os.environ"):
+      os.environ.pop("CRASH_RECOVERY", None)
+      config = shared.config.load_config(config_path="/nonexistent")
+    self.assertEqual(config.get("crash_recovery"), "backup")
+
+  def test_crash_recovery_env(self):
+    with mock.patch.dict("os.environ", {"CRASH_RECOVERY": "prefer_unpacked"}):
+      config = shared.config.load_config(config_path="/nonexistent")
+    self.assertEqual(config.get("crash_recovery"), "prefer_unpacked")
+
   def test_no_user_config_env(self):
     """Test that IDAMCP_NO_USER_CONFIG ignores user configuration files."""
     with mock.patch.dict("os.environ", {"IDAMCP_NO_USER_CONFIG": "1"}):

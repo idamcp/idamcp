@@ -376,6 +376,7 @@ class TestIDAMCP(unittest.IsolatedAsyncioTestCase):
         self.verify_memory_and_search_lifecycle,
         self.verify_misc_write_lifecycle,
         self.verify_headless_load_options,
+        self.verify_crash_recovery,
         self.verify_invalid_addresses_corner_cases,
         self.verify_malformed_inputs_corner_cases,
         self.verify_type_declaration_error_cases,
@@ -1905,6 +1906,80 @@ hex(tid) if tid is not None else ""
 
     curr_func = await self.run_tool("get_current_function")
     self.assertTrue(isinstance(curr_func, dict) or isinstance(curr_func, str))
+
+  async def verify_crash_recovery(self):
+    """Reopens a database whose previous IDA was killed after a rename."""
+    import shutil  # pylint: disable=g-import-not-at-top
+    import subprocess  # pylint: disable=g-import-not-at-top
+
+    mode = load_config().get("crash_recovery", "backup")
+    tmp_dir = tempfile.mkdtemp(prefix="cr.")
+    binary = os.path.join(tmp_dir, "crash.bin")
+    shutil.copy(os.path.abspath("tests/test_binary"), binary)
+    idb = binary + ".i64"
+    python = load_config().get("python_path", sys.executable)
+    # Save a packed .i64, then rename a function, flush, and die without
+    # closing: the next open finds dirty unpacked files next to the .i64.
+    script = (
+        "import os, sys, idapro\n"
+        "assert idapro.open_database(sys.argv[1], sys.argv[2] == 'save') == 0\n"
+        "import ida_funcs, ida_name, ida_loader\n"
+        "if sys.argv[2] == 'save':\n"
+        "  idapro.close_database(True)\n"
+        "  sys.exit(0)\n"
+        "ea = ida_funcs.getn_func(0).start_ea\n"
+        "ida_name.set_name(ea, 'crash_marker', ida_name.SN_NOWARN)\n"
+        "ida_loader.flush_buffers()\n"
+        "os._exit(9)\n"
+    )
+    opened_id = None
+    pid = None
+    try:
+      for step, path in (("save", binary), ("crash", idb)):
+        subprocess.run(
+            [python, "-c", script, path, step],
+            check=False,
+            timeout=300,
+            capture_output=True,
+        )
+      self.assertTrue(os.path.isfile(binary + ".id0"))
+
+      resp = await self.session.call_tool("idalib_headless_open", {"path": idb})
+      self.assertFalse(_is_error(resp), resp)
+      sc = _structured_content(resp)
+      opened_id, pid = sc["database_id"], sc.get("pid")
+      if mode == "off":
+        self.assertNotIn("crash_recovery", sc)
+        return
+      report = sc["crash_recovery"]
+      backup = report["backup_path"]
+      self.assertTrue(os.path.isfile(os.path.join(backup, "crash.bin.id0")))
+      resp = await self.session.call_tool(
+          "idapython_eval",
+          {
+              "database_id": opened_id,
+              "code": "ida_name.get_name(ida_funcs.getn_func(0).start_ea)",
+          },
+      )
+      name = json.loads(resp.content[0].text)["result"]
+      if mode == "prefer_unpacked":
+        self.assertEqual(report["action"], "prefer_unpacked")
+        self.assertTrue(os.path.isfile(os.path.join(backup, "crash.bin.i64")))
+        self.assertEqual(name, "crash_marker")  # unsaved rename kept
+      else:
+        self.assertEqual(report["action"], "backup")
+        self.assertEqual(report["packed_database"], idb)
+        self.assertNotEqual(name, "crash_marker")  # IDA restored the .i64
+    finally:
+      if opened_id:
+        await self.session.call_tool(
+            "idalib_headless_close", {"database_id": opened_id}
+        )
+        for _ in range(100):
+          if not pid or not _is_process_running(pid):
+            break
+          await asyncio.sleep(0.1)
+      shutil.rmtree(tmp_dir, ignore_errors=True)
 
   async def verify_headless_load_options(self):
     """Opens a copy of the test binary as a raw binary at 0x10000."""

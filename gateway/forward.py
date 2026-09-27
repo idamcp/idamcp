@@ -40,6 +40,8 @@ from fastmcp.exceptions import ToolError
 from pydantic import BaseModel
 from pydantic import ConfigDict
 from pydantic import Field
+from gateway import crash_recovery
+from gateway.crash_recovery import CrashRecovery
 from shared import load_options
 from shared.config import load_config
 from shared.rpc import RPCClient
@@ -121,6 +123,13 @@ class DatabaseInfo(Metadata):
   pid: Annotated[int, "Process ID of the IDA instance"]
   busy: NotRequired[
       Annotated[bool, "Whether the database is currently busy executing a tool"]
+  ]
+  crash_recovery: NotRequired[
+      Annotated[
+          CrashRecovery,
+          "Present only when crash leftovers were found and handled while"
+          " opening; message says what happened to unsaved changes",
+      ]
   ]
 
 
@@ -269,6 +278,13 @@ class HeadlessManager:
           " using idalib_headless_close before opening a new one."
       )
 
+    try:
+      spawn_path, recovery = crash_recovery.prepare(
+          path, str(CONFIG.get("crash_recovery", crash_recovery.DEFAULT_MODE))
+      )
+    except crash_recovery.RecoveryError as e:
+      raise ToolError(str(e)) from e
+
     self._pending_spawns += 1
     try:
       # Determine command
@@ -294,7 +310,7 @@ class HeadlessManager:
           python_path,
           "-m",
           "ida_mcp.headless",
-          path,
+          spawn_path,
           *options.to_cli(),
           stdin=asyncio.subprocess.DEVNULL,
           stdout=asyncio.subprocess.PIPE,
@@ -386,6 +402,8 @@ class HeadlessManager:
             )
       raise ToolError("Failed to connect to headless backend.")
 
+    if recovery is not None:
+      metadata["crash_recovery"] = recovery
     return metadata
 
 

@@ -238,7 +238,8 @@ example of all available settings (showing defaults):
   "disabled_tools": [],
   "proxy_host": "localhost",
   "proxy_port": 8000,
-  "flush_after_write": false
+  "flush_after_write": false,
+  "crash_recovery": "backup"
 }
 ```
 
@@ -278,6 +279,24 @@ example of all available settings (showing defaults):
     `flush_buffers` call per modifying tool call and defaults to `False`. If
     `flush_buffers` is unavailable or fails, one error is logged and flushing
     stops for that session.
+*   **crash_recovery**: What `idalib_headless_open` does when the database was
+    not closed cleanly last time (IDA crashed or was killed, leaving `.id0`,
+    `.id1`, … files marked open). If a saved `.i64`/`.idb` exists, IDA reopens
+    it and silently deletes the unsaved changes in those files; without one,
+    IDA repairs the files and keeps the changes.
+    *   `"backup"` (default): copy the leftover files to
+        `<name>.crash-<time>-<pid>/` next to the database, then open as usual.
+        The result's `crash_recovery` field says what happened and where the
+        copy is.
+    *   `"prefer_unpacked"`: also move the saved `.i64`/`.idb` into that
+        directory, so IDA repairs the leftover files and keeps the changes made
+        since the last save. Only on local Linux filesystems (falls back to
+        `"backup"` elsewhere).
+    *   `"off"`: don't check (the behavior before this setting existed).
+
+    The check reads the `.id0` header while holding its lock, and does nothing
+    if the database is open in another IDA, the header is not recognized, the
+    files are on a network filesystem, or on Windows.
 
 </details>
 
@@ -303,6 +322,8 @@ example of all available settings (showing defaults):
 *   **PROXY_PORT**: The port for the Gateway Proxy to listen on.
 *   **FLUSH_AFTER_WRITE**: Set to `true`, `1`, or `yes` to enable
     `flush_after_write`.
+*   **CRASH_RECOVERY**: `backup`, `prefer_unpacked` or `off`; overrides
+    `crash_recovery`.
 
 </details>
 
