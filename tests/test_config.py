@@ -147,6 +147,17 @@ class TestConfig(unittest.TestCase):
       config = shared.config.load_config(config_path="/nonexistent")
       self.assertTrue(config.get("check_entries_freshness"))
 
+  def test_gui_refresh_views_default(self):
+    """Test gui_refresh_views is on by default."""
+    config = shared.config.load_config(config_path="/nonexistent")
+    self.assertTrue(config.get("gui_refresh_views"))
+
+  def test_gui_refresh_views_env(self):
+    """Test GUI_REFRESH_VIEWS environment variable."""
+    with mock.patch.dict("os.environ", {"GUI_REFRESH_VIEWS": "0"}):
+      config = shared.config.load_config(config_path="/nonexistent")
+      self.assertFalse(config.get("gui_refresh_views"))
+
   def test_no_user_config_env(self):
     """Test that IDAMCP_NO_USER_CONFIG ignores user configuration files."""
     with mock.patch.dict("os.environ", {"IDAMCP_NO_USER_CONFIG": "1"}):

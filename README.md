@@ -238,7 +238,8 @@ example of all available settings (showing defaults):
   "disabled_tools": [],
   "proxy_host": "localhost",
   "proxy_port": 8000,
-  "flush_after_write": false
+  "flush_after_write": false,
+  "gui_refresh_views": true
 }
 ```
 
@@ -278,6 +279,10 @@ example of all available settings (showing defaults):
     `flush_buffers` call per modifying tool call and defaults to `False`. If
     `flush_buffers` is unavailable or fails, one error is logged and flushing
     stops for that session.
+*   **gui_refresh_views**: If `True` (default), the IDA GUI plugin refreshes
+    (re-decompiles) open Pseudocode views after each tool call that modifies
+    the database, so agent changes such as renames and prototypes show up
+    without pressing `F5`. Not used in headless mode.
 
 </details>
 
@@ -294,6 +299,7 @@ example of all available settings (showing defaults):
     Sqlite storage.
 *   **CHECK_ENTRIES_FRESHNESS**: Set to `true`, `1`, or `yes` to enable entry
     points freshness verification before querying the `entries` table.
+*   **GUI_REFRESH_VIEWS**: Set to `false` or `0` to disable `gui_refresh_views`.
 *   **ENABLE_ALL_UNSAFE_TOOLS**: Set to `true` to enable all unsafe tools.
 *   **ENABLED_UNSAFE_TOOLS**: A comma-separated list of specific unsafe tools to
     enable (e.g., `idapython_eval,dbg_step_over`).

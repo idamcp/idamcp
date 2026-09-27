@@ -85,6 +85,83 @@ class IDASafety(enum.IntEnum):
   SAFE_WRITE = ida_kernwin.MFF_WRITE
 
 
+# Delay used to coalesce bursts of write calls into a single view refresh.
+_VIEW_REFRESH_DELAY_MS = 200
+_view_refresh_disabled = False
+_view_refresh_pending = False
+
+
+def _refresh_pseudocode_views() -> int:
+  """Re-decompiles every open Pseudocode-<X> view. Returns the view count.
+
+  Disassembly and list views pick up database changes on their own, but an
+  open pseudocode view keeps showing its cached ctree (e.g. old callee names or
+  prototypes) until it is refreshed.
+  """
+  # pylint: disable-next=g-import-not-at-top
+  import ida_hexrays
+
+  if not ida_hexrays.init_hexrays_plugin():
+    return 0
+  refreshed = 0
+  for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
+    widget = ida_kernwin.find_widget(f"Pseudocode-{letter}")
+    if not widget:
+      continue
+    vdui = ida_hexrays.get_widget_vdui(widget)
+    if vdui:
+      vdui.refresh_view(True)
+      refreshed += 1
+  return refreshed
+
+
+def _run_view_refresh() -> int:
+  """Timer callback: performs the pending refresh. Never raises."""
+  global _view_refresh_pending, _view_refresh_disabled
+  _view_refresh_pending = False
+  try:
+    _refresh_pseudocode_views()
+  except Exception as e:  # pylint: disable=broad-exception-caught
+    _view_refresh_disabled = True
+    logger.error("Disabling MCP view refresh: %s", e)
+  return -1  # One-shot timer.
+
+
+def _schedule_view_refresh() -> None:
+  """Schedules a refresh of open pseudocode views (GUI only, best effort).
+
+  Called after each tool call that may modify the database. Calls arriving
+  within `_VIEW_REFRESH_DELAY_MS` share one refresh. Skipped in headless mode
+  and when the `gui_refresh_views` option is off. On any error, logs once and
+  stops trying for the rest of the session. Never raises.
+  """
+  global _view_refresh_pending, _view_refresh_disabled
+  if (
+      _view_refresh_disabled
+      or _view_refresh_pending
+      or getattr(idaapi, "is_headless", False)
+  ):
+    return
+  try:
+    # pylint: disable-next=g-import-not-at-top
+    from shared.config import load_config
+
+    if not load_config().get("gui_refresh_views", True):
+      return
+    register_timer = getattr(ida_kernwin, "register_timer", None)
+    if register_timer is None:
+      _run_view_refresh()
+      return
+    _view_refresh_pending = True
+    if not register_timer(_VIEW_REFRESH_DELAY_MS, _run_view_refresh):
+      _view_refresh_pending = False
+      _run_view_refresh()
+  except Exception as e:  # pylint: disable=broad-exception-caught
+    _view_refresh_pending = False
+    _view_refresh_disabled = True
+    logger.error("Disabling MCP view refresh: %s", e)
+
+
 class _IDACall:
   """Helper to execute a callable on IDA's main thread with safety and cancellation checks."""
 
@@ -127,6 +204,9 @@ class _IDACall:
       if self.safety_mode == IDASafety.SAFE_WRITE:
         _flush_after_write()
       idc.batch(old_batch)
+      # Also after failures: a write tool may have applied part of its changes.
+      if self.safety_mode == IDASafety.SAFE_WRITE:
+        _schedule_view_refresh()
 
   def run_in_main(self) -> Any:
     old_batch = idc.batch(1)
