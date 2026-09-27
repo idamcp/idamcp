@@ -341,6 +341,15 @@ ENABLED_UNSAFE_TOOLS=idapython_eval,dbg_step_over <gemini/headless/ida>
 3.  The Gateway will automatically discover this new session, and you can begin
     your analysis with the AI agent.
 
+IDA allows only one process to open a database at a time, so to work on the
+same database as the agent, keep it open in the GUI with the MCP server
+started. Agent tool calls run inside that IDA instance. If the agent asks to
+open a file that is already open there, `idalib_headless_open` returns the
+GUI's database (with `already_open: true`) instead of starting a second IDA;
+`idalib_headless_close` never closes GUI instances. If the file is open in an
+IDA where the MCP server is not started, the open fails with an error saying
+so.
+
 ### Headless Mode (Automated)
 
 You can launch IDA instances in the background directly from the command line or

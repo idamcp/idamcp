@@ -2734,7 +2734,7 @@
           "tags": []
         }
       },
-      "description": "Close a headless IDA instance.",
+      "description": "Close a headless IDA instance. GUI instances are never closed.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -2755,13 +2755,49 @@
           "tags": []
         }
       },
-      "description": "Open a binary in a new headless IDA instance.\n\nIf the database is already open, this tool will raise an error containing\nthe existing session ID. It is recommended to call list_available_databases\nfirst to check for active sessions, or use the existing ID returned in the\nerror if you attempt to open an already-open database.",
+      "description": "Open a binary in a new headless IDA instance.\n\nIf the file is already open in a connected IDA instance (headless, or the\nuser's GUI with the MCP server started), that database is returned with\nalready_open set instead of starting a new instance. If it is open in an\nIDA without the MCP server, an error says so.\n\nprocessor/loader/base_address are for raw firmware or other files IDA can't\nidentify on its own; leave them unset to let IDA pick. They are rejected if\nthe file is already open, since they only apply to a new instance.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
+          "base_address": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional 16-byte aligned load address (IDA's -b), e.g. '0x10000'. Only for new binaries; needs IDA 9.1+"
+          },
+          "loader": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional file type name or prefix as IDA lists it (IDA's -T), e.g. 'Binary file'. Only for new binaries; needs IDA 9.1+"
+          },
           "path": {
             "description": "Path to the target binary or database",
             "type": "string"
+          },
+          "processor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional IDA processor module (IDA's -p), e.g. 'metapc', 'arm', 'arm:ARMv7-M', 'mipsb'. Only for new binaries; needs IDA 9.1+"
           }
         },
         "required": [
@@ -2773,6 +2809,9 @@
       "outputSchema": {
         "description": "Information about a connected IDA database.",
         "properties": {
+          "already_open": {
+            "type": "boolean"
+          },
           "bitness": {
             "type": "integer"
           },
@@ -2931,6 +2970,9 @@
             "items": {
               "description": "Information about a connected IDA database.",
               "properties": {
+                "already_open": {
+                  "type": "boolean"
+                },
                 "bitness": {
                   "type": "integer"
                 },

@@ -122,6 +122,15 @@ class DatabaseInfo(Metadata):
   busy: NotRequired[
       Annotated[bool, "Whether the database is currently busy executing a tool"]
   ]
+  already_open: NotRequired[
+      Annotated[
+          bool,
+          "Set by idalib_headless_open when the file was already open in a"
+          " connected IDA instance (for example the user's GUI). The existing"
+          " database is returned and shared with that instance;"
+          " idalib_headless_close does not close GUI instances.",
+      ]
+  ]
 
 
 class ClientState(BaseModel):
@@ -141,6 +150,61 @@ _global_database_id_to_pid: dict[str, int] = {}
 _global_client_state: dict[str, ClientState] = collections.defaultdict(
     ClientState
 )
+
+
+def _same_file(a: str | None, b: str) -> bool:
+  """True if `a` and `b` name the same file (symlinks, `..`, hard links)."""
+  if not a:
+    return False
+  try:
+    return os.path.samefile(a, b)
+  except OSError:
+    return os.path.realpath(a) == os.path.realpath(b)
+
+
+def _find_open_database(path: str) -> DatabaseInfo | None:
+  """Returns a connected database whose input file or IDB is `path`."""
+  for db_id, metadata in list(_global_metadata.items()):
+    if not (
+        _same_file(metadata.get("database_path"), path)
+        or _same_file(metadata.get("filepath"), path)
+    ):
+      continue
+    pid = metadata.get("pid")
+    if not pid or not _is_process_running(pid):
+      continue
+    if _global_client_state[db_id].is_closed or db_id not in _global_clients:
+      continue
+    info = dict(metadata)
+    info["database_id"] = db_id
+    info["already_open"] = True
+    return info  # type: ignore[return-value]
+  return None
+
+
+def _unpacked_database_exists(path: str) -> bool:
+  """True if IDA's unpacked database files (`.id0`) exist for `path`.
+
+  IDA unpacks `<base>.i64` / `<base>.idb` into `<base>.id0`, `.id1`, ... while
+  the database is open, and removes them on close. `<base>` is the input file
+  path, or the IDB path without its extension.
+  """
+  base = path
+  if path.lower().endswith((".i64", ".idb")):
+    base = path[:-4]
+  return os.path.exists(base + ".id0")
+
+
+def _database_in_use_message(path: str) -> str:
+  return (
+      f"Cannot open {path}: the database appears to be open in another IDA"
+      " process (its unpacked .id0 file exists). If it is open in the IDA"
+      " GUI, start the MCP server there (Ctrl-Alt-M, or set gui_autostart)"
+      " and use list_available_databases. If no IDA has it open, a previous"
+      " session probably crashed; open it once in IDA to recover it."
+  )
+
+
 _backend_events: dict[str, asyncio.Event] = collections.defaultdict(
     asyncio.Event
 )
@@ -238,7 +302,7 @@ class HeadlessManager:
       path: str,
       options: load_options.LoadOptions | None = None,
   ) -> DatabaseInfo:
-    """Spawn a headless instance, optionally with validated load options."""
+    """Spawn a headless instance, or return the instance that has it open."""
     path = os.path.abspath(path)
     if not os.path.exists(path):
       raise ToolError(f"{path} doesn't exist.")
@@ -249,18 +313,20 @@ class HeadlessManager:
     except load_options.LoadOptionsError as e:
       raise ToolError(str(e)) from e
 
-    for db_id, metadata in list(_global_metadata.items()):
-      if (
-          metadata.get("database_path") == path
-          or metadata.get("filepath") == path
-      ):
-        pid = metadata.get("pid")
-        if pid and _is_process_running(pid):
-          raise ToolError(
-              f"Database {path} is already connected (ID: {db_id}). DO NOT"
-              " attempt to open it again; use the existing ID to access it"
-              " directly.",
-          )
+    existing = _find_open_database(path)
+    if existing is not None:
+      if not options.is_empty():
+        raise ToolError(
+            f"{path} is already open in {existing['database_id']}; load"
+            " options only apply to a new instance. Use that database_id, or"
+            " close it first."
+        )
+      logging.info(
+          "[Gateway] %s is already open in %s, returning it",
+          path,
+          existing["database_id"],
+      )
+      return existing
 
     if len(self.spawned_instances) + self._pending_spawns >= self.max_instances:
       raise ToolError(
@@ -338,6 +404,9 @@ class HeadlessManager:
       if not metadata:
         with contextlib.suppress(Exception):
           process.terminate()
+
+        if _unpacked_database_exists(path):
+          raise ToolError(_database_in_use_message(path))
 
         if process.stderr:
           stderr_str = ""
@@ -872,13 +941,14 @@ async def idalib_headless_open(
 ) -> DatabaseInfo:
   """Open a binary in a new headless IDA instance.
 
-  If the database is already open, this tool will raise an error containing
-  the existing session ID. It is recommended to call list_available_databases
-  first to check for active sessions, or use the existing ID returned in the
-  error if you attempt to open an already-open database.
+  If the file is already open in a connected IDA instance (headless, or the
+  user's GUI with the MCP server started), that database is returned with
+  already_open set instead of starting a new instance. If it is open in an
+  IDA without the MCP server, an error says so.
 
   processor/loader/base_address are for raw firmware or other files IDA can't
-  identify on its own; leave them unset to let IDA pick.
+  identify on its own; leave them unset to let IDA pick. They are rejected if
+  the file is already open, since they only apply to a new instance.
   """
   try:
     options = load_options.parse_load_options(processor, loader, base_address)
@@ -889,7 +959,7 @@ async def idalib_headless_open(
 
 @mcp_tool
 async def idalib_headless_close(database_id: str) -> None:
-  """Close a headless IDA instance."""
+  """Close a headless IDA instance. GUI instances are never closed."""
   # Only close the database opened by us and not already closed.
   if (
       _global_database_id_to_pid.get(database_id, None) is not None
