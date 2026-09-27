@@ -65,6 +65,7 @@ _DEFAULT_CONFIG = {
     "disabled_tools": [],
     "flush_after_write": False,
     "gui_undo_points": False,
+    "gui_refresh_views": True,
     "autostart": False,
     "hotkey": "Ctrl-Alt-M",
     "tool_mode": "hybrid",  # "full" | "hybrid" | "code_mode"
@@ -243,6 +244,7 @@ def load_config(config_path: str | None = None) -> dict[str, Any]:
   _set_option_from_env(config, "rebuild_strings_on_data_patch")
   _set_option_from_env(config, "flush_after_write")
   _set_option_from_env(config, "gui_undo_points")
+  _set_option_from_env(config, "gui_refresh_views")
   _set_option_from_env(config, "autostart")
   _set_option_from_env(config, "hotkey")
   _set_option_from_env(config, "tool_mode")

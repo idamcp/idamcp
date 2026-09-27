@@ -274,7 +274,8 @@ example of all available settings (showing defaults):
   "show_decompiler_warnings": false,
   "omitted_decompiler_warnings": ["WARN_GUESSED_TYPE", "WARN_UNDEF_LVAR"],
   "max_tool_response_bytes": "8m",
-  "max_eval_output_bytes": "1m"
+  "max_eval_output_bytes": "1m",
+  "gui_refresh_views": true
 }
 ```
 
@@ -334,6 +335,10 @@ example of all available settings (showing defaults):
     labeled `MCP: <tool name>` before each tool call that modifies the database,
     so each agent change can be reverted with `Ctrl + Z` / Edit -> Undo. Not
     used in headless mode. Defaults to `False`.
+*   **gui_refresh_views**: If `True` (default), the IDA GUI plugin refreshes
+    (re-decompiles) open Pseudocode views after each tool call that modifies
+    the database, so agent changes such as renames and prototypes show up
+    without pressing `F5`. Not used in headless mode.
 *   **autostart**: If `True`, the IDA plugin starts the MCP server by itself
     when IDA opens a database, so you don't need Edit -> Plugins -> MCP or the
     hotkey. If auto-analysis is still running, the server starts when it
@@ -411,6 +416,7 @@ example of all available settings (showing defaults):
     points freshness verification before querying the `entries` table.
 *   **GUI_UNDO_POINTS**: Set to `true`, `1`, or `yes` to enable
     `gui_undo_points`.
+*   **GUI_REFRESH_VIEWS**: Set to `false` or `0` to disable `gui_refresh_views`.
 *   **AUTOSTART**: Set to `true`, `1`, or `yes` to enable `autostart`; any
     other value disables it.
 *   **HOTKEY**: Overrides `hotkey`; an empty value means no shortcut.
