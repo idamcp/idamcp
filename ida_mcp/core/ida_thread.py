@@ -95,6 +95,42 @@ class IDATask:
 
 _ida_queue: queue.Queue[IDATask | str] = queue.Queue()
 
+# Optional background work that loop() runs on the IDA thread while the queue
+# is empty (headless deferred auto-analysis). Each call should return within a
+# few tens of milliseconds, since queued tasks wait for it. It returns True
+# while work remains; after False or an exception it is not called again.
+_idle_work: Callable[[], bool] | None = None
+
+
+def set_idle_work(func: Callable[[], bool] | None) -> None:
+  """Sets (or clears, with None) the work loop() runs while idle."""
+  global _idle_work
+  _idle_work = func
+
+
+def _run_idle_work() -> None:
+  global _idle_work
+  work = _idle_work
+  if work is None:
+    return
+  try:
+    more = work()
+  except Exception:  # pylint: disable=broad-exception-caught
+    logger.exception("Idle work failed, not running it again")
+    more = False
+  if not more and _idle_work is work:
+    _idle_work = None
+
+
+def _next_item() -> IDATask | str:
+  """Returns the next queued item, running idle work while there is none."""
+  while _idle_work is not None:
+    try:
+      return _ida_queue.get_nowait()
+    except queue.Empty:
+      _run_idle_work()
+  return _ida_queue.get()
+
 
 def loop():
   """Worker thread loop."""
@@ -110,7 +146,7 @@ def loop():
   try:
     while True:
       try:
-        item = _ida_queue.get()
+        item = _next_item()
         if isinstance(item, str):
           if item in ("quit", "exit"):
             logger.info("IDA worker thread received exit signal.")

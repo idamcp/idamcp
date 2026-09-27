@@ -238,7 +238,8 @@ example of all available settings (showing defaults):
   "disabled_tools": [],
   "proxy_host": "localhost",
   "proxy_port": 8000,
-  "flush_after_write": false
+  "flush_after_write": false,
+  "headless_deferred_analysis": false
 }
 ```
 
@@ -278,6 +279,18 @@ example of all available settings (showing defaults):
     `flush_buffers` call per modifying tool call and defaults to `False`. If
     `flush_buffers` is unavailable or fails, one error is logged and flushing
     stops for that session.
+*   **headless_deferred_analysis**: If `True`, a headless instance opens the
+    binary without waiting for auto-analysis, starts serving right away, and
+    runs the analysis on the IDA thread in ~50 ms slices whenever no tool call
+    is queued (a tool call waits for the current slice; a single long analysis
+    step can make that wait longer). `idalib_headless_open` then returns in
+    about the time the loader takes, instead of after the full analysis, so
+    large binaries don't hit `headless_open_timeout`. Until analysis finishes,
+    function lists, xrefs and names can be incomplete, as in the IDA GUI while
+    it is still analyzing (`ida_auto.auto_is_ok()` tells whether it is done). If
+    a tool disables auto-analysis (`ida_auto.enable_auto(False)`), the
+    background analysis stops. Defaults to `False` (analyze fully before
+    serving).
 
 </details>
 
@@ -303,6 +316,8 @@ example of all available settings (showing defaults):
 *   **PROXY_PORT**: The port for the Gateway Proxy to listen on.
 *   **FLUSH_AFTER_WRITE**: Set to `true`, `1`, or `yes` to enable
     `flush_after_write`.
+*   **HEADLESS_DEFERRED_ANALYSIS**: Set to `true`, `1`, or `yes` to enable
+    `headless_deferred_analysis`.
 
 </details>
 
@@ -361,9 +376,10 @@ PYTHONPATH=/path/to/project python3 -m ida_mcp.headless /path/to/binary_or_idb
         to complete its initial auto-analysis. Consequently, the tool call may
         timeout and be cancelled. To resolve this, you may need to adjust both
         the `timeout` setting in the client settings and the
-        `headless_open_timeout` in `~/.idamcp.json`. Alternatively, it is
-        recommended to open the target binary manually the first time to allow
-        the initial auto-analysis to finish.
+        `headless_open_timeout` in `~/.idamcp.json`, or set
+        `headless_deferred_analysis` so the open returns before the analysis
+        finishes. Alternatively, it is recommended to open the target binary
+        manually the first time to allow the initial auto-analysis to finish.
 
 *   **Close**: "Close the headless session for `/path/to/binary`."
 

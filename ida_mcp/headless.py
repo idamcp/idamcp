@@ -29,6 +29,7 @@ import pathlib
 import signal
 import sys
 import threading
+import time
 
 # fmt: off
 # idapro must go first to initialize idalib
@@ -42,6 +43,7 @@ from ida_mcp.core import ida_thread
 from ida_mcp.server import mcp_server_thread
 from ida_mcp.server import stop_server
 from shared import load_options
+from shared.config import load_config
 # fmt: on
 
 
@@ -56,6 +58,41 @@ def _server_thread(hash_str: str) -> None:
   finally:
     logger.info("Server stopped, closing database...")
     ida_thread.stop()
+
+
+# Target length of one run of deferred auto-analysis between tool calls. The
+# deadline is checked between auto_make_step calls, so a single long step can
+# overrun it (up to ~1.2 s seen on a 11 MB binary with IDA 9.4).
+_ANALYSIS_SLICE_S = 0.05
+
+
+def _deferred_analysis_supported() -> bool:
+  """Whether this idalib can run auto-analysis step by step."""
+  # pylint: disable-next=g-import-not-at-top
+  import ida_auto
+
+  return all(
+      callable(getattr(ida_auto, name, None))
+      for name in ("auto_make_step", "is_auto_enabled")
+  )
+
+
+def _analysis_step() -> bool:
+  """Runs auto-analysis for up to one slice. Returns True while work remains."""
+  # pylint: disable-next=g-import-not-at-top
+  import ida_auto
+
+  # A tool may have disabled auto-analysis (ida_auto.enable_auto(False));
+  # respect that instead of forcing it back on.
+  if not ida_auto.is_auto_enabled():
+    logger.info("Auto-analysis was disabled, stopping deferred analysis.")
+    return False
+  deadline = time.monotonic() + _ANALYSIS_SLICE_S
+  while time.monotonic() < deadline:
+    if not ida_auto.auto_make_step(0, idaapi.BADADDR):
+      logger.info("Deferred auto-analysis finished.")
+      return False
+  return True
 
 
 def main():
@@ -101,6 +138,14 @@ def main():
       sys.exit(1)
     open_kwargs["args"] = options.to_ida_args()
 
+  deferred = bool(load_config().get("headless_deferred_analysis"))
+  if deferred and not _deferred_analysis_supported():
+    logger.warning(
+        "headless_deferred_analysis is set, but this idalib lacks"
+        " ida_auto.auto_make_step/is_auto_enabled. Analyzing before serving."
+    )
+    deferred = False
+
   logger.info(
       "Initializing idalib and opening %s %s...",
       args.input_path,
@@ -109,7 +154,7 @@ def main():
 
   try:
     ret = idapro.open_database(
-        str(args.input_path), run_auto_analysis=True, **open_kwargs
+        str(args.input_path), run_auto_analysis=not deferred, **open_kwargs
     )
     if ret != 0:
       logger.error(
@@ -150,6 +195,11 @@ def main():
         original_handlers[sig] = signal.signal(sig, signal_handler)
       except Exception as e:  # pylint: disable=broad-exception-caught
         logger.exception("Could not register handler for signal %s: %s", sig, e)
+
+  if deferred:
+    # Serve right away and analyze on the IDA thread between tool calls.
+    logger.info("Auto-analysis deferred; it runs while no tool call is queued.")
+    ida_thread.set_idle_work(_analysis_step)
 
   server_thread = threading.Thread(
       target=_server_thread,

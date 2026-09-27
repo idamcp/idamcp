@@ -147,6 +147,17 @@ class TestConfig(unittest.TestCase):
       config = shared.config.load_config(config_path="/nonexistent")
       self.assertTrue(config.get("check_entries_freshness"))
 
+  def test_headless_deferred_analysis_default(self):
+    with mock.patch.dict("os.environ"):
+      os.environ.pop("HEADLESS_DEFERRED_ANALYSIS", None)
+      config = shared.config.load_config(config_path="/nonexistent")
+    self.assertIs(config.get("headless_deferred_analysis"), False)
+
+  def test_headless_deferred_analysis_env(self):
+    with mock.patch.dict("os.environ", {"HEADLESS_DEFERRED_ANALYSIS": "1"}):
+      config = shared.config.load_config(config_path="/nonexistent")
+      self.assertIs(config.get("headless_deferred_analysis"), True)
+
   def test_no_user_config_env(self):
     """Test that IDAMCP_NO_USER_CONFIG ignores user configuration files."""
     with mock.patch.dict("os.environ", {"IDAMCP_NO_USER_CONFIG": "1"}):
