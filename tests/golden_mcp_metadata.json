@@ -2760,7 +2760,7 @@
           "tags": []
         }
       },
-      "description": "Close a headless IDA instance.",
+      "description": "Close a headless IDA instance. GUI instances are never closed.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -2781,7 +2781,7 @@
           "tags": []
         }
       },
-      "description": "Open a binary in a new headless IDA instance.\n\nReturns once the file is loaded. IDA's auto-analysis may still be running\nthen: check auto_analysis_status in the result. While it is \"in_progress\",\nevery tool call for this database fails with \"auto analysis is still in\nprogress, please wait.\"; call list_available_databases later to see when it\nis \"done\". The database can be closed at any time.\n\nIf the database is already open, this tool will raise an error containing\nthe existing session ID. It is recommended to call list_available_databases\nfirst to check for active sessions, or use the existing ID returned in the\nerror if you attempt to open an already-open database.\n\nprocessor/loader/base_address are for raw firmware or other files IDA can't\nidentify on its own; leave them unset to let IDA pick.",
+      "description": "Open a binary in a new headless IDA instance.\n\nReturns once the file is loaded. IDA's auto-analysis may still be running\nthen: check auto_analysis_status in the result. While it is \"in_progress\",\nevery tool call for this database fails with \"auto analysis is still in\nprogress, please wait.\"; call list_available_databases later to see when it\nis \"done\". The database can be closed at any time.\n\nIf the file is already open in a connected IDA instance (headless, or the\nuser's GUI with the MCP server started), that database is returned with\nalready_open set instead of starting a new instance. If it is open in an\nIDA without the MCP server, an error says so.\n\nprocessor/loader/base_address are for raw firmware or other files IDA can't\nidentify on its own; leave them unset to let IDA pick. They are rejected if\nthe file is already open, since they only apply to a new instance.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -2840,6 +2840,9 @@
       "outputSchema": {
         "description": "Information about a connected IDA database.",
         "properties": {
+          "already_open": {
+            "type": "boolean"
+          },
           "auto_analysis_status": {
             "enum": [
               "in_progress",
@@ -3017,6 +3020,9 @@
             "items": {
               "description": "Information about a connected IDA database.",
               "properties": {
+                "already_open": {
+                  "type": "boolean"
+                },
                 "auto_analysis_status": {
                   "enum": [
                     "in_progress",
