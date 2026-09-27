@@ -42,6 +42,10 @@
           "tags": []
         }
       },
+      "annotations": {
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
       "description": "Add entry points to the list of entry points.",
       "inputSchema": {
         "additionalProperties": false,
@@ -115,6 +119,10 @@
           "tags": []
         }
       },
+      "annotations": {
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
       "description": "Replace imm-values in instructions with named Enum symbolic constants.",
       "inputSchema": {
         "additionalProperties": false,
@@ -163,6 +171,10 @@
         "fastmcp": {
           "tags": []
         }
+      },
+      "annotations": {
+        "openWorldHint": false,
+        "readOnlyHint": false
       },
       "description": "Convert a number constant to an offset.",
       "inputSchema": {
@@ -224,6 +236,10 @@
         "fastmcp": {
           "tags": []
         }
+      },
+      "annotations": {
+        "openWorldHint": false,
+        "readOnlyHint": false
       },
       "description": "Creates stack variables for given functions.",
       "inputSchema": {
@@ -291,6 +307,10 @@
           "tags": []
         }
       },
+      "annotations": {
+        "openWorldHint": true,
+        "readOnlyHint": false
+      },
       "description": "Continue the debugger, returns the current instruction pointer.",
       "inputSchema": {
         "additionalProperties": false,
@@ -325,6 +345,10 @@
           "tags": []
         }
       },
+      "annotations": {
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
       "description": "Delete a breakpoint at the specified address.",
       "inputSchema": {
         "additionalProperties": false,
@@ -351,6 +375,10 @@
         "fastmcp": {
           "tags": []
         }
+      },
+      "annotations": {
+        "openWorldHint": false,
+        "readOnlyHint": false
       },
       "description": "Enable or disable a breakpoint at the specified address.",
       "inputSchema": {
@@ -384,6 +412,10 @@
           "tags": []
         }
       },
+      "annotations": {
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
       "description": "Exit the debugger.",
       "inputSchema": {
         "additionalProperties": false,
@@ -405,6 +437,11 @@
         "fastmcp": {
           "tags": []
         }
+      },
+      "annotations": {
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
       },
       "description": "Get all registers and their values.\n\nThis function is only available when debugging.",
       "inputSchema": {
@@ -470,6 +507,11 @@
           "tags": []
         }
       },
+      "annotations": {
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
       "description": "Get registers for the current thread.",
       "inputSchema": {
         "additionalProperties": false,
@@ -521,6 +563,11 @@
         "fastmcp": {
           "tags": []
         }
+      },
+      "annotations": {
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
       },
       "description": "Get registers and their values for a specific thread.",
       "inputSchema": {
@@ -579,6 +626,11 @@
           "tags": []
         }
       },
+      "annotations": {
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
       "description": "Get the current call stack.",
       "inputSchema": {
         "additionalProperties": false,
@@ -618,6 +670,11 @@
         "fastmcp": {
           "tags": []
         }
+      },
+      "annotations": {
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
       },
       "description": "Get specific registers for the thread currently paused in the debugger.",
       "inputSchema": {
@@ -675,6 +732,11 @@
         "fastmcp": {
           "tags": []
         }
+      },
+      "annotations": {
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
       },
       "description": "Get specific registers and their values for a given thread.",
       "inputSchema": {
@@ -738,6 +800,11 @@
           "tags": []
         }
       },
+      "annotations": {
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
       "description": "List all breakpoints in the program.",
       "inputSchema": {
         "additionalProperties": false,
@@ -759,6 +826,10 @@
         "fastmcp": {
           "tags": []
         }
+      },
+      "annotations": {
+        "openWorldHint": true,
+        "readOnlyHint": false
       },
       "description": "Run the debugger to the specified address.",
       "inputSchema": {
@@ -787,6 +858,10 @@
           "tags": []
         }
       },
+      "annotations": {
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
       "description": "Set a breakpoint at the specified address.",
       "inputSchema": {
         "additionalProperties": false,
@@ -814,6 +889,10 @@
           "tags": []
         }
       },
+      "annotations": {
+        "openWorldHint": true,
+        "readOnlyHint": false
+      },
       "description": "Start the debugger, returns the current instruction pointer.",
       "inputSchema": {
         "additionalProperties": false,
@@ -835,6 +914,10 @@
         "fastmcp": {
           "tags": []
         }
+      },
+      "annotations": {
+        "openWorldHint": true,
+        "readOnlyHint": false
       },
       "description": "Step into the current instruction.",
       "inputSchema": {
@@ -858,6 +941,10 @@
           "tags": []
         }
       },
+      "annotations": {
+        "openWorldHint": true,
+        "readOnlyHint": false
+      },
       "description": "Step over the current instruction.",
       "inputSchema": {
         "additionalProperties": false,
@@ -879,6 +966,10 @@
         "fastmcp": {
           "tags": []
         }
+      },
+      "annotations": {
+        "openWorldHint": false,
+        "readOnlyHint": false
       },
       "description": "Create or update a local type from a C declaration.",
       "inputSchema": {
@@ -918,6 +1009,11 @@
         "fastmcp": {
           "tags": []
         }
+      },
+      "annotations": {
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
       },
       "description": "Decompile a function at the given address.",
       "inputSchema": {
@@ -962,6 +1058,10 @@
         "fastmcp": {
           "tags": []
         }
+      },
+      "annotations": {
+        "openWorldHint": false,
+        "readOnlyHint": false
       },
       "description": "Delete the named stack variables for given functions.",
       "inputSchema": {
@@ -1009,6 +1109,11 @@
         "fastmcp": {
           "tags": []
         }
+      },
+      "annotations": {
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
       },
       "description": "Disassemble instructions starting at the given address.\n\nThis function always treats the data at the address as code (forcing\ndisassembly), making it suitable for analyzing irregular code, obfuscated\ncode, or code starting at arbitrary offsets.\n\nFor standard code analysis where you want to see IDA's full disassembly view\n(including data, directives, and formatted comments), 'get_ida_view' is\npreferred.",
       "inputSchema": {
@@ -1059,6 +1164,11 @@
           "tags": []
         }
       },
+      "annotations": {
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
       "description": "Get assembly code for a function (API-compatible with older IDA builds).",
       "inputSchema": {
         "additionalProperties": false,
@@ -1102,6 +1212,10 @@
         "fastmcp": {
           "tags": []
         }
+      },
+      "annotations": {
+        "openWorldHint": false,
+        "readOnlyHint": false
       },
       "description": "Export the database to various file formats.\n\nThe tool produces the same files as from the GUI menu File -> Produce Files.\nYou can further process the generated file with other tools like\nripgrep/grep/awk, etc.\n\nReturns:\n    The path to the generated file.",
       "inputSchema": {
@@ -1167,6 +1281,11 @@
         "fastmcp": {
           "tags": []
         }
+      },
+      "annotations": {
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
       },
       "description": "Get the basic block containing the specified address.",
       "inputSchema": {
@@ -1243,6 +1362,11 @@
         "fastmcp": {
           "tags": []
         }
+      },
+      "annotations": {
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
       },
       "description": "Find paths between functions in the call graph.",
       "inputSchema": {
@@ -1334,6 +1458,11 @@
           "tags": []
         }
       },
+      "annotations": {
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
       "description": "Get the forward call graph from a function.",
       "inputSchema": {
         "additionalProperties": false,
@@ -1418,6 +1547,11 @@
         "fastmcp": {
           "tags": []
         }
+      },
+      "annotations": {
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
       },
       "description": "Get the backward call graph to a function.",
       "inputSchema": {
@@ -1504,6 +1638,11 @@
           "tags": []
         }
       },
+      "annotations": {
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
       "description": "Get all callees of a function.",
       "inputSchema": {
         "additionalProperties": false,
@@ -1563,6 +1702,11 @@
         "fastmcp": {
           "tags": []
         }
+      },
+      "annotations": {
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
       },
       "description": "Get all callers of the given address.",
       "inputSchema": {
@@ -1638,6 +1782,11 @@
           "tags": []
         }
       },
+      "annotations": {
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
       "description": "Retrieves the comment associated with a specific address.",
       "inputSchema": {
         "additionalProperties": false,
@@ -1677,6 +1826,11 @@
           "tags": []
         }
       },
+      "annotations": {
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
       "description": "Get the address currently selected by the user.",
       "inputSchema": {
         "additionalProperties": false,
@@ -1710,6 +1864,11 @@
         "fastmcp": {
           "tags": []
         }
+      },
+      "annotations": {
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
       },
       "description": "Get the function currently selected by the user.",
       "inputSchema": {
@@ -1770,6 +1929,11 @@
           "tags": []
         }
       },
+      "annotations": {
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
       "description": "Retrieve the addresses pointed to by the data at a specific location.",
       "inputSchema": {
         "additionalProperties": false,
@@ -1811,6 +1975,11 @@
         "fastmcp": {
           "tags": []
         }
+      },
+      "annotations": {
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
       },
       "description": "Get all entry points in the database.",
       "inputSchema": {
@@ -1867,6 +2036,11 @@
           "tags": []
         }
       },
+      "annotations": {
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
       "description": "Get a function by its address.",
       "inputSchema": {
         "additionalProperties": false,
@@ -1914,6 +2088,11 @@
         "fastmcp": {
           "tags": []
         }
+      },
+      "annotations": {
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
       },
       "description": "Get the Control Flow Graph (CFG) of a function.",
       "inputSchema": {
@@ -1990,6 +2169,11 @@
           "tags": []
         }
       },
+      "annotations": {
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
       "description": "Check if the address belongs to a library function (FLIRT).",
       "inputSchema": {
         "additionalProperties": false,
@@ -2043,6 +2227,11 @@
         "fastmcp": {
           "tags": []
         }
+      },
+      "annotations": {
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
       },
       "description": "Read global variables' values by their addresses (if known at compile-time).\n\nPrefer this function over the `read_*` functions.",
       "inputSchema": {
@@ -2101,6 +2290,11 @@
           "tags": []
         }
       },
+      "annotations": {
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
       "description": "Read global variables' values (if known at compile-time).\n\nPrefer this function over the `read_*` functions.",
       "inputSchema": {
         "additionalProperties": false,
@@ -2158,6 +2352,11 @@
           "tags": []
         }
       },
+      "annotations": {
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
       "description": "Retrieves the formatted text view directly from IDA Pro's 'IDA View-A'.\n\nCRITICAL: Use this tool (NOT disassemble_code) when inspecting data segments,\nglobal variables, arrays, or applied C-structures. It accurately renders data\ndirectives (DCB/DCD/DCQ), strings, cross-references, and applied struct\nformatting (e.g., my_struct_t <1, 2>). It is also the preferred tool for\nreading standard assembly code with inline comments. The view starts at the\nitem containing address and shows count items; call again with the address\nafter the last item shown to continue.",
       "inputSchema": {
         "additionalProperties": false,
@@ -2206,6 +2405,11 @@
         "fastmcp": {
           "tags": []
         }
+      },
+      "annotations": {
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
       },
       "description": "Get metadata about the current IDB.",
       "inputSchema": {
@@ -2297,6 +2501,11 @@
           "tags": []
         }
       },
+      "annotations": {
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
       "description": "Get the operand of an instruction.",
       "inputSchema": {
         "additionalProperties": false,
@@ -2350,6 +2559,11 @@
         "fastmcp": {
           "tags": []
         }
+      },
+      "annotations": {
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
       },
       "description": "Retrieve the stack frame variables for a given function.",
       "inputSchema": {
@@ -2416,6 +2630,11 @@
           "tags": []
         }
       },
+      "annotations": {
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
       "description": "Get the start entry point of the binary.",
       "inputSchema": {
         "additionalProperties": false,
@@ -2449,6 +2668,11 @@
         "fastmcp": {
           "tags": []
         }
+      },
+      "annotations": {
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
       },
       "description": "Get structure field values at a specific address.",
       "inputSchema": {
@@ -2485,6 +2709,11 @@
         "fastmcp": {
           "tags": []
         }
+      },
+      "annotations": {
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
       },
       "description": "Retrieves all cross-references originating from a specific address.",
       "inputSchema": {
@@ -2561,6 +2790,11 @@
           "tags": []
         }
       },
+      "annotations": {
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
       "description": "Get all cross references to the given address.",
       "inputSchema": {
         "additionalProperties": false,
@@ -2635,6 +2869,11 @@
         "fastmcp": {
           "tags": []
         }
+      },
+      "annotations": {
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
       },
       "description": "Get all cross references to a named struct field (member).",
       "inputSchema": {
@@ -2716,6 +2955,11 @@
           "tags": []
         }
       },
+      "annotations": {
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
       "description": "Get a formatted hexadecimal dump of memory at the specified address.\n\nEach request is limited to a maximum of 0x1000 bytes. Bytes that have no\nvalue in the database (gaps between segments, uninitialized data such as\n.bss) are shown as ??. This tool is useful for examining raw memory\ncontents, such as unknown data structures, encrypted payloads, or inline\nstrings.",
       "inputSchema": {
         "additionalProperties": false,
@@ -2760,6 +3004,10 @@
           "tags": []
         }
       },
+      "annotations": {
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
       "description": "Close a headless IDA instance.",
       "inputSchema": {
         "additionalProperties": false,
@@ -2780,6 +3028,10 @@
         "fastmcp": {
           "tags": []
         }
+      },
+      "annotations": {
+        "openWorldHint": false,
+        "readOnlyHint": false
       },
       "description": "Open a binary in a new headless IDA instance.\n\nReturns once the file is loaded. IDA's auto-analysis may still be running\nthen: check auto_analysis_status in the result. While it is \"in_progress\",\nevery tool call for this database fails with \"auto analysis is still in\nprogress, please wait.\"; call list_available_databases later to see when it\nis \"done\". The database can be closed at any time.\n\nIf the database is already open, this tool will raise an error containing\nthe existing session ID. It is recommended to call list_available_databases\nfirst to check for active sessions, or use the existing ID returned in the\nerror if you attempt to open an already-open database.\n\nprocessor/loader/base_address are for raw firmware or other files IDA can't\nidentify on its own; leave them unset to let IDA pick.",
       "inputSchema": {
@@ -2924,6 +3176,10 @@
           "tags": []
         }
       },
+      "annotations": {
+        "openWorldHint": true,
+        "readOnlyHint": false
+      },
       "description": "Execute Python code in IDA context.\n\nReturns dict with result/result_type/stdout/stderr: result is str() of the\nvalue, and result_type its type, e.g. \"int\" or \"ida_funcs.func_t\" (both are\nempty if the code raises). Has access to all IDA API modules.\nSupports Jupyter-style evaluation (returns the value of the last expression).\nEach call runs in a fresh namespace unless persist_globals is set; objects\nthat must outlive the call (hooks, timers, callbacks) need persist_globals.\nstdout, stderr, and result are each limited to max_eval_output_bytes (1 MiB\nby default): code that prints more is stopped, and the call fails with an\nerror that includes the output so far. Print less, or write large output to\na file.",
       "inputSchema": {
         "additionalProperties": false,
@@ -2965,6 +3221,10 @@
           "tags": []
         }
       },
+      "annotations": {
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
       "description": "Navigates the IDA UI (IDA View/Pseudocode) to the specified address.",
       "inputSchema": {
         "additionalProperties": false,
@@ -3003,6 +3263,11 @@
         "fastmcp": {
           "tags": []
         }
+      },
+      "annotations": {
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
       },
       "description": "List all available IDA database connection IDs.\n\nActive databases returned by this tool do not need to be opened again; they\nare ready to accept queries using their database_id, unless their\nauto_analysis_status is \"in_progress\": such a database rejects every tool\nuntil IDA's auto-analysis has finished, so check again later.",
       "inputSchema": {
@@ -3110,6 +3375,11 @@
           "tags": []
         }
       },
+      "annotations": {
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
       "description": "List all bookmarks in the database.",
       "inputSchema": {
         "additionalProperties": false,
@@ -3162,6 +3432,11 @@
         "fastmcp": {
           "tags": []
         }
+      },
+      "annotations": {
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
       },
       "description": "Lists all defined enums (enumerated types) in the IDA database.",
       "inputSchema": {
@@ -3246,6 +3521,11 @@
           "tags": []
         }
       },
+      "annotations": {
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
       "description": "List matching functions in the database (paginated, filtered).",
       "inputSchema": {
         "additionalProperties": false,
@@ -3323,6 +3603,11 @@
           "tags": []
         }
       },
+      "annotations": {
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
       "description": "List matching global variables in the database (paginated, filtered).\n\nNote: This list excludes dummy names (e.g., off_, loc_, byte_, sub_) to focus\non user-defined or imported symbols.",
       "inputSchema": {
         "additionalProperties": false,
@@ -3389,6 +3674,11 @@
           "tags": []
         }
       },
+      "annotations": {
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
       "description": "List all imported symbols with their name and module (paginated).",
       "inputSchema": {
         "additionalProperties": false,
@@ -3454,6 +3744,11 @@
           "tags": []
         }
       },
+      "annotations": {
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
+      },
       "description": "List Local types in the database.",
       "inputSchema": {
         "additionalProperties": false,
@@ -3499,6 +3794,11 @@
         "fastmcp": {
           "tags": []
         }
+      },
+      "annotations": {
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
       },
       "description": "List all patched bytes in the database.",
       "inputSchema": {
@@ -3556,6 +3856,11 @@
         "fastmcp": {
           "tags": []
         }
+      },
+      "annotations": {
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
       },
       "description": "List all segments in the binary.",
       "inputSchema": {
@@ -3617,6 +3922,11 @@
         "fastmcp": {
           "tags": []
         }
+      },
+      "annotations": {
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
       },
       "description": "List matching strings in the database (paginated, filtered).",
       "inputSchema": {
@@ -3692,6 +4002,11 @@
         "fastmcp": {
           "tags": []
         }
+      },
+      "annotations": {
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
       },
       "description": "Get structures with detailed member information.\n\nOptionally filter by name pattern.",
       "inputSchema": {
@@ -3797,6 +4112,10 @@
           "tags": []
         }
       },
+      "annotations": {
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
       "description": "Create an array of items starting at the specified address.",
       "inputSchema": {
         "additionalProperties": false,
@@ -3841,6 +4160,10 @@
           "tags": []
         }
       },
+      "annotations": {
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
       "description": "Convert raw bytes to instructions at an address (GUI: 'C').\n\nThis operation automatically undefines (GUI: 'U') any existing item at the\nspecified address to allow for the creation of a new instruction. If no\ninstruction can be created there, the existing item is kept.",
       "inputSchema": {
         "additionalProperties": false,
@@ -3879,6 +4202,10 @@
         "fastmcp": {
           "tags": []
         }
+      },
+      "annotations": {
+        "openWorldHint": false,
+        "readOnlyHint": false
       },
       "description": "Convert the current item to a primitive data type (byte, word, etc.).",
       "inputSchema": {
@@ -3936,6 +4263,10 @@
           "tags": []
         }
       },
+      "annotations": {
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
       "description": "Define a function at a code location (GUI: 'P').\n\nTo ensure success, this operation first undefines (GUI: 'U') any existing\nitem at the address and converts it to code before establishing the function\ndefinition. If no function can be created there, the existing item is kept.",
       "inputSchema": {
         "additionalProperties": false,
@@ -3974,6 +4305,10 @@
         "fastmcp": {
           "tags": []
         }
+      },
+      "annotations": {
+        "openWorldHint": false,
+        "readOnlyHint": false
       },
       "description": "Create a string literal at the specified address.",
       "inputSchema": {
@@ -4018,6 +4353,10 @@
         "fastmcp": {
           "tags": []
         }
+      },
+      "annotations": {
+        "openWorldHint": false,
+        "readOnlyHint": false
       },
       "description": "Convert the current item to a structure instance.",
       "inputSchema": {
@@ -4067,6 +4406,10 @@
         "fastmcp": {
           "tags": []
         }
+      },
+      "annotations": {
+        "openWorldHint": false,
+        "readOnlyHint": false
       },
       "description": "Patch multiple assembly instructions at given addresses.\n\nYou can provide multiple assembly instructions separated by ';'.\nThe assembler is aware of the IDA Pro database context, which means you can\ndirectly use label names, function names, and global variable names\nin your assembly instructions (e.g., 'call my_function' or 'mov eax, my_var').\n\nThe architecture and bitness (e.g., x86, ARM Thumb, MIPS) are automatically\ninferred from the current IDA database.",
       "inputSchema": {
@@ -4141,6 +4484,10 @@
           "tags": []
         }
       },
+      "annotations": {
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
       "description": "Patch bytes directly in memory.",
       "inputSchema": {
         "additionalProperties": false,
@@ -4196,6 +4543,11 @@
         "fastmcp": {
           "tags": []
         }
+      },
+      "annotations": {
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
       },
       "description": "Read formatted data from memory at given addresses.",
       "inputSchema": {
@@ -4281,6 +4633,10 @@
           "tags": []
         }
       },
+      "annotations": {
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
       "description": "Set or delete name of items at the specified addresses.",
       "inputSchema": {
         "additionalProperties": false,
@@ -4336,6 +4692,10 @@
         "fastmcp": {
           "tags": []
         }
+      },
+      "annotations": {
+        "openWorldHint": false,
+        "readOnlyHint": false
       },
       "description": "Rename local variables in a function.",
       "inputSchema": {
@@ -4398,6 +4758,10 @@
           "tags": []
         }
       },
+      "annotations": {
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
       "description": "Change the name of stack variables for IDA functions.",
       "inputSchema": {
         "additionalProperties": false,
@@ -4458,6 +4822,11 @@
         "fastmcp": {
           "tags": []
         }
+      },
+      "annotations": {
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
       },
       "description": "Search for binary pattern within a specified memory range.\n\nThe search operates within the bounds defined by `start_ea` (low address) and\n`end_ea` (high address).\n- When the direction is 'down', the search progresses from `start_ea`\nascending towards `end_ea`.\n- When the direction is 'up', the search progresses from `end_ea` descending\ntowards `start_ea`.\n\nNote: Results are capped at a maximum of 50 matches per call.",
       "inputSchema": {
@@ -4538,6 +4907,11 @@
         "fastmcp": {
           "tags": []
         }
+      },
+      "annotations": {
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
       },
       "description": "Search for a text string within a specified memory range.\n\nThe search operates within the bounds defined by `start_ea` (low address) and\n`end_ea` (high address).\n- When the direction is 'down', the search progresses from `start_ea`\nascending towards `end_ea`.\n- When the direction is 'up', the search progresses from `end_ea` descending\ntowards `start_ea`.\n\nNote: The results are capped at a maximum of 50 matches per call.",
       "inputSchema": {
@@ -4624,6 +4998,10 @@
           "tags": []
         }
       },
+      "annotations": {
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
       "description": "Sets the background color of items at specified addresses.",
       "inputSchema": {
         "additionalProperties": false,
@@ -4692,6 +5070,10 @@
           "tags": []
         }
       },
+      "annotations": {
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
       "description": "Sets a comment at the specified address in both disassembly and pseudocode.\n\nThis function sets a comment in the disassembly view. If the address is\nwithin a function that can be decompiled, it also attempts to set the comment\nin the pseudocode view:\n- As a function comment if the address is the entry point.\n- At the nearest mapped location in the pseudocode tree otherwise.",
       "inputSchema": {
         "additionalProperties": false,
@@ -4754,6 +5136,10 @@
           "tags": []
         }
       },
+      "annotations": {
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
       "description": "Set or unset the non-returning flag for functions.",
       "inputSchema": {
         "additionalProperties": false,
@@ -4797,6 +5183,10 @@
         "fastmcp": {
           "tags": []
         }
+      },
+      "annotations": {
+        "openWorldHint": false,
+        "readOnlyHint": false
       },
       "description": "Set local variables' types.",
       "inputSchema": {
@@ -4859,6 +5249,10 @@
           "tags": []
         }
       },
+      "annotations": {
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
       "description": "Updates the types for the variables within a function's stack frame.",
       "inputSchema": {
         "additionalProperties": false,
@@ -4920,6 +5314,10 @@
           "tags": []
         }
       },
+      "annotations": {
+        "openWorldHint": false,
+        "readOnlyHint": false
+      },
       "description": "Set type of functions/variables.",
       "inputSchema": {
         "additionalProperties": false,
@@ -4975,6 +5373,11 @@
         "fastmcp": {
           "tags": []
         }
+      },
+      "annotations": {
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": true
       },
       "description": "Executes read-only SQL queries against IDA Pro using SQLite.\n\nTables ('functions', 'strings', 'names', 'imports', 'segments', 'local_types',\n'xrefs', 'entries') are automatically populated from IDA on first use and\nkept in sync automatically via event hooks.\n\n### Available Tables & Schemas\n- functions (start_ea INTEGER, end_ea INTEGER, name TEXT, demangled_name\n  TEXT, prototype TEXT, size INTEGER, is_lib INTEGER)\n- strings (address INTEGER, length INTEGER, string TEXT)\n- names (address INTEGER, name TEXT)\n- imports (address INTEGER, name TEXT, module TEXT)\n- segments (name TEXT, class TEXT, start_ea INTEGER, end_ea INTEGER,\nsize INTEGER, permissions TEXT)\n- local_types (ordinal INTEGER, name TEXT, declaration TEXT)\n- xrefs (from_ea INTEGER, to_ea INTEGER, type TEXT, from_function_ea INTEGER)\n- entries (index_id INTEGER, ordinal INTEGER, address INTEGER, name TEXT)\n\nIt supports standard SQL SELECT statements. You can provide multiple\nqueries in a list or separated by ';'.\n\n### Extended SQLite Support\nThis tool provides an enhanced SQLite interface for reverse engineering:\n- **Hexadecimal Literals:** You can use `0x` prefixed hexadecimal numbers\n  directly in your queries for any integer types (e.g., `WHERE address >\n  0x401000`, `WHERE size = 0x40`).\n- **Automatic Hex Formatting in Final Output:** All integer columns and values\n  in the final query results (the returned dictionaries) are automatically\n  formatted as lowercase `0x...` hexadecimal strings (e.g., `0x401240`,\n  `0x20`), eliminating the need to manually call `printf('0x%X', ...)` for\n  selected output columns.\n- **Intermediate Evaluation in SQLite:** Inside the SQL engine, expressions\n  and columns remain numeric integer values. If coerced to text within a\n  query (e.g. via `LIKE`, `CAST(... AS TEXT)`, or string concatenation\n  `||`), SQLite uses standard base-10 decimal representation. To perform\n  hex pattern matching inside the query itself, explicitly use\n  `printf('0x%x', address) LIKE '0x401%'` or prefer numeric comparisons\n  (`WHERE address BETWEEN 0x401000 AND 0x402000`).\n- **Large Address Support:** All address columns are automatically treated\n  as unsigned 64-bit integers (`uint64`).\n\n### Notes on Querying\n- To see available tables or their schemas dynamically:\n  - `SELECT name FROM sqlite_master WHERE type='table'`\n  - `PRAGMA table_info('functions')`\n- **'xrefs' table:** Contains code and data cross-references between memory\n  addresses and type IDs (excluding ordinary sequential instruction flow).\n  Reference types include `call`, `jmp`, `read`, `write`, and 'offset'. The\n  `from_function_ea` column contains the start address of the\n  function containing `from_ea` (or NULL if outside any function).\n  Supports all comparison and set operators (`=`, `!=`, `<`, `<=`, `>`, `>=`,\n  `BETWEEN ... AND ...`, `IN (...)`) on `from_ea` and `to_ea`.",
       "inputSchema": {
@@ -5058,6 +5461,10 @@
         "fastmcp": {
           "tags": []
         }
+      },
+      "annotations": {
+        "openWorldHint": false,
+        "readOnlyHint": false
       },
       "description": "Clear code/data definitions in a range (GUI: 'U').",
       "inputSchema": {
