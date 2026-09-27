@@ -1183,12 +1183,7 @@ async def hexdump(
 
 @mcp_tool
 async def idapython_reference(
-    database_id: Annotated[
-        str,
-        "The unique identifier for the target IDA database. You can obtain this"
-        " ID by calling list_available_databases, reading the ida://databases"
-        " resource, or by opening a new database via idalib_headless_open.",
-    ],
+    database_id: DatabaseId,
     query: Annotated[
         str,
         "A name ('get_func', 'ida_typeinf.tinfo_t', 'FUNC_NORET') or a short"
