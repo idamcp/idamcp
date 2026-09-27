@@ -147,6 +147,17 @@ class TestConfig(unittest.TestCase):
       config = shared.config.load_config(config_path="/nonexistent")
       self.assertTrue(config.get("check_entries_freshness"))
 
+  def test_trace_dir_default(self):
+    """Test tracing is off by default (empty trace_dir)."""
+    config = shared.config.load_config(config_path="/nonexistent")
+    self.assertEqual(config.get("trace_dir"), "")
+
+  def test_trace_dir_env(self):
+    """Test TRACE_DIR environment variable."""
+    with mock.patch.dict("os.environ", {"TRACE_DIR": "/tmp/idamcp-trace"}):
+      config = shared.config.load_config(config_path="/nonexistent")
+      self.assertEqual(config.get("trace_dir"), "/tmp/idamcp-trace")
+
   def test_no_user_config_env(self):
     """Test that IDAMCP_NO_USER_CONFIG ignores user configuration files."""
     with mock.patch.dict("os.environ", {"IDAMCP_NO_USER_CONFIG": "1"}):
