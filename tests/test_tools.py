@@ -368,6 +368,7 @@ class TestIDAMCP(unittest.IsolatedAsyncioTestCase):
         self.verify_error_messages,
         self.verify_stack_frame_fp_offset,
         self.verify_safe_eval_via_patch_assembly,
+        self.verify_open_already_open_database,
         self.verify_timeout_busy_handling,
         self.verify_timeout_gil_starvation_handling,
         self.verify_idapython_eval_timeout,
@@ -3881,6 +3882,25 @@ for name in ("LocalTypesSyncRenamed", "LocalTypesSyncUnseen"):
     await self.run_tool("idapython_eval", code=delete_code)
     self.assertIsNone(await declaration("LocalTypesSyncRenamed"))
     await assert_in_sync("after the deletes")
+
+  async def verify_open_already_open_database(self):
+    # Opening the same file again returns the existing database instead of an
+    # error, also through a symlink (matched by file identity, not string).
+    abs_path = os.path.abspath(self.current_filepath)
+    with tempfile.TemporaryDirectory() as tmp:
+      link = os.path.join(tmp, "link_to_binary")
+      os.symlink(abs_path, link)
+      for path in (abs_path, link):
+        resp = await self.session.call_tool(
+            "idalib_headless_open", {"path": path}
+        )
+        self.assertFalse(_is_error(resp), f"open {path} failed: {resp}")
+        sc = _structured_content(resp)
+        self.assertEqual(sc["database_id"], self.db_id)
+        self.assertTrue(sc.get("already_open"))
+    dbs_resp = await self.session.call_tool("list_available_databases", {})
+    db_ids = [db["database_id"] for db in json.loads(dbs_resp.content[0].text)]
+    self.assertEqual(db_ids.count(self.db_id), 1)
 
   async def verify_safe_eval(self):
     from gateway.patcher import _safe_eval_math
