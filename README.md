@@ -238,7 +238,8 @@ example of all available settings (showing defaults):
   "disabled_tools": [],
   "proxy_host": "localhost",
   "proxy_port": 8000,
-  "flush_after_write": false
+  "flush_after_write": false,
+  "eval_result_json": false
 }
 ```
 
@@ -278,6 +279,14 @@ example of all available settings (showing defaults):
     `flush_buffers` call per modifying tool call and defaults to `False`. If
     `flush_buffers` is unavailable or fails, one error is logged and flushing
     stops for that session.
+*   **eval_result_json**: Default for the `return_json` parameter of
+    `idapython_eval`, used when a call omits it. When enabled, `idapython_eval`
+    also returns the value of the last expression as native JSON in
+    `result_json` (tuples become lists, dict keys become strings). If the value
+    is not valid JSON (for example an IDA object, or NaN), `result_json_error`
+    says why instead. `result` stays a string either way. Off by default
+    because JSON-valued results would otherwise be sent twice. Agents can
+    enable it per call with `return_json=true` without changing this setting.
 
 </details>
 
@@ -303,6 +312,8 @@ example of all available settings (showing defaults):
 *   **PROXY_PORT**: The port for the Gateway Proxy to listen on.
 *   **FLUSH_AFTER_WRITE**: Set to `true`, `1`, or `yes` to enable
     `flush_after_write`.
+*   **EVAL_RESULT_JSON**: Set to `true`, `1`, or `yes` to enable
+    `eval_result_json`.
 
 </details>
 

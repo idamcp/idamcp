@@ -147,6 +147,17 @@ class TestConfig(unittest.TestCase):
       config = shared.config.load_config(config_path="/nonexistent")
       self.assertTrue(config.get("check_entries_freshness"))
 
+  def test_eval_result_json_default(self):
+    """Test eval_result_json is off by default."""
+    config = shared.config.load_config(config_path="/nonexistent")
+    self.assertFalse(config.get("eval_result_json"))
+
+  def test_eval_result_json_env(self):
+    """Test EVAL_RESULT_JSON environment variable."""
+    with mock.patch.dict("os.environ", {"EVAL_RESULT_JSON": "true"}):
+      config = shared.config.load_config(config_path="/nonexistent")
+      self.assertTrue(config.get("eval_result_json"))
+
   def test_no_user_config_env(self):
     """Test that IDAMCP_NO_USER_CONFIG ignores user configuration files."""
     with mock.patch.dict("os.environ", {"IDAMCP_NO_USER_CONFIG": "1"}):

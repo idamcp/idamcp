@@ -383,6 +383,7 @@ class TestIDAMCP(unittest.IsolatedAsyncioTestCase):
         self.verify_xrefs_lifecycle,
         self.verify_sql_entries_table,
         self.verify_safe_eval,
+        self.verify_eval_structured_result,
         self.verify_safe_eval_via_patch_assembly,
         self.verify_timeout_busy_handling,
         self.verify_timeout_gil_starvation_handling,
@@ -1971,6 +1972,48 @@ hex(tid) if tid is not None else ""
             break
           await asyncio.sleep(0.1)
       shutil.rmtree(tmp_dir, ignore_errors=True)
+
+  async def verify_eval_structured_result(self):
+    # Default config, parameter omitted: result_type only, no result_json.
+    res = await self.run_tool("idapython_eval", code="1 + 1")
+    self.assertEqual(res["result"], "2")
+    self.assertEqual(res["result_type"], "int")
+    self.assertNotIn("result_json", res)
+
+    # Per-call parameter.
+    res = await self.run_tool(
+        "idapython_eval",
+        code="{'n': len(list(idautils.Functions())) > 0, 't': (1, 2)}",
+        return_json=True,
+    )
+    self.assertEqual(res["result_type"], "dict")
+    self.assertEqual(res["result_json"], {"n": True, "t": [1, 2]})
+    self.assertIsInstance(res["result"], str)
+
+    res = await self.run_tool(
+        "idapython_eval",
+        code="ida_funcs.get_func(next(iter(idautils.Functions())))",
+        return_json=True,
+    )
+    self.assertEqual(res["result_type"], "func_t")
+    self.assertNotIn("result_json", res)
+    self.assertIn("not JSON serializable", res["result_json_error"])
+
+    # Config fallback when the parameter is omitted, and explicit override.
+    toggle = (
+        "from shared.config import load_config\n"
+        "load_config()['eval_result_json'] = {}"
+    )
+    await self.run_tool("idapython_eval", code=toggle.format(True))
+    try:
+      res = await self.run_tool("idapython_eval", code="[1, 2]")
+      self.assertEqual(res["result_json"], [1, 2])
+      res = await self.run_tool(
+          "idapython_eval", code="[1, 2]", return_json=False
+      )
+      self.assertNotIn("result_json", res)
+    finally:
+      await self.run_tool("idapython_eval", code=toggle.format(False))
 
   async def verify_misc_write_lifecycle(self):
     # Dynamically resolve rebased addresses to handle ASLR rebasing

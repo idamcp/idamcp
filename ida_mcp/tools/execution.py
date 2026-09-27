@@ -24,6 +24,7 @@
 import ast
 import contextlib
 import io
+import json
 import sys
 import traceback
 from typing import Annotated, Any, Dict
@@ -117,23 +118,52 @@ def _init_session_globals():
   _session_globals["get_function"] = helper.get_function
 
 
+def _to_json_value(value: Any) -> tuple[bool, Any]:
+  """Returns (True, value as JSON would round-trip it) or (False, error).
+
+  Strict: no `default=` fallback and no NaN/Infinity, so only values that are
+  valid JSON as-is are accepted. Tuples become lists and dict keys become
+  strings, exactly as the JSON-RPC layer would send them.
+  """
+  try:
+    return True, json.loads(json.dumps(value, allow_nan=False))
+  except (TypeError, ValueError, RecursionError) as e:
+    return False, f"{type(e).__name__}: {e}"
+
+
 @jsonrpc
 @unsafe
 @idawrite
 def idapython_eval(
     code: Annotated[str, "Python code to execute"],
+    return_json: Annotated[
+        bool | None,
+        "Also return the value of the last expression as native JSON in"
+        " result_json (or the reason it can't be, in result_json_error)."
+        " Omit to use the server's eval_result_json setting (off by default).",
+    ] = None,
 ) -> Dict[str, Any]:
   """Execute Python code in IDA context.
 
-  Returns dict with result/stdout/stderr. Has access to all IDA API modules.
-  Supports Jupyter-style evaluation (returns the value of the last expression).
+  Returns dict with result/stdout/stderr/result_type. Has access to all IDA API
+  modules. Supports Jupyter-style evaluation (returns the value of the last
+  expression as a string in result, and its type name in result_type).
+  With return_json=True (or the eval_result_json config option when return_json
+  is omitted), the value is also returned as native JSON in result_json (or the
+  reason it isn't JSON in result_json_error).
   Maintains persistent state across calls.
   """
+  if return_json is None:
+    # pylint: disable-next=g-import-not-at-top
+    from shared.config import load_config
+
+    return_json = bool(load_config().get("eval_result_json"))
   _init_session_globals()
 
   stdout_capture = io.StringIO()
   stderr_capture = io.StringIO()
   result_value = None
+  has_value = False
 
   # Use context managers to redirect stdout/stderr safely
   try:
@@ -156,6 +186,7 @@ def idapython_eval(
             "result": "",
             "stdout": stdout_capture.getvalue(),
             "stderr": stderr_capture.getvalue(),
+            "result_type": "",
         }
 
       # 2. Analyze the AST to handle Jupyter-style last-expression logic
@@ -183,6 +214,7 @@ def idapython_eval(
         # evaluate arbitrary Python code in the IDA Pro environment.
         # pylint: disable=eval-used
         result_value = eval(expr_code, _session_globals)
+        has_value = True
 
   except Exception:  # pylint: disable=broad-exception-caught
     # The broad exception is intentional here to catch any error during the
@@ -190,8 +222,14 @@ def idapython_eval(
     # Capture traceback into stderr
     print(traceback.format_exc(), file=stderr_capture)
 
-  return {
+  output = {
       "result": str(result_value) if result_value is not None else "",
       "stdout": stdout_capture.getvalue(),
       "stderr": stderr_capture.getvalue(),
+      # "" when the code did not end in an expression (or it raised).
+      "result_type": type(result_value).__name__ if has_value else "",
   }
+  if return_json and has_value:
+    ok, value = _to_json_value(result_value)
+    output["result_json" if ok else "result_json_error"] = value
+  return output
