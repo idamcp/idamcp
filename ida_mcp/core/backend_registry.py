@@ -27,7 +27,9 @@ import logging
 import os
 import pathlib
 import tempfile
-from typing import Any
+from typing import Any, Iterable
+
+from shared import protocol
 
 
 class RegistryManager:
@@ -44,6 +46,7 @@ class RegistryManager:
       address: str | int,
       name: str,
       metadata: dict[str, Any] | None = None,
+      capabilities: Iterable[str] = (),
   ) -> pathlib.Path | None:
     """Register a backend.
 
@@ -52,6 +55,8 @@ class RegistryManager:
       address: port number (int) for tcp, or path (str) for uds.
       name: the identifier name.
       metadata: Optional dictionary containing database metadata.
+      capabilities: Capabilities of this backend instance, advertised in
+        addition to protocol.BACKEND_CAPABILITIES.
 
     Returns:
       Path to the registry file created, or None if failed.
@@ -64,6 +69,8 @@ class RegistryManager:
         "address": address,
         "name": name,
         "metadata": metadata or {},
+        # Gateways from before the protocol check ignore these keys.
+        **protocol.record_fields(capabilities),
     }
     file_path = self.registry_dir / f"{name}.json"
     temp_path = ""

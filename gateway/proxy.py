@@ -1071,7 +1071,8 @@ async def idapython_eval(
 
   Returns dict with result/stdout/stderr. Has access to all IDA API modules.
   Supports Jupyter-style evaluation (returns the value of the last expression).
-  Maintains persistent state across calls.
+  Maintains persistent state across calls; the server can be configured to
+  keep separate state per MCP session.
   """
   return await forward_to(database_id, "idapython_eval", locals())
 

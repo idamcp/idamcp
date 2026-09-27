@@ -25,6 +25,7 @@
 import logging
 from typing import Any, Dict, List
 from ida_mcp.core import ida_thread
+from ida_mcp.core import lease
 from ida_mcp.core.decorators import internal, jsonrpc
 from ida_mcp.core.rpc_registry import rpc_registry
 from ida_mcp.core.security import security_manager
@@ -79,3 +80,26 @@ def close_database() -> None:
       "Received close_database RPC call. Stopping loop..."
   )
   ida_thread.stop()
+
+
+@internal
+@jsonrpc
+async def lease_acquire() -> bool:
+  """Gives the calling connection a lease on this headless instance.
+
+  Only effective on headless instances with headless_lifetime "lease"; returns
+  False elsewhere. The lease ends with lease_release or when the connection
+  closes.
+  """
+  return lease.acquire_current()
+
+
+@internal
+@jsonrpc
+async def lease_release() -> Dict[str, Any]:
+  """Ends the calling connection's lease.
+
+  Returns {"released": bool, "remaining": int}. When the last lease is
+  released, the instance saves and exits right away.
+  """
+  return lease.release_current()

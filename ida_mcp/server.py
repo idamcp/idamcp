@@ -37,6 +37,8 @@ sys.path = [str(root_dir)] + [p for p in sys.path if p != str(root_dir)]
 
 import asyncio
 from shared.rpc import RPCServer
+from ida_mcp.core import ida_thread
+from ida_mcp.core import lease
 from ida_mcp.core.backend_registry import RegistryManager
 from ida_mcp.core.rpc_registry import rpc_registry
 from ida_mcp.core.security import security_manager
@@ -172,7 +174,17 @@ def mcp_server_thread(identifier: str):
     print(f"[MCP] Failed to fetch metadata for registration: {e}")
     return
 
+  def _lease_expired(reason: str) -> None:
+    del reason  # Logged by the lease manager.
+    ida_thread.stop()
+
+  lease_manager = lease.configure(
+      config, bool(metadata and metadata.get("is_headless")), _lease_expired
+  )
+
   def create_wrapper(tool_func):
+    counts_as_activity = not tool_func.__name__.startswith("lease_")
+
     @functools.wraps(tool_func)
     async def wrapper(*args, **kwargs):
 
@@ -180,9 +192,15 @@ def mcp_server_thread(identifier: str):
         raise ToolError(
             f"Tool '{tool_func.__name__}' is unsafe and not enabled."
         )
-      result = tool_func(*args, **kwargs)
-      if inspect.isawaitable(result):
-        result = await result
+      if lease_manager is not None and counts_as_activity:
+        lease_manager.call_started()
+      try:
+        result = tool_func(*args, **kwargs)
+        if inspect.isawaitable(result):
+          result = await result
+      finally:
+        if lease_manager is not None and counts_as_activity:
+          lease_manager.call_finished()
       return result
 
     # Python 3.14 uses __annotate__ instead of __annotations__ in
@@ -207,16 +225,26 @@ def mcp_server_thread(identifier: str):
     server = None
     socket_path = None
     stop_event = asyncio.Event()
+    watch_task = None
+    capabilities = (lease.CAPABILITY,) if lease_manager is not None else ()
 
     with _servers_lock:
       _running_servers[identifier] = (loop, stop_event)
 
     try:
       server = RPCServer(methods)
+      if lease_manager is not None:
+        watch_task = asyncio.create_task(lease_manager.watch())
       if channel == "tcp":
         srv = await server.start_tcp("127.0.0.1", 0)
         port = srv.sockets[0].getsockname()[1]
-        registry.register("tcp", port, name=identifier, metadata=metadata)
+        registry.register(
+            "tcp",
+            port,
+            name=identifier,
+            metadata=metadata,
+            capabilities=capabilities,
+        )
       else:
         uds_dir = config["uds_dir"]
         socket_path = os.path.join(uds_dir, f"{identifier}.sock")
@@ -225,13 +253,19 @@ def mcp_server_thread(identifier: str):
             os.unlink(socket_path)
         await server.start_uds(socket_path)
         registry.register(
-            "uds", socket_path, name=identifier, metadata=metadata
+            "uds",
+            socket_path,
+            name=identifier,
+            metadata=metadata,
+            capabilities=capabilities,
         )
 
       await stop_event.wait()
     except asyncio.CancelledError:
       pass
     finally:
+      if watch_task is not None:
+        watch_task.cancel()
       with _servers_lock:
         _running_servers.pop(identifier, None)
       if server is not None:

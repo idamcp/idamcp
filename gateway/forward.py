@@ -41,6 +41,7 @@ from pydantic import BaseModel
 from pydantic import ConfigDict
 from pydantic import Field
 from shared import load_options
+from shared import protocol
 from shared.config import load_config
 from shared.rpc import RPCClient
 from shared.rpc import RPCError
@@ -145,6 +146,87 @@ _backend_events: dict[str, asyncio.Event] = collections.defaultdict(
     asyncio.Event
 )
 _background_tasks: set[asyncio.Task] = set()
+# Capabilities advertised in the registry record of each connected backend.
+_global_capabilities: dict[str, frozenset[str]] = {}
+# Lease backends (headless_lease capability) this gateway holds a lease on. The
+# lease is taken again after a reconnect.
+_leased: set[str] = set()
+# Backends that registered but were not connected because of a protocol
+# version mismatch, mapped to the message shown to the user.
+_incompatible_backends: dict[str, str] = {}
+
+
+def backend_capabilities(database_id: str) -> frozenset[str]:
+  """Returns the optional features a connected backend advertised.
+
+  Backends from before the protocol check advertise none.
+
+  Args:
+    database_id: The ID of the backend.
+
+  Returns:
+    The capability names, or an empty set for unknown backends.
+  """
+  return _global_capabilities.get(database_id, frozenset())
+
+
+def _uses_leases(database_id: str) -> bool:
+  """Returns True if the backend's lifetime follows its clients' leases."""
+  return protocol.HEADLESS_LEASE in backend_capabilities(database_id)
+
+
+async def _acquire_lease(database_id: str, client: RPCClient) -> bool:
+  """Takes a lease on a lease backend for this gateway's connection."""
+  try:
+    acquired = await asyncio.wait_for(
+        client.call(method="lease_acquire", params={}), timeout=10.0
+    )
+  except Exception as e:  # pylint: disable=broad-exception-caught
+    logging.warning(
+        "[Gateway] Could not take a lease on backend %s: %s", database_id, e
+    )
+    return False
+  if acquired:
+    _leased.add(database_id)
+    logging.info("[Gateway] Holding a lease on backend %s", database_id)
+  return bool(acquired)
+
+
+# How long idalib_headless_close waits for a lease backend to save and exit
+# after it released the last lease.
+_LEASE_EXIT_TIMEOUT = 60.0
+
+
+async def _release_lease(database_id: str) -> None:
+  """Releases this gateway's lease; waits for the exit if it was the last."""
+  client = _global_clients.get(database_id)
+  if client is None or database_id not in _leased:
+    return
+  _leased.discard(database_id)
+  _headless_manager.forget(database_id)
+  pid = _global_metadata.get(database_id, {}).get("pid")
+  try:
+    result = await asyncio.wait_for(
+        client.call(method="lease_release", params={}), timeout=10.0
+    )
+  except Exception as e:  # pylint: disable=broad-exception-caught
+    raise ToolError(f"Could not release the lease on {database_id}: {e}") from e
+  if not isinstance(result, dict) or result.get("remaining") != 0:
+    # Other clients still use the instance.
+    return
+  # This was the last lease: the backend saves and exits. Wait for it, so that
+  # opening the same file again right after this call starts a new instance.
+  if pid:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _LEASE_EXIT_TIMEOUT
+    while _is_process_running(pid):
+      if loop.time() >= deadline:
+        raise ToolError(
+            f"Released the last lease on {database_id}, but it has not exited"
+            f" after {_LEASE_EXIT_TIMEOUT:g} s; it may still be saving."
+        )
+      await asyncio.sleep(0.1)
+  await disconnect_backend(database_id)
 
 
 def _create_background_task(coro) -> asyncio.Task:
@@ -227,6 +309,11 @@ class HeadlessManager:
     pid = _global_database_id_to_pid.pop(database_id, None)
     if pid is not None and _is_process_running(pid):
       _create_background_task(_kill_process_gracefully(pid))
+
+  def forget(self, database_id: str) -> None:
+    """Stops tracking an instance without closing or killing it."""
+    self.spawned_instances.discard(database_id)
+    _global_database_id_to_pid.pop(database_id, None)
 
   async def close(self, database_id: str) -> None:
     """Close a specific headless instance gracefully."""
@@ -420,6 +507,22 @@ async def connect_to_backend(registry_file: pathlib.Path) -> None:
       _cleanup_stale_registry_file(registry_file, data)
       return
 
+    # The backend process is alive, so keep its registry file even if the
+    # protocol versions do not match.
+    if reason := protocol.incompatibility_reason(data):
+      logging.error(
+          "[Gateway] Not connecting to backend %s: %s", backend_id, reason
+      )
+      _incompatible_backends[backend_id] = reason
+      return
+    _incompatible_backends.pop(backend_id, None)
+    if protocol.is_legacy_record(data):
+      logging.warning(
+          "[Gateway] Backend %s did not report a protocol version (idamcp"
+          " plugin from before the protocol check); assuming no capabilities.",
+          backend_id,
+      )
+
     metadata = data.get("metadata", {})
     # Ensure database_id is present in the metadata
     metadata["database_id"] = backend_id
@@ -461,9 +564,17 @@ async def connect_to_backend(registry_file: pathlib.Path) -> None:
       # Reset the closed state for new connections under the same ID
       _global_clients[backend_id] = client
       _global_metadata[backend_id] = metadata  # type: ignore
+      _global_capabilities[backend_id] = protocol.parse_capabilities(data)
       _global_client_state[backend_id].is_closed = False
       _global_client_state[backend_id].is_broken = False
       logging.info("[Gateway] Successfully connected to backend %s", backend_id)
+
+    # A lease backend exits when no client holds a lease. The gateway that
+    # spawned it takes one right away; others take one on their first call.
+    if _uses_leases(backend_id) and (
+        backend_id in _global_database_id_to_pid or backend_id in _leased
+    ):
+      await _acquire_lease(backend_id, client)
 
   except Exception as e:  # pylint: disable=broad-exception-caught
     logging.error(
@@ -485,6 +596,10 @@ async def disconnect_backend(backend_id: str, unregister: bool = True) -> None:
       backend_id,
       unregister,
   )
+  _incompatible_backends.pop(backend_id, None)
+  # A lease backend decides itself when to exit: closing the connection
+  # releases this gateway's lease, so don't close or kill it.
+  lease_backend = _uses_leases(backend_id)
   client = None
   with contextlib.suppress(Exception):
     async with _global_client_state[backend_id].condition:
@@ -518,11 +633,15 @@ async def disconnect_backend(backend_id: str, unregister: bool = True) -> None:
           return
       client = _global_clients.pop(backend_id, None)
       _global_metadata.pop(backend_id, None)
+      _global_capabilities.pop(backend_id, None)
     try:
       if client:
         # If it is a headless instance opened by us, request graceful shutdown
         # first
-        if _global_database_id_to_pid.get(backend_id) is not None:
+        if (
+            not lease_backend
+            and _global_database_id_to_pid.get(backend_id) is not None
+        ):
           try:
             logging.info(
                 "[Gateway] Requesting graceful database close for %s",
@@ -547,8 +666,11 @@ async def disconnect_backend(backend_id: str, unregister: bool = True) -> None:
       )
     finally:
       if unregister and _global_client_state[backend_id].is_closed:
-        logging.info("[Gateway] Calling unregister for %s", backend_id)
-        await _headless_manager.unregister(backend_id)
+        if lease_backend:
+          _headless_manager.forget(backend_id)
+        else:
+          logging.info("[Gateway] Calling unregister for %s", backend_id)
+          await _headless_manager.unregister(backend_id)
 
 
 # --- The Watchdog Handler ---
@@ -590,8 +712,46 @@ class RegistryEventHandler(FileSystemEventHandler):
     logging.debug("on_deleted: %s", event.src_path)
     if src_path.endswith(".json"):
       asyncio.run_coroutine_threadsafe(
-          disconnect_backend(pathlib.Path(src_path).stem), self.loop
+          _backend_removed(pathlib.Path(src_path).stem), self.loop
       )
+
+
+async def _backend_removed(backend_id: str) -> None:
+  """Handles a backend whose registry record was deleted."""
+  _leased.discard(backend_id)
+  await disconnect_backend(backend_id)
+
+
+def _mcp_session_id() -> str | None:
+  """Returns the MCP session id of the running tool call, or None."""
+  try:
+    # pylint: disable=g-import-not-at-top
+    from fastmcp.server.dependencies import get_context
+
+    session_id = get_context().session_id
+  except Exception:  # pylint: disable=broad-exception-caught
+    return None
+  return session_id if isinstance(session_id, str) else None
+
+
+def _request_meta(target: str) -> dict[str, Any] | None:
+  """Returns the RPC request metadata for a call to the backend, if any.
+
+  Only backends that advertise "eval_namespaces" get the MCP session id; older
+  backends receive the same requests as before.
+
+  Args:
+    target: The ID of the backend.
+
+  Returns:
+    The metadata, or None when there is nothing to send.
+  """
+  if "eval_namespaces" not in backend_capabilities(target):
+    return None
+  session_id = _mcp_session_id()
+  if session_id is None:
+    return None
+  return {"session": session_id}
 
 
 async def forward_to(target: str, tool_name: str, args: dict[str, Any]) -> Any:
@@ -615,7 +775,14 @@ async def forward_to(target: str, tool_name: str, args: dict[str, Any]) -> Any:
     client = _global_clients.get(target)
     if client is None:
       logging.info("[Gateway] forward_to: client for %s not found", target)
+      if reason := _incompatible_backends.get(target):
+        raise ToolError(
+            f"Error: Backend database {target} is not connected. {reason}"
+        )
       raise ToolError(f"Error: Backend database {target} not found")
+
+    if _uses_leases(target) and target not in _leased:
+      await _acquire_lease(target, client)
 
     call_arguments = {k: v for k, v in args.items() if k != "database_id"}
 
@@ -623,7 +790,12 @@ async def forward_to(target: str, tool_name: str, args: dict[str, Any]) -> Any:
       logging.info(
           "[Gateway] Sending RPC call to backend %s: %s", target, tool_name
       )
-      result = await client.call(method=tool_name, params=call_arguments)
+      if meta := _request_meta(target):
+        result = await client.call(
+            method=tool_name, params=call_arguments, meta=meta
+        )
+      else:
+        result = await client.call(method=tool_name, params=call_arguments)
       logging.info(
           "[Gateway] RPC call to backend %s: %s succeeded", target, tool_name
       )
@@ -829,12 +1001,19 @@ async def list_available_databases() -> list[DatabaseInfo]:
     await disconnect_backend(db_id)
     _cleanup_stale_registry_by_id(db_id, metadata)
   if not available:
-    raise ToolError(
+    message = (
         "It looks like there are currently no available IDA databases. If"
         " you've just closed them or haven't opened any yet, you might need to"
         " open your target binary in IDA first, or launch a headless instance"
         " if you want to operate without the UI."
     )
+    if _incompatible_backends:
+      details = " ".join(
+          f"[{db_id}] {reason}"
+          for db_id, reason in sorted(_incompatible_backends.items())
+      )
+      message += f" IDA instances found but not connected: {details}"
+    raise ToolError(message)
   return available
 
 
@@ -889,7 +1068,14 @@ async def idalib_headless_open(
 
 @mcp_tool
 async def idalib_headless_close(database_id: str) -> None:
-  """Close a headless IDA instance."""
+  """Close a headless IDA instance.
+
+  With headless_lifetime "lease", an instance that other clients still use
+  stays open for them; otherwise it saves and exits before this returns.
+  """
+  if _uses_leases(database_id):
+    await _release_lease(database_id)
+    return
   # Only close the database opened by us and not already closed.
   if (
       _global_database_id_to_pid.get(database_id, None) is not None

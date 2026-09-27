@@ -147,6 +147,48 @@ class TestConfig(unittest.TestCase):
       config = shared.config.load_config(config_path="/nonexistent")
       self.assertTrue(config.get("check_entries_freshness"))
 
+  def test_eval_namespace_scope_default(self):
+    """Test that idapython_eval shares one namespace by default."""
+    with mock.patch.dict("os.environ"):
+      os.environ.pop("EVAL_NAMESPACE_SCOPE", None)
+      config = shared.config.load_config(config_path="/nonexistent")
+      self.assertEqual(config.get("eval_namespace_scope"), "process")
+
+  def test_eval_namespace_scope_env(self):
+    """Test EVAL_NAMESPACE_SCOPE environment variable."""
+    with mock.patch.dict("os.environ", {"EVAL_NAMESPACE_SCOPE": "session"}):
+      config = shared.config.load_config(config_path="/nonexistent")
+      self.assertEqual(config.get("eval_namespace_scope"), "session")
+
+  def test_headless_lifetime_defaults(self):
+    """Test that headless instances keep today's lifetime by default."""
+    with mock.patch.dict("os.environ"):
+      for name in (
+          "HEADLESS_LIFETIME",
+          "HEADLESS_LEASE_GRACE",
+          "HEADLESS_IDLE_TIMEOUT",
+      ):
+        os.environ.pop(name, None)
+      config = shared.config.load_config(config_path="/nonexistent")
+    self.assertEqual(config["headless_lifetime"], "spawner")
+    self.assertEqual(config["headless_lease_grace"], 30.0)
+    self.assertEqual(config["headless_idle_timeout"], 0.0)
+
+  def test_headless_lifetime_env(self):
+    """Test the HEADLESS_LIFETIME/LEASE_GRACE/IDLE_TIMEOUT variables."""
+    with mock.patch.dict(
+        "os.environ",
+        {
+            "HEADLESS_LIFETIME": "lease",
+            "HEADLESS_LEASE_GRACE": "5",
+            "HEADLESS_IDLE_TIMEOUT": "600",
+        },
+    ):
+      config = shared.config.load_config(config_path="/nonexistent")
+    self.assertEqual(config["headless_lifetime"], "lease")
+    self.assertEqual(config["headless_lease_grace"], 5.0)
+    self.assertEqual(config["headless_idle_timeout"], 600.0)
+
   def test_no_user_config_env(self):
     """Test that IDAMCP_NO_USER_CONFIG ignores user configuration files."""
     with mock.patch.dict("os.environ", {"IDAMCP_NO_USER_CONFIG": "1"}):

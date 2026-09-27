@@ -49,6 +49,10 @@ _DEFAULT_CONFIG = {
     "proxy_host": "localhost",
     "proxy_port": 8000,
     "flush_after_write": False,
+    "eval_namespace_scope": "process",
+    "headless_lifetime": "spawner",
+    "headless_lease_grace": 30.0,
+    "headless_idle_timeout": 0.0,
 }
 
 
@@ -169,6 +173,10 @@ def load_config(config_path: str | None = None) -> dict[str, Any]:
   _set_option_from_env(config, "sqlite_persistent")
   _set_option_from_env(config, "check_entries_freshness")
   _set_option_from_env(config, "flush_after_write")
+  _set_option_from_env(config, "eval_namespace_scope")
+  _set_option_from_env(config, "headless_lifetime")
+  _set_option_from_env(config, "headless_lease_grace")
+  _set_option_from_env(config, "headless_idle_timeout")
 
   if not 0 <= config["proxy_port"] <= 65535:
     logging.warning(

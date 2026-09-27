@@ -22,16 +22,23 @@
 """Module for executing Python code in the IDA Pro environment."""
 
 import ast
+import collections
 import contextlib
 import io
+import logging
 import sys
+import threading
 import traceback
-from typing import Annotated, Any, Dict
+from typing import Annotated, Any, Dict, Hashable
 
 from ida_mcp.core.decorators import jsonrpc
 from ida_mcp.core.decorators import unsafe
 from ida_mcp.core.synchronization import idawrite
 from ida_mcp.utils import helper
+from shared import rpc
+from shared.config import load_config
+
+logger = logging.getLogger(__name__)
 
 # Persistent global scope for the session
 _session_globals: Dict[str, Any] = {}
@@ -115,6 +122,71 @@ def _init_session_globals():
   _session_globals["__builtins__"] = __builtins__
   _session_globals["parse_and_check_ea"] = helper.parse_and_check_ea
   _session_globals["get_function"] = helper.get_function
+  _base_globals.update(_session_globals)
+
+
+# Pristine copy of the initial scope, used to start per-session namespaces.
+_base_globals: Dict[str, Any] = {}
+
+# Per-session namespaces for eval_namespace_scope "session", most recently used
+# last. Keys are (connection id, gateway session id).
+_MAX_SESSION_NAMESPACES = 32
+_session_namespaces: collections.OrderedDict[Hashable, Dict[str, Any]] = (
+    collections.OrderedDict()
+)
+_namespaces_lock = threading.Lock()
+_warned_scope: set[str] = set()
+
+
+def _drop_connection_namespaces(connection_id: int) -> None:
+  """Forgets the namespaces of an RPC connection that closed."""
+  with _namespaces_lock:
+    for key in [k for k in _session_namespaces if k[0] == connection_id]:
+      del _session_namespaces[key]
+
+
+rpc.add_connection_close_listener(_drop_connection_namespaces)
+
+
+def _namespace_scope() -> str:
+  scope = str(load_config().get("eval_namespace_scope", "process")).lower()
+  if scope not in ("process", "session"):
+    if scope not in _warned_scope:
+      _warned_scope.add(scope)
+      logger.warning("Unknown eval_namespace_scope %r; using 'process'.", scope)
+    return "process"
+  return scope
+
+
+def _current_namespace() -> Dict[str, Any]:
+  """Returns the globals idapython_eval runs the code in.
+
+  With eval_namespace_scope "process" (default) all callers share one
+  namespace. With "session" each MCP session gets its own: the gateway sends
+  its session id in the request metadata, and callers that send none (older
+  gateways, direct RPC clients) get one namespace per connection. Calls that do
+  not come through RPC use the process namespace.
+  """
+  if _namespace_scope() != "session":
+    return _session_globals
+  session = rpc.current_meta().get("session")
+  key = (
+      rpc.current_connection(),
+      session if isinstance(session, str) else None,
+  )
+  if key == (None, None):
+    return _session_globals
+  with _namespaces_lock:
+    namespace = _session_namespaces.get(key)
+    if namespace is not None:
+      _session_namespaces.move_to_end(key)
+      return namespace
+    namespace = dict(_base_globals)
+    _session_namespaces[key] = namespace
+    while len(_session_namespaces) > _MAX_SESSION_NAMESPACES:
+      evicted, _ = _session_namespaces.popitem(last=False)
+      logger.info("Dropped the idapython_eval namespace of %r", evicted)
+    return namespace
 
 
 @jsonrpc
@@ -127,9 +199,11 @@ def idapython_eval(
 
   Returns dict with result/stdout/stderr. Has access to all IDA API modules.
   Supports Jupyter-style evaluation (returns the value of the last expression).
-  Maintains persistent state across calls.
+  Maintains persistent state across calls; the server can be configured to
+  keep separate state per MCP session.
   """
   _init_session_globals()
+  namespace = _current_namespace()
 
   stdout_capture = io.StringIO()
   stderr_capture = io.StringIO()
@@ -151,7 +225,7 @@ def idapython_eval(
         # The use of exec is intentional here, as this function is meant to
         # execute arbitrary Python code in the IDA Pro environment.
         # pylint: disable=exec-used
-        exec(code, _session_globals)
+        exec(code, namespace)
         return {  # Should not be reached if exec raises
             "result": "",
             "stdout": stdout_capture.getvalue(),
@@ -172,7 +246,7 @@ def idapython_eval(
         # The use of exec is intentional here, as this function is meant to
         # execute arbitrary Python code in the IDA Pro environment.
         # pylint: disable=exec-used
-        exec(code_obj, _session_globals)
+        exec(code_obj, namespace)
 
       # 4. Compile and evaluate the last expression
       if last_node is not None:
@@ -182,7 +256,7 @@ def idapython_eval(
         # The use of eval is intentional here, as this function is meant to
         # evaluate arbitrary Python code in the IDA Pro environment.
         # pylint: disable=eval-used
-        result_value = eval(expr_code, _session_globals)
+        result_value = eval(expr_code, namespace)
 
   except Exception:  # pylint: disable=broad-exception-caught
     # The broad exception is intentional here to catch any error during the
