@@ -594,12 +594,7 @@ async def dbg_enable_breakpoint(
 
 @mcp_tool
 async def save_database(
-    database_id: Annotated[
-        str,
-        "The unique identifier for the target IDA database. You can obtain this"
-        " ID by calling list_available_databases, reading the ida://databases"
-        " resource, or by opening a new database via idalib_headless_open.",
-    ],
+    database_id: DatabaseId,
 ) -> SaveDatabaseResult:
   """Saves the IDA database so renames, comments, types and patches persist.
 
