@@ -147,6 +147,17 @@ class TestConfig(unittest.TestCase):
       config = shared.config.load_config(config_path="/nonexistent")
       self.assertTrue(config.get("check_entries_freshness"))
 
+  def test_async_interrupt_default(self):
+    """Test async_interrupt is on by default."""
+    config = shared.config.load_config(config_path="/nonexistent")
+    self.assertTrue(config.get("async_interrupt"))
+
+  def test_async_interrupt_env(self):
+    """Test ASYNC_INTERRUPT environment variable."""
+    with mock.patch.dict("os.environ", {"ASYNC_INTERRUPT": "0"}):
+      config = shared.config.load_config(config_path="/nonexistent")
+      self.assertFalse(config.get("async_interrupt"))
+
   def test_no_user_config_env(self):
     """Test that IDAMCP_NO_USER_CONFIG ignores user configuration files."""
     with mock.patch.dict("os.environ", {"IDAMCP_NO_USER_CONFIG": "1"}):

@@ -28,6 +28,7 @@ import sys
 import traceback
 from typing import Annotated, Any, Dict
 
+from ida_mcp.core import interrupt
 from ida_mcp.core.decorators import jsonrpc
 from ida_mcp.core.decorators import unsafe
 from ida_mcp.core.synchronization import idawrite
@@ -157,6 +158,11 @@ def idapython_eval(
             "stdout": stdout_capture.getvalue(),
             "stderr": stderr_capture.getvalue(),
         }
+
+      # Keep `except:` / `except BaseException:` in the submitted code from
+      # swallowing a cancellation.
+      interrupt.protect_handlers(tree)
+      _session_globals[interrupt.INTERRUPT_GLOBAL] = interrupt.ToolInterrupt
 
       # 2. Analyze the AST to handle Jupyter-style last-expression logic
       last_node = None

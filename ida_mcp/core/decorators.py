@@ -46,6 +46,7 @@ from typing import (
     get_args,
     get_origin,
 )
+from ida_mcp.core.interrupt import ToolInterrupt
 from ida_mcp.core.rpc_registry import rpc_registry
 
 logger = logging.getLogger(__name__)
@@ -152,7 +153,8 @@ def make_cancellation_profile_func(
   def _profile_func(unused_frame, unused_event, unused_arg) -> None:
     if token.is_cancelled:
       # Raising an exception automatically sets the profile function to None.
-      raise asyncio.CancelledError("Tool cancelled")
+      # ToolInterrupt is a CancelledError that guarded user code re-raises.
+      raise ToolInterrupt("Tool cancelled")
 
   _profile_func.is_ida_mcp_canceller = True  # type: ignore
   _profile_func.token = token  # type: ignore

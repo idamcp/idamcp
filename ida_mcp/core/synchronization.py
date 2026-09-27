@@ -29,6 +29,7 @@ from typing import Any, Callable
 
 import ida_kernwin
 from ida_mcp.core import ida_thread
+from ida_mcp.core import interrupt
 from ida_mcp.core.decorators import cancellation_profile
 from ida_mcp.core.decorators import get_cancellation_token
 import idaapi
@@ -85,6 +86,28 @@ class IDASafety(enum.IntEnum):
   SAFE_WRITE = ida_kernwin.MFF_WRITE
 
 
+def _make_interruptible(token) -> interrupt.InterruptibleCall | None:
+  """Returns a tracker for asynchronous interruption, or None if not used.
+
+  Used when the call has a cancellation token, the `async_interrupt` option is
+  on (default), and CPython exposes PyThreadState_SetAsyncExc. Otherwise only
+  the `sys.setprofile` canceller applies, as before.
+  """
+  if token is None:
+    return None
+  try:
+    # pylint: disable-next=g-import-not-at-top
+    from shared.config import load_config
+
+    if not load_config().get("async_interrupt", True):
+      return None
+  except Exception as e:  # pylint: disable=broad-exception-caught
+    logger.error("Could not read async_interrupt option: %s", e)
+  if not interrupt.is_available():
+    return None
+  return interrupt.InterruptibleCall()
+
+
 class _IDACall:
   """Helper to execute a callable on IDA's main thread with safety and cancellation checks."""
 
@@ -116,10 +139,26 @@ class _IDACall:
       return
 
     old_batch = idc.batch(1)
+    interruptible = _make_interruptible(self.token)
     try:
       with cancellation_profile(self.token):
-        self.result = self.ff()
-        self.success = True
+        # The injection window is limited to the tool body. exit() clears an
+        # undelivered interrupt before the profile hook is restored.
+        unregister = None
+        try:
+          if interruptible is not None:
+            interruptible.enter()
+            unregister = self.token.register_callback(interruptible.request)
+          self.result = self.ff()
+          self.success = True
+        finally:
+          if unregister is not None:
+            unregister()
+          if interruptible is not None:
+            interruptible.exit()
+    except interrupt.ToolInterrupt:
+      self.success = False
+      self.result = interrupt.ToolInterrupt("Tool cancelled")
     except BaseException as e:
       self.success = False
       self.result = e
