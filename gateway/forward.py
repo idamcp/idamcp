@@ -41,6 +41,7 @@ from pydantic import BaseModel
 from pydantic import ConfigDict
 from pydantic import Field
 from shared import load_options
+from shared import protocol
 from shared.config import load_config
 from shared.rpc import RPCClient
 from shared.rpc import RPCError
@@ -145,6 +146,25 @@ _backend_events: dict[str, asyncio.Event] = collections.defaultdict(
     asyncio.Event
 )
 _background_tasks: set[asyncio.Task] = set()
+# Capabilities advertised in the registry record of each connected backend.
+_global_capabilities: dict[str, frozenset[str]] = {}
+# Backends that registered but were not connected because of a protocol
+# version mismatch, mapped to the message shown to the user.
+_incompatible_backends: dict[str, str] = {}
+
+
+def backend_capabilities(database_id: str) -> frozenset[str]:
+  """Returns the optional features a connected backend advertised.
+
+  Backends from before the protocol check advertise none.
+
+  Args:
+    database_id: The ID of the backend.
+
+  Returns:
+    The capability names, or an empty set for unknown backends.
+  """
+  return _global_capabilities.get(database_id, frozenset())
 
 
 def _create_background_task(coro) -> asyncio.Task:
@@ -420,6 +440,22 @@ async def connect_to_backend(registry_file: pathlib.Path) -> None:
       _cleanup_stale_registry_file(registry_file, data)
       return
 
+    # The backend process is alive, so keep its registry file even if the
+    # protocol versions do not match.
+    if reason := protocol.incompatibility_reason(data):
+      logging.error(
+          "[Gateway] Not connecting to backend %s: %s", backend_id, reason
+      )
+      _incompatible_backends[backend_id] = reason
+      return
+    _incompatible_backends.pop(backend_id, None)
+    if protocol.is_legacy_record(data):
+      logging.warning(
+          "[Gateway] Backend %s did not report a protocol version (idamcp"
+          " plugin from before the protocol check); assuming no capabilities.",
+          backend_id,
+      )
+
     metadata = data.get("metadata", {})
     # Ensure database_id is present in the metadata
     metadata["database_id"] = backend_id
@@ -461,6 +497,7 @@ async def connect_to_backend(registry_file: pathlib.Path) -> None:
       # Reset the closed state for new connections under the same ID
       _global_clients[backend_id] = client
       _global_metadata[backend_id] = metadata  # type: ignore
+      _global_capabilities[backend_id] = protocol.parse_capabilities(data)
       _global_client_state[backend_id].is_closed = False
       _global_client_state[backend_id].is_broken = False
       logging.info("[Gateway] Successfully connected to backend %s", backend_id)
@@ -485,6 +522,7 @@ async def disconnect_backend(backend_id: str, unregister: bool = True) -> None:
       backend_id,
       unregister,
   )
+  _incompatible_backends.pop(backend_id, None)
   client = None
   with contextlib.suppress(Exception):
     async with _global_client_state[backend_id].condition:
@@ -518,6 +556,7 @@ async def disconnect_backend(backend_id: str, unregister: bool = True) -> None:
           return
       client = _global_clients.pop(backend_id, None)
       _global_metadata.pop(backend_id, None)
+      _global_capabilities.pop(backend_id, None)
     try:
       if client:
         # If it is a headless instance opened by us, request graceful shutdown
@@ -594,6 +633,38 @@ class RegistryEventHandler(FileSystemEventHandler):
       )
 
 
+def _mcp_session_id() -> str | None:
+  """Returns the MCP session id of the running tool call, or None."""
+  try:
+    # pylint: disable=g-import-not-at-top
+    from fastmcp.server.dependencies import get_context
+
+    session_id = get_context().session_id
+  except Exception:  # pylint: disable=broad-exception-caught
+    return None
+  return session_id if isinstance(session_id, str) else None
+
+
+def _request_meta(target: str) -> dict[str, Any] | None:
+  """Returns the RPC request metadata for a call to the backend, if any.
+
+  Only backends that advertise "eval_namespaces" get the MCP session id; older
+  backends receive the same requests as before.
+
+  Args:
+    target: The ID of the backend.
+
+  Returns:
+    The metadata, or None when there is nothing to send.
+  """
+  if "eval_namespaces" not in backend_capabilities(target):
+    return None
+  session_id = _mcp_session_id()
+  if session_id is None:
+    return None
+  return {"session": session_id}
+
+
 async def forward_to(target: str, tool_name: str, args: dict[str, Any]) -> Any:
   """Forwards a tool call to the running backend server."""
   logging.info(
@@ -615,6 +686,10 @@ async def forward_to(target: str, tool_name: str, args: dict[str, Any]) -> Any:
     client = _global_clients.get(target)
     if client is None:
       logging.info("[Gateway] forward_to: client for %s not found", target)
+      if reason := _incompatible_backends.get(target):
+        raise ToolError(
+            f"Error: Backend database {target} is not connected. {reason}"
+        )
       raise ToolError(f"Error: Backend database {target} not found")
 
     call_arguments = {k: v for k, v in args.items() if k != "database_id"}
@@ -623,7 +698,12 @@ async def forward_to(target: str, tool_name: str, args: dict[str, Any]) -> Any:
       logging.info(
           "[Gateway] Sending RPC call to backend %s: %s", target, tool_name
       )
-      result = await client.call(method=tool_name, params=call_arguments)
+      if meta := _request_meta(target):
+        result = await client.call(
+            method=tool_name, params=call_arguments, meta=meta
+        )
+      else:
+        result = await client.call(method=tool_name, params=call_arguments)
       logging.info(
           "[Gateway] RPC call to backend %s: %s succeeded", target, tool_name
       )
@@ -829,12 +909,19 @@ async def list_available_databases() -> list[DatabaseInfo]:
     await disconnect_backend(db_id)
     _cleanup_stale_registry_by_id(db_id, metadata)
   if not available:
-    raise ToolError(
+    message = (
         "It looks like there are currently no available IDA databases. If"
         " you've just closed them or haven't opened any yet, you might need to"
         " open your target binary in IDA first, or launch a headless instance"
         " if you want to operate without the UI."
     )
+    if _incompatible_backends:
+      details = " ".join(
+          f"[{db_id}] {reason}"
+          for db_id, reason in sorted(_incompatible_backends.items())
+      )
+      message += f" IDA instances found but not connected: {details}"
+    raise ToolError(message)
   return available
 
 

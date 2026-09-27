@@ -238,7 +238,8 @@ example of all available settings (showing defaults):
   "disabled_tools": [],
   "proxy_host": "localhost",
   "proxy_port": 8000,
-  "flush_after_write": false
+  "flush_after_write": false,
+  "eval_namespace_scope": "process"
 }
 ```
 
@@ -278,6 +279,16 @@ example of all available settings (showing defaults):
     `flush_buffers` call per modifying tool call and defaults to `False`. If
     `flush_buffers` is unavailable or fails, one error is logged and flushing
     stops for that session.
+*   **eval_namespace_scope**: Which callers share the variables that
+    `idapython_eval` keeps between calls. `"process"` (default): everyone
+    connected to the same IDA instance shares one namespace. `"session"`: each
+    MCP session gets its own namespace, so agents working on the same database
+    don't overwrite each other's variables. The gateway sends its MCP session id
+    to backends that support this; with an older gateway, or for direct RPC
+    clients, each connection gets its own namespace. The IDA plugin keeps up to
+    32 session namespaces, drops the least recently used one beyond that, and
+    drops a connection's namespaces when it disconnects. The setting is read by
+    the IDA plugin, so it applies to the backend's config.
 
 </details>
 
@@ -303,6 +314,8 @@ example of all available settings (showing defaults):
 *   **PROXY_PORT**: The port for the Gateway Proxy to listen on.
 *   **FLUSH_AFTER_WRITE**: Set to `true`, `1`, or `yes` to enable
     `flush_after_write`.
+*   **EVAL_NAMESPACE_SCOPE**: `process` or `session`; sets
+    `eval_namespace_scope`.
 
 </details>
 

@@ -21,6 +21,7 @@
 """Simple JSON-RPC implementation over TCP/UDS."""
 
 import asyncio
+import contextvars
 import dataclasses
 import json
 import logging
@@ -81,6 +82,35 @@ def set_keepalive(sock):
     logger.warning("Failed to set keepalive: %s", e)
 
 
+# Per-request context set by RPCServer for the method it runs. The optional
+# "meta" object of a request carries caller information that is not a method
+# parameter (for example the gateway's MCP session id), so methods don't have
+# to declare it and servers that predate it simply ignore it.
+_connection_var: contextvars.ContextVar[int | None] = contextvars.ContextVar(
+    "rpc_connection", default=None
+)
+_meta_var: contextvars.ContextVar[dict[str, Any]] = contextvars.ContextVar(
+    "rpc_meta", default={}
+)
+_connection_close_listeners: list[Callable[[int], None]] = []
+
+
+def current_connection() -> int | None:
+  """Returns an id for the connection of the running RPC request, or None."""
+  return _connection_var.get()
+
+
+def current_meta() -> dict[str, Any]:
+  """Returns the "meta" object of the running RPC request ({} if none)."""
+  return _meta_var.get()
+
+
+def add_connection_close_listener(listener: Callable[[int], None]) -> None:
+  """Calls listener(connection_id) whenever an RPCServer connection closes."""
+  if listener not in _connection_close_listeners:
+    _connection_close_listeners.append(listener)
+
+
 class RPCServer:
   """Simple JSON-RPC server."""
 
@@ -132,6 +162,11 @@ class RPCServer:
         await writer.wait_closed()
       except Exception:
         pass
+      for listener in list(_connection_close_listeners):
+        try:
+          listener(id(transport))
+        except Exception:  # pylint: disable=broad-exception-caught
+          logger.exception("Connection close listener failed")
       logger.info("Connection closed")
 
   async def process_request(self, request: dict, writer: asyncio.StreamWriter):
@@ -167,11 +202,19 @@ class RPCServer:
       return
 
     params = request.get("params", {})
+    meta = request.get("meta")
 
-    # Spawn task to handle the request
-    task = asyncio.create_task(
-        self.execute_method(req_id, method, params, writer)
-    )
+    # Spawn task to handle the request. The task copies the current context,
+    # so the method sees this request's connection and meta.
+    connection_token = _connection_var.set(id(transport))
+    meta_token = _meta_var.set(meta if isinstance(meta, dict) else {})
+    try:
+      task = asyncio.create_task(
+          self.execute_method(req_id, method, params, writer)
+      )
+    finally:
+      _meta_var.reset(meta_token)
+      _connection_var.reset(connection_token)
     self.running_tasks[transport][req_id] = task
     task.add_done_callback(
         lambda _: self.running_tasks[transport].pop(req_id, None)
@@ -336,7 +379,12 @@ class RPCClient:
         future.set_exception(exc)
     self.pending_requests.clear()
 
-  async def call(self, method: str, params: Any = None) -> Any:
+  async def call(
+      self,
+      method: str,
+      params: Any = None,
+      meta: dict[str, Any] | None = None,
+  ) -> Any:
     if self._closed or not self.writer:
       raise RPCError("Connection is closed")
 
@@ -350,6 +398,8 @@ class RPCClient:
         "params": params,
         "id": req_id,
     }
+    if meta:
+      request["meta"] = meta
 
     try:
       data = json.dumps(request, cls=RPCJSONEncoder).encode("utf-8") + b"\n"

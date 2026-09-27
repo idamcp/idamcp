@@ -22,6 +22,7 @@
 """Module for synchronizing with the IDA main thread."""
 
 import asyncio
+import contextvars
 import enum
 import functools
 import logging
@@ -103,6 +104,10 @@ class _IDACall:
     self.ff = ff
     self.safety_mode = safety_mode
     self.token = token
+    # Context variables do not cross threads. Capture the caller's context
+    # (request metadata such as the MCP session) so the function sees it on
+    # IDA's main thread.
+    self.context = contextvars.copy_context()
     self.success = False
     self.result: Any = IDASyncError(
         f"execute_sync silently failed to execute {ff.__name__}"
@@ -118,7 +123,7 @@ class _IDACall:
     old_batch = idc.batch(1)
     try:
       with cancellation_profile(self.token):
-        self.result = self.ff()
+        self.result = self.context.run(self.ff)
         self.success = True
     except BaseException as e:
       self.success = False

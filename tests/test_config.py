@@ -147,6 +147,19 @@ class TestConfig(unittest.TestCase):
       config = shared.config.load_config(config_path="/nonexistent")
       self.assertTrue(config.get("check_entries_freshness"))
 
+  def test_eval_namespace_scope_default(self):
+    """Test that idapython_eval shares one namespace by default."""
+    with mock.patch.dict("os.environ"):
+      os.environ.pop("EVAL_NAMESPACE_SCOPE", None)
+      config = shared.config.load_config(config_path="/nonexistent")
+      self.assertEqual(config.get("eval_namespace_scope"), "process")
+
+  def test_eval_namespace_scope_env(self):
+    """Test EVAL_NAMESPACE_SCOPE environment variable."""
+    with mock.patch.dict("os.environ", {"EVAL_NAMESPACE_SCOPE": "session"}):
+      config = shared.config.load_config(config_path="/nonexistent")
+      self.assertEqual(config.get("eval_namespace_scope"), "session")
+
   def test_no_user_config_env(self):
     """Test that IDAMCP_NO_USER_CONFIG ignores user configuration files."""
     with mock.patch.dict("os.environ", {"IDAMCP_NO_USER_CONFIG": "1"}):

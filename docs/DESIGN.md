@@ -243,12 +243,16 @@ The system uses a "Dead Drop" discovery mechanism.
 ### Workflow
 
 1.  **Registration**: When the IDA Plugin loads, it writes a JSON metadata file
-    (PID, Port, Auth Token) to the registry directory (default:
-    `~/.ida_mcp_registry`).
+    (PID, channel and address, database metadata, protocol version and
+    capabilities) to the registry directory (default: `~/.ida_mcp_registry`).
 2.  **Discovery**: The Gateway runs a `watchdog` thread monitoring this
     directory.
 3.  **Connection**: Upon seeing a new JSON file, the Gateway verifies the
-    process is alive and adds it to the routing table.
+    process is alive, checks the protocol version (`shared/protocol.py`), and
+    adds it to the routing table. Records without a protocol version come from
+    plugins older than this check and are accepted with no capabilities. A
+    version the gateway does not support is not connected; tool calls for it
+    return a message saying whether IDA or the MCP client must be restarted.
 4.  **Routing**: Incoming tool calls include a `database_id`. The Router
     inspects this ID and forwards the payload to the corresponding backend via
     SSE (Server-Sent Events).

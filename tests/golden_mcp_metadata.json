@@ -2755,13 +2755,49 @@
           "tags": []
         }
       },
-      "description": "Open a binary in a new headless IDA instance.\n\nIf the database is already open, this tool will raise an error containing\nthe existing session ID. It is recommended to call list_available_databases\nfirst to check for active sessions, or use the existing ID returned in the\nerror if you attempt to open an already-open database.",
+      "description": "Open a binary in a new headless IDA instance.\n\nIf the database is already open, this tool will raise an error containing\nthe existing session ID. It is recommended to call list_available_databases\nfirst to check for active sessions, or use the existing ID returned in the\nerror if you attempt to open an already-open database.\n\nprocessor/loader/base_address are for raw firmware or other files IDA can't\nidentify on its own; leave them unset to let IDA pick.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
+          "base_address": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional 16-byte aligned load address (IDA's -b), e.g. '0x10000'. Only for new binaries; needs IDA 9.1+"
+          },
+          "loader": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional file type name or prefix as IDA lists it (IDA's -T), e.g. 'Binary file'. Only for new binaries; needs IDA 9.1+"
+          },
           "path": {
             "description": "Path to the target binary or database",
             "type": "string"
+          },
+          "processor": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional IDA processor module (IDA's -p), e.g. 'metapc', 'arm', 'arm:ARMv7-M', 'mipsb'. Only for new binaries; needs IDA 9.1+"
           }
         },
         "required": [
@@ -2848,7 +2884,7 @@
           "tags": []
         }
       },
-      "description": "Execute Python code in IDA context.\n\nReturns dict with result/stdout/stderr. Has access to all IDA API modules.\nSupports Jupyter-style evaluation (returns the value of the last expression).\nMaintains persistent state across calls.",
+      "description": "Execute Python code in IDA context.\n\nReturns dict with result/stdout/stderr. Has access to all IDA API modules.\nSupports Jupyter-style evaluation (returns the value of the last expression).\nMaintains persistent state across calls; the server can be configured to\nkeep separate state per MCP session.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
