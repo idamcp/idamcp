@@ -398,6 +398,12 @@ example of all available settings (showing defaults):
     characters, duration, outcome, error message) to
     `<trace_dir>/gateway-<UTC timestamp>-<id>.jsonl`. Results are not recorded.
     Files are created with mode `0600`. Empty (the default) disables tracing.
+    For bug reports, `python3 install.py logs` (or `python3 -m gateway.logs`)
+    writes `idamcp-logs-<timestamp>.zip` with these traces, the headless
+    backend logs (`<tmp>/idamcp_backend_*.log`), the registry entries, the
+    effective configuration (known options only) and environment information.
+    It works while the Gateway is stopped. The files can contain file paths,
+    tool arguments and backend output; review the archive before sharing it.
 
 </details>
 
