@@ -238,7 +238,8 @@ example of all available settings (showing defaults):
   "disabled_tools": [],
   "proxy_host": "localhost",
   "proxy_port": 8000,
-  "flush_after_write": false
+  "flush_after_write": false,
+  "gui_autostart": false
 }
 ```
 
@@ -278,6 +279,11 @@ example of all available settings (showing defaults):
     `flush_buffers` call per modifying tool call and defaults to `False`. If
     `flush_buffers` is unavailable or fails, one error is logged and flushing
     stops for that session.
+*   **gui_autostart**: If `True`, the IDA GUI plugin starts the MCP server by
+    itself once auto-analysis of the opened database has finished, so you
+    don't have to press `Ctrl + Alt + M`. Only applies to the interactive GUI;
+    batch runs (`-A` / `-B`), `idat` and headless (idalib) are not affected.
+    Defaults to `False`.
 
 </details>
 
@@ -294,6 +300,7 @@ example of all available settings (showing defaults):
     Sqlite storage.
 *   **CHECK_ENTRIES_FRESHNESS**: Set to `true`, `1`, or `yes` to enable entry
     points freshness verification before querying the `entries` table.
+*   **GUI_AUTOSTART**: Set to `true`, `1`, or `yes` to enable `gui_autostart`.
 *   **ENABLE_ALL_UNSAFE_TOOLS**: Set to `true` to enable all unsafe tools.
 *   **ENABLED_UNSAFE_TOOLS**: A comma-separated list of specific unsafe tools to
     enable (e.g., `idapython_eval,dbg_step_over`).
@@ -337,7 +344,8 @@ ENABLED_UNSAFE_TOOLS=idapython_eval,dbg_step_over <gemini/headless/ida>
 ### GUI Mode (Interactive)
 
 1.  **Start IDA Pro** and open a database/binary.
-2.  Press **`Ctrl + Alt + M`** to start the MCP server within IDA.
+2.  Press **`Ctrl + Alt + M`** to start the MCP server within IDA (or set
+    `gui_autostart` to start it automatically after auto-analysis).
 3.  The Gateway will automatically discover this new session, and you can begin
     your analysis with the AI agent.
 

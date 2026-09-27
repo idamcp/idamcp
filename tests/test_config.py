@@ -147,6 +147,17 @@ class TestConfig(unittest.TestCase):
       config = shared.config.load_config(config_path="/nonexistent")
       self.assertTrue(config.get("check_entries_freshness"))
 
+  def test_gui_autostart_default(self):
+    """Test gui_autostart is off by default."""
+    config = shared.config.load_config(config_path="/nonexistent")
+    self.assertFalse(config.get("gui_autostart"))
+
+  def test_gui_autostart_env(self):
+    """Test GUI_AUTOSTART environment variable."""
+    with mock.patch.dict("os.environ", {"GUI_AUTOSTART": "true"}):
+      config = shared.config.load_config(config_path="/nonexistent")
+      self.assertTrue(config.get("gui_autostart"))
+
   def test_no_user_config_env(self):
     """Test that IDAMCP_NO_USER_CONFIG ignores user configuration files."""
     with mock.patch.dict("os.environ", {"IDAMCP_NO_USER_CONFIG": "1"}):

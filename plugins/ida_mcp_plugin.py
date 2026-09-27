@@ -42,6 +42,19 @@ from ida_mcp.tools.info import clear_caches  # pylint: disable=g-import-not-at-t
 from ida_mcp.tools.query import close_tables  # pylint: disable=g-import-not-at-top,g-bad-import-order
 from shared.config import load_config  # pylint: disable=g-import-not-at-top,g-bad-import-order
 
+_AUTOSTART_POLL_MS = 500
+
+
+def _is_interactive_gui() -> bool:
+  """True for the Qt GUI in interactive mode; False for idat, idalib, -A/-B."""
+  try:
+    if not idaapi.is_idaq():
+      return False
+    cvar = getattr(idaapi, "cvar", None)
+    return not getattr(cvar, "batch", 0)
+  except Exception:  # pylint: disable=broad-exception-caught
+    return False
+
 
 class MCP(idaapi.plugin_t):
   """IDA Plugin class for MCP Server."""
@@ -56,14 +69,63 @@ class MCP(idaapi.plugin_t):
     hotkey = MCP.wanted_hotkey.replace("-", "+")
     if sys.platform == "darwin":
       hotkey = hotkey.replace("Alt", "Option")
-    print(
-        f"[MCP] Plugin loaded, use Edit -> Plugins -> MCP ({hotkey}) to start"
-        " the server"
-    )
     self._server_started = False
     self.server_thread = None
     self.hash_str = None
+    self._autostart_timer = None
+    if self._schedule_autostart():
+      print("[MCP] Plugin loaded, the server starts after auto-analysis")
+    else:
+      print(
+          f"[MCP] Plugin loaded, use Edit -> Plugins -> MCP ({hotkey}) to"
+          " start the server"
+      )
     return idaapi.PLUGIN_KEEP
+
+  def _schedule_autostart(self) -> bool:
+    """Starts the server once auto-analysis is done, if gui_autostart is set.
+
+    Uses a main-thread timer instead of calling run() here: init() runs while
+    the database is being loaded, and run() would block the UI in auto_wait()
+    until analysis finishes.
+
+    Returns:
+      True if autostart was scheduled.
+    """
+    if not load_config().get("gui_autostart") or not _is_interactive_gui():
+      return False
+    register_timer = getattr(idaapi, "register_timer", None)
+    if register_timer is None:
+      print("[MCP] gui_autostart: register_timer unavailable, not starting")
+      return False
+
+    def _tick():
+      if self._server_started:
+        self._autostart_timer = None
+        return -1
+      if not idaapi.auto_is_ok():
+        return _AUTOSTART_POLL_MS
+      self._autostart_timer = None
+      try:
+        self.run(0)
+      except Exception as e:  # pylint: disable=broad-exception-caught
+        print(f"[MCP] gui_autostart failed: {e}")
+      return -1
+
+    self._autostart_timer = register_timer(_AUTOSTART_POLL_MS, _tick)
+    return self._autostart_timer is not None
+
+  def _cancel_autostart(self) -> None:
+    timer = getattr(self, "_autostart_timer", None)
+    self._autostart_timer = None
+    if timer is None:
+      return
+    unregister_timer = getattr(idaapi, "unregister_timer", None)
+    if unregister_timer is not None:
+      try:
+        unregister_timer(timer)
+      except Exception:  # pylint: disable=broad-exception-caught
+        pass
 
   def run(self, arg):
     del arg
@@ -96,6 +158,7 @@ class MCP(idaapi.plugin_t):
     self.server_thread.start()
 
   def term(self):
+    self._cancel_autostart()
     if not self._server_started:
       return
 
