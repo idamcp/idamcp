@@ -32,7 +32,7 @@ root_dir = pathlib.Path(__file__).resolve().parent.parent
 if str(root_dir) not in sys.path:
   sys.path.insert(0, str(root_dir))
 
-for module in ("ida_kernwin", "idaapi", "idc", "ida_idaapi"):
+for module in ("ida_auto", "ida_kernwin", "idaapi", "idc", "ida_idaapi"):
   if module not in sys.modules:
     sys.modules[module] = mock.MagicMock()
 

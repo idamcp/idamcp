@@ -429,12 +429,7 @@ async def get_data_xrefs_from(
 
 @mcp_tool
 async def get_changes_since(
-    database_id: Annotated[
-        str,
-        "The unique identifier for the target IDA database. You can obtain this"
-        " ID by calling list_available_databases, reading the ida://databases"
-        " resource, or by opening a new database via idalib_headless_open.",
-    ],
+    database_id: DatabaseId,
     revision: Annotated[
         int,
         "The `revision` returned by your previous call. Use 0 on the first"
