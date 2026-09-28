@@ -24,6 +24,7 @@ import asyncio
 import atexit
 import collections
 import contextlib
+import inspect
 import json
 import logging
 import os
@@ -594,6 +595,89 @@ class RegistryEventHandler(FileSystemEventHandler):
       )
 
 
+# Default values of the parameters of every registered tool, keyed by tool
+# name. Filled by `mcp_tool`. Used by `forward_to` to avoid sending arguments
+# the caller left at their default value.
+_TOOL_DEFAULTS: dict[str, dict[str, Any]] = {}
+
+_UNEXPECTED_KWARG_RE = re.compile(
+    r"unexpected keyword argument '([A-Za-z_][A-Za-z0-9_]*)'", re.IGNORECASE
+)
+
+
+def _register_tool_defaults(f) -> None:
+  """Records the default values of `f`'s parameters under its name."""
+  try:
+    params = inspect.signature(f).parameters.values()
+  except (TypeError, ValueError):
+    return
+  _TOOL_DEFAULTS[f.__name__] = {
+      p.name: p.default
+      for p in params
+      if p.default is not inspect.Parameter.empty
+  }
+
+
+def _is_default_value(value: Any, default: Any) -> bool:
+  """Type-strict equality, so that e.g. `0` is not treated as `False`."""
+  if value is None or default is None:
+    return value is default
+  return type(value) is type(default) and value == default
+
+
+def _drop_default_arguments(
+    tool_name: str, args: dict[str, Any]
+) -> dict[str, Any]:
+  """Removes arguments whose value equals the tool's declared default.
+
+  The generated proxy forwards `locals()`, i.e. every parameter including the
+  ones the caller did not set. A backend running an older plugin version
+  rejects parameters it does not know (`method(**params)`), so every new
+  optional parameter would break a newer gateway talking to an older IDA
+  instance. Dropping default-valued arguments makes the backend apply its own
+  default instead. The proxy is generated from the backend sources, so for
+  matching versions the defaults are identical and behavior does not change.
+
+  Only calls coming from the generated proxy are affected (identified by the
+  presence of `database_id` in `args`). Gateway-internal calls build their
+  arguments explicitly and are forwarded as-is.
+
+  Args:
+    tool_name: The backend method name.
+    args: The arguments as received by the proxy function.
+
+  Returns:
+    The arguments to send to the backend.
+  """
+  call_arguments = {k: v for k, v in args.items() if k != "database_id"}
+  if "database_id" not in args:
+    return call_arguments
+  defaults = _TOOL_DEFAULTS.get(tool_name)
+  if not defaults:
+    return call_arguments
+  return {
+      k: v
+      for k, v in call_arguments.items()
+      if k not in defaults or not _is_default_value(v, defaults[k])
+  }
+
+
+def _unsupported_parameter_error(
+    target: str, tool_name: str, error: Exception
+) -> ToolError | None:
+  """Maps a backend 'unexpected keyword argument' error to a clear ToolError."""
+  match = _UNEXPECTED_KWARG_RE.search(str(error))
+  if match is None:
+    return None
+  return ToolError(
+      f"The IDA plugin serving database {target} does not support parameter"
+      f" '{match.group(1)}' of tool '{tool_name}'. It is probably running an"
+      " older idamcp version: restart IDA (or reopen the headless database)"
+      " to load the updated plugin, or call the tool without this parameter."
+      f" Backend error: {error}"
+  )
+
+
 async def forward_to(target: str, tool_name: str, args: dict[str, Any]) -> Any:
   """Forwards a tool call to the running backend server."""
   logging.info(
@@ -617,7 +701,7 @@ async def forward_to(target: str, tool_name: str, args: dict[str, Any]) -> Any:
       logging.info("[Gateway] forward_to: client for %s not found", target)
       raise ToolError(f"Error: Backend database {target} not found")
 
-    call_arguments = {k: v for k, v in args.items() if k != "database_id"}
+    call_arguments = _drop_default_arguments(tool_name, args)
 
     try:
       logging.info(
@@ -641,6 +725,10 @@ async def forward_to(target: str, tool_name: str, args: dict[str, Any]) -> Any:
         ) from e
       if e.data == -32001:
         raise ToolError(str(e)) from e
+      if (
+          err := _unsupported_parameter_error(target, tool_name, e)
+      ) is not None:
+        raise err from e
       raise ToolError(f"Backend tool error: {e}") from e
     except asyncio.CancelledError as e:
       logging.info(
@@ -755,6 +843,7 @@ def mcp_tool(func=None, *args, **kwargs):
   """Decorator to add a tool to the MCP server if it's not disabled."""
 
   def decorator(f):
+    _register_tool_defaults(f)
     disabled_tools = CONFIG.get("disabled_tools", [])
     for pattern in disabled_tools:
       if re.search(pattern, f.__name__, re.IGNORECASE):

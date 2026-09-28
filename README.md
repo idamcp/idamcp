@@ -407,6 +407,14 @@ python3 tests/dump_mcp_metadata.py
 make test
 ```
 
+**Adding parameters to existing tools.** A GUI IDA instance keeps the plugin
+version it loaded at startup, so the gateway may talk to an older backend. The
+gateway only forwards arguments whose value differs from the declared default;
+the backend applies its own default for the rest. New parameters must therefore
+be optional, and their default must keep the previous behavior. If a caller
+sets a new parameter against an older plugin, the call fails with an error
+asking to restart IDA.
+
 ## Authors & Acknowledgments
 
 Developed and maintained by **Junfeng Yang** with the help of Google Gemini,
