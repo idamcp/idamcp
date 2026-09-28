@@ -4384,6 +4384,52 @@
           "tags": []
         }
       },
+      "description": "Saves the IDA database so renames, comments, types and patches persist.\n\nSaves in place to the current .idb/.i64 path. In the IDA GUI this is the same\nas File > Save. Headless databases are also saved when they are closed.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "database_id": {
+            "description": "The unique identifier for the target IDA database. You can obtain this ID by calling list_available_databases, reading the ida://databases resource, or by opening a new database via idalib_headless_open.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "database_id"
+        ],
+        "type": "object"
+      },
+      "name": "save_database",
+      "outputSchema": {
+        "properties": {
+          "database_path": {
+            "type": "string"
+          },
+          "method": {
+            "enum": [
+              "ui_action",
+              "ida_loader",
+              "idc"
+            ],
+            "type": "string"
+          },
+          "saved": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "saved",
+          "database_path",
+          "method"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "_meta": {
+        "fastmcp": {
+          "tags": []
+        }
+      },
       "description": "Search for binary pattern within a specified memory range.\n\nThe search operates within the bounds defined by `start_ea` (low address) and\n`end_ea` (high address).\n- When the direction is 'down', the search progresses from `start_ea`\nascending towards `end_ea`.\n- When the direction is 'up', the search progresses from `end_ea` descending\ntowards `start_ea`.\n\nNote: Results are capped at a maximum of 50 matches per call.",
       "inputSchema": {
         "additionalProperties": false,

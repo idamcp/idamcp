@@ -376,6 +376,7 @@ class TestIDAMCP(unittest.IsolatedAsyncioTestCase):
         self.verify_memory_and_search_lifecycle,
         self.verify_misc_write_lifecycle,
         self.verify_headless_load_options,
+        self.verify_save_database,
         self.verify_invalid_addresses_corner_cases,
         self.verify_malformed_inputs_corner_cases,
         self.verify_type_declaration_error_cases,
@@ -1971,6 +1972,15 @@ hex(tid) if tid is not None else ""
             break
           await asyncio.sleep(0.1)
       shutil.rmtree(tmp_dir, ignore_errors=True)
+
+  async def verify_save_database(self):
+    metadata = await self.run_tool("get_metadata")
+    result = await self.run_tool("save_database")
+    self.assertIsInstance(result, dict)
+    self.assertIs(result.get("saved"), True)
+    self.assertEqual(result.get("method"), "ida_loader")  # headless
+    self.assertEqual(result.get("database_path"), metadata["database_path"])
+    self.assertTrue(os.path.isfile(result["database_path"]))
 
   async def verify_misc_write_lifecycle(self):
     # Dynamically resolve rebased addresses to handle ASLR rebasing

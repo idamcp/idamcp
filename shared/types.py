@@ -244,6 +244,18 @@ class EnumDefinition(TypedDict):
   ordinal: NotRequired[int]
 
 
+class SaveDatabaseResult(TypedDict):
+  saved: Annotated[bool, "True if IDA reported a successful save"]
+  database_path: Annotated[
+      str, "The absolute path to the saved IDA database (.idb or .i64)"
+  ]
+  method: Annotated[
+      Literal["ui_action", "ida_loader", "idc"],
+      "How the database was saved: the GUI SaveBase action, or the"
+      " ida_loader / idc save_database API in headless mode",
+  ]
+
+
 class SetCommentResult(TypedDict):
   disassembly_comment_status: Annotated[
       Literal["success", "failed"],
