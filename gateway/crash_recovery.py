@@ -17,6 +17,11 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
+#
+# Portions of _network_filesystem() (the /proc/self/mountinfo parsing) are
+# adapted from IDA Nexus (https://github.com/HexRaysSA/ida-nexus,
+# ida_nexus/database_state.py), Copyright (c) 2026 Hex-Rays SA, used under the
+# MIT License, whose terms are the same as those above.
 
 """Detects IDA crash leftovers before a headless open and backs them up.
 
