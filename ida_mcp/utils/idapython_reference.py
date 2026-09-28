@@ -17,6 +17,13 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
+#
+# The approach of this module (an AST index of IDA's own python modules and
+# example scripts, searched by name and description) and parts of the indexing
+# and search code are adapted from IDA Nexus
+# (https://github.com/HexRaysSA/ida-nexus, ida_nexus/reference.py),
+# Copyright (c) 2026 Hex-Rays SA, used under the MIT License, whose terms are
+# the same as those above.
 
 """Searchable reference of the IDAPython API shipped with the running IDA.
 

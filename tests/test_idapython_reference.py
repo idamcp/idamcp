@@ -34,6 +34,10 @@ root_dir = pathlib.Path(__file__).resolve().parent.parent
 if str(root_dir) not in sys.path:
   sys.path.insert(0, str(root_dir))
 
+for _mod in ("ida_auto", "ida_kernwin", "idaapi", "idc", "ida_idaapi"):
+  if _mod not in sys.modules:
+    sys.modules[_mod] = mock.MagicMock()
+
 # pylint: disable=g-import-not-at-top
 from ida_mcp.tools import reference as reference_tool
 from ida_mcp.utils import idapython_reference as ref
