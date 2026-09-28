@@ -17,6 +17,12 @@
 # LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
+#
+# Portions of this file (the ZIP writing helpers, the temporary-file handling
+# and the command-line messages) are adapted from IDA MCP
+# (https://github.com/HexRaysSA/ida-mcp, ida_mcp/logs.py),
+# Copyright (c) 2026 Hex-Rays SA, used under the MIT License, whose terms are
+# the same as those above.
 
 """Collects idamcp logs and state into one ZIP for bug reports.
 
