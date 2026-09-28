@@ -401,6 +401,11 @@ def install_server(
 if __name__ == "__main__":
   if is_running_in_ida():
     install()
+  elif sys.argv[1:2] == ["logs"]:
+    # Forwards the remaining arguments (see `install.py logs --help`).
+    from gateway import logs  # pylint: disable=g-import-not-at-top
+
+    sys.exit(logs.main(sys.argv[2:]))
   else:
     parser = argparse.ArgumentParser(
         description="IDA MCP Installer & Build Tool"
@@ -413,6 +418,7 @@ if __name__ == "__main__":
             "plugin",
             "build",
             "test",
+            "logs",
             "gemini",
             "agy",
             "jetski",
@@ -432,6 +438,10 @@ if __name__ == "__main__":
         build()
       case "test":
         run_tests()
+      case "logs":
+        from gateway import logs  # pylint: disable=g-import-not-at-top
+
+        sys.exit(logs.main([]))
       case "gemini" | "agy" | "jetski" | "claude" | "codex":
         install_server(args.command)
       case "plugin":

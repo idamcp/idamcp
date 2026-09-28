@@ -239,6 +239,7 @@ example of all available settings (showing defaults):
   "proxy_host": "localhost",
   "proxy_port": 8000,
   "flush_after_write": false,
+  "trace_dir": ""
   "gui_undo_points": true
 }
 ```
@@ -279,6 +280,17 @@ example of all available settings (showing defaults):
     `flush_buffers` call per modifying tool call and defaults to `False`. If
     `flush_buffers` is unavailable or fails, one error is logged and flushing
     stops for that session.
+*   **trace_dir**: If set, the Gateway writes one JSON line per forwarded tool
+    call (tool, `database_id`, arguments with strings truncated to 256
+    characters, duration, outcome, error message) to
+    `<trace_dir>/gateway-<UTC timestamp>-<id>.jsonl`. Results are not recorded.
+    Files are created with mode `0600`. Empty (the default) disables tracing.
+    For bug reports, `python3 install.py logs` (or `python3 -m gateway.logs`)
+    writes `idamcp-logs-<timestamp>.zip` with these traces, the headless
+    backend logs (`<tmp>/idamcp_backend_*.log`), the registry entries, the
+    effective configuration (known options only) and environment information.
+    It works while the Gateway is stopped. The files can contain file paths,
+    tool arguments and backend output; review the archive before sharing it.
 *   **gui_undo_points**: If `True` (default), the IDA GUI plugin creates an
     undo point labeled `MCP: <tool name>` before each tool call that modifies
     the database, so each agent change can be reverted with `Ctrl + Z` /
@@ -309,6 +321,8 @@ example of all available settings (showing defaults):
 *   **PROXY_PORT**: The port for the Gateway Proxy to listen on.
 *   **FLUSH_AFTER_WRITE**: Set to `true`, `1`, or `yes` to enable
     `flush_after_write`.
+*   **TRACE_DIR**: Directory for the Gateway's JSONL tool-call trace (see
+    `trace_dir`).
 
 </details>
 

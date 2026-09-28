@@ -147,6 +147,16 @@ class TestConfig(unittest.TestCase):
       config = shared.config.load_config(config_path="/nonexistent")
       self.assertTrue(config.get("check_entries_freshness"))
 
+  def test_trace_dir_default(self):
+    """Test tracing is off by default (empty trace_dir)."""
+    config = shared.config.load_config(config_path="/nonexistent")
+    self.assertEqual(config.get("trace_dir"), "")
+
+  def test_trace_dir_env(self):
+    """Test TRACE_DIR environment variable."""
+    with mock.patch.dict("os.environ", {"TRACE_DIR": "/tmp/idamcp-trace"}):
+      config = shared.config.load_config(config_path="/nonexistent")
+      self.assertEqual(config.get("trace_dir"), "/tmp/idamcp-trace")
   def test_gui_undo_points_default(self):
     """Test gui_undo_points is on by default."""
     config = shared.config.load_config(config_path="/nonexistent")
