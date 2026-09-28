@@ -95,6 +95,24 @@ class Metadata(TypedDict):
   is_headless: Annotated[
       bool, "Whether the instance is running in headless mode"
   ]
+  analysis_complete: NotRequired[
+      Annotated[
+          bool,
+          "Whether IDA's auto-analysis queue is empty. While false, function"
+          " lists, xrefs and names can still change; see wait_for_analysis.",
+      ]
+  ]
+
+
+class AnalysisStatus(TypedDict):
+  complete: Annotated[bool, "Whether auto-analysis has finished"]
+  auto_enabled: Annotated[
+      bool | None, "Whether auto-analysis is enabled for this database"
+  ]
+  timed_out: Annotated[
+      bool, "True if the timeout expired before analysis finished"
+  ]
+  waited_s: Annotated[float, "Seconds spent waiting"]
 
 
 T = TypeVar("T")

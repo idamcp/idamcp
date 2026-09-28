@@ -1133,6 +1133,30 @@ async def get_metadata(
 
 
 @mcp_tool
+async def wait_for_analysis(
+    database_id: Annotated[
+        str,
+        "The unique identifier for the target IDA database. You can obtain this"
+        " ID by calling list_available_databases, reading the ida://databases"
+        " resource, or by opening a new database via idalib_headless_open.",
+    ],
+    timeout: Annotated[
+        float | None,
+        "Maximum seconds to wait. Omit to wait until analysis finishes.",
+    ] = None,
+) -> AnalysisStatus:
+  """Wait until IDA's auto-analysis has finished.
+
+  Returns immediately if it already has. Use it before relying on function
+  lists, xrefs or names in a database whose get_metadata shows
+  analysis_complete=false (e.g. a binary just opened in the IDA GUI). In the
+  GUI this waits for IDA's own analysis; headless, it runs the pending
+  analysis steps. Other tool calls can run while it waits.
+  """
+  return await forward_to(database_id, "wait_for_analysis", locals())
+
+
+@mcp_tool
 async def get_function_by_address(
     database_id: Annotated[
         str,

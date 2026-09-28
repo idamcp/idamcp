@@ -23,7 +23,9 @@
 """Module for retrieving information from IDA Pro."""
 
 import contextlib
+import math
 import re
+import time
 from typing import Annotated, Any, List
 import ida_bytes
 import ida_funcs
@@ -33,6 +35,7 @@ import ida_ida
 import ida_kernwin
 from ida_mcp.core.decorators import internal, jsonrpc
 from ida_mcp.core.synchronization import idaread
+from ida_mcp.core.synchronization import idawrite
 from ida_mcp.utils import helper
 from ida_mcp.utils.caching import IteratorCache
 import ida_moves
@@ -43,6 +46,7 @@ import idaapi
 import idautils
 import idc
 from shared.rpc import ToolError
+from shared.types import AnalysisStatus
 from shared.types import AssemblyContextItem
 from shared.types import AssemblyContextRequest
 from shared.types import BasicBlock
@@ -167,6 +171,106 @@ def get_metadata() -> Metadata:
       bitness=idaapi.inf_get_app_bitness(),
       procname=idaapi.inf_get_procname() or "<unknown>",
       is_headless=not idaapi.is_idaq(),
+      **_analysis_complete_field(),
+  )
+
+
+def _auto_is_ok() -> bool | None:
+  """Returns ida_auto.auto_is_ok(), or None if this IDA lacks it."""
+  # pylint: disable-next=g-import-not-at-top
+  import ida_auto
+
+  auto_is_ok = getattr(ida_auto, "auto_is_ok", None)
+  return None if auto_is_ok is None else bool(auto_is_ok())
+
+
+def _analysis_complete_field() -> dict[str, bool]:
+  complete = _auto_is_ok()
+  return {} if complete is None else {"analysis_complete": complete}
+
+
+@idaread
+def _analysis_status() -> dict[str, Any]:
+  is_auto_enabled = getattr(ida_ida, "inf_is_auto_enabled", None)
+  return {
+      "complete": _auto_is_ok(),
+      "auto_enabled": (
+          None if is_auto_enabled is None else bool(is_auto_enabled())
+      ),
+  }
+
+
+# One analysis slice in headless mode. Short enough that other tool calls can
+# run between slices.
+_ANALYSIS_SLICE_S = 0.25
+
+
+@idawrite
+def _analysis_slice(max_seconds: float) -> bool:
+  """Runs pending auto-analysis steps (headless). Returns True when drained."""
+  # pylint: disable-next=g-import-not-at-top
+  import ida_auto
+
+  previously_enabled = ida_auto.enable_auto(True)
+  try:
+    deadline = time.monotonic() + max_seconds
+    while time.monotonic() < deadline:
+      if not ida_auto.auto_make_step(0, idaapi.BADADDR):
+        return True
+    return False
+  finally:
+    if not previously_enabled:
+      ida_auto.enable_auto(False)
+
+
+@jsonrpc
+def wait_for_analysis(
+    timeout: Annotated[
+        float | None,
+        "Maximum seconds to wait. Omit to wait until analysis finishes.",
+    ] = None,
+) -> AnalysisStatus:
+  """Wait until IDA's auto-analysis has finished.
+
+  Returns immediately if it already has. Use it before relying on function
+  lists, xrefs or names in a database whose get_metadata shows
+  analysis_complete=false (e.g. a binary just opened in the IDA GUI). In the
+  GUI this waits for IDA's own analysis; headless, it runs the pending
+  analysis steps. Other tool calls can run while it waits.
+  """
+  if timeout is not None and (not math.isfinite(timeout) or timeout <= 0):
+    raise ValueError("timeout must be a positive number of seconds")
+  headless = bool(getattr(idaapi, "is_headless", False))
+  start = time.monotonic()
+  deadline = None if timeout is None else start + timeout
+  timed_out = False
+  drained = False
+  while True:
+    status = _analysis_status.sync_call()
+    if status["complete"] is None:
+      raise ToolError("This IDA version does not provide ida_auto.auto_is_ok")
+    if status["complete"] or drained:
+      # drained: auto_make_step found nothing left to do, but auto_is_ok()
+      # is still false. Report that instead of spinning.
+      break
+    remaining = None if deadline is None else deadline - time.monotonic()
+    if remaining is not None and remaining <= 0:
+      timed_out = True
+      break
+    step = (
+        _ANALYSIS_SLICE_S
+        if remaining is None
+        else min(_ANALYSIS_SLICE_S, remaining)
+    )
+    if headless:
+      drained = _analysis_slice.sync_call(step)
+    else:
+      time.sleep(step)  # The GUI analyzes in its own idle loop.
+  return AnalysisStatus(
+      complete=status["complete"],
+      auto_enabled=status["auto_enabled"],
+      timed_out=timed_out,
+      waited_s=round(time.monotonic() - start, 3),
   )
 
 

@@ -390,6 +390,7 @@ class TestIDAMCP(unittest.IsolatedAsyncioTestCase):
         self.verify_db_versioning_and_migration,
         self.verify_lock_reentrancy_no_deadlock,
         self.verify_sql_query_cancellation_and_recovery,
+        self.verify_wait_for_analysis,
     ]
 
     errors = []
@@ -3810,6 +3811,39 @@ with q._db_write_lock:
     # Verify that other tools still function cleanly
     meta = await self.run_tool("get_metadata")
     self.assertIn("sha256", meta)
+
+  async def verify_wait_for_analysis(self):
+    """analysis_complete in metadata and wait_for_analysis draining work."""
+    meta = await self.run_tool("get_metadata")
+    self.assertIs(meta.get("analysis_complete"), True)
+    res = await self.run_tool("wait_for_analysis")
+    self.assertTrue(res["complete"])
+    self.assertFalse(res["timed_out"])
+
+    # Queue the whole image for reanalysis. Headless has no idle loop, so the
+    # queue stays pending until wait_for_analysis runs it.
+    await self.run_tool(
+        "idapython_eval",
+        code=(
+            "ida_auto.plan_range(ida_ida.inf_get_min_ea(),"
+            " ida_ida.inf_get_max_ea())"
+        ),
+    )
+    meta = await self.run_tool("get_metadata")
+    print(
+        f"analysis_complete after plan_range: {meta.get('analysis_complete')}"
+    )
+    self.assertIs(meta.get("analysis_complete"), False)
+
+    res = await self.run_tool("wait_for_analysis", timeout=120.0)
+    print(f"wait_for_analysis: {res}")
+    self.assertTrue(res["complete"])
+    self.assertFalse(res["timed_out"])
+    meta = await self.run_tool("get_metadata")
+    self.assertIs(meta.get("analysis_complete"), True)
+
+    with self.assertRaises(Exception):
+      await self.run_tool("wait_for_analysis", timeout=0)
 
 
 if __name__ == "__main__":
