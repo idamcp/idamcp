@@ -24,6 +24,7 @@ import asyncio
 import atexit
 import collections
 import contextlib
+import ipaddress
 import json
 import logging
 import os
@@ -59,6 +60,42 @@ logging.basicConfig(level=logging.ERROR)
 # Load configuration
 CONFIG = load_config()
 REGISTRY_DIR = pathlib.Path(CONFIG["registry_dir"])
+
+
+def is_loopback_host(host: str) -> bool:
+  """Whether host is a loopback name or address; hostnames are not resolved."""
+  host = host.strip().strip("[]")
+  if host.lower() == "localhost":
+    return True
+  try:
+    return ipaddress.ip_address(host).is_loopback
+  except ValueError:
+    return False
+
+
+def warn_if_not_loopback(host: str, port: int) -> bool:
+  """Prints a warning to stderr if the SSE/HTTP listener is not loopback-only.
+
+  The gateway's SSE/HTTP endpoint has no authentication.
+
+  Args:
+    host: The host the gateway listens on.
+    port: The port the gateway listens on.
+
+  Returns:
+    True if a warning was printed.
+  """
+  if is_loopback_host(host):
+    return False
+  print(
+      f"[WARNING] The idamcp gateway is listening on {host}:{port}, which is"
+      " not a loopback address. The MCP endpoint has no authentication:"
+      " anyone who can reach it can call every enabled tool, including"
+      " idapython_eval if it is enabled. Use localhost unless you need"
+      " remote access, and restrict it with a firewall if you do.",
+      file=sys.stderr,
+  )
+  return True
 
 
 def _is_process_running(pid: int) -> bool:

@@ -164,6 +164,7 @@ import argparse
 import contextlib
 from typing import Annotated, Any, Dict, List, Literal
 from gateway.forward import forward_to, mcp_server, mcp_tool
+from gateway.forward import warn_if_not_loopback
 from shared.config import load_config
 from shared.types import *
 
@@ -210,6 +211,7 @@ if __name__ == "__main__":
     port = (
         args.port if args.port is not None else config.get("proxy_port", 8000)
     )
+    warn_if_not_loopback(host, port)
     with contextlib.suppress(KeyboardInterrupt):
       mcp_server.run(transport=args.transport, host=host, port=port)
   else:
@@ -221,8 +223,8 @@ if __name__ == "__main__":
 def main():
   # 1. Parse Gateway Tools
   gateway_tools = set()
-  for gateway_file in sorted(glob.glob('gateway/*.py')):
-    if gateway_file.endswith(('proxy.py', '__init__.py')):
+  for gateway_file in sorted(glob.glob("gateway/*.py")):
+    if gateway_file.endswith(("proxy.py", "__init__.py")):
       continue
     print(f'Processing {gateway_file}...')
     gateway_items = extract_with_ast(gateway_file, decorator_filter='@mcp_tool')
@@ -230,22 +232,22 @@ def main():
   print(f'Found gateway tools: {gateway_tools}')
 
   # 2. Parse Backend Tools
-  tools_dir = 'ida_mcp/tools'
-  tool_files = glob.glob(os.path.join(tools_dir, '*.py'))
+  tools_dir = "ida_mcp/tools"
+  tool_files = glob.glob(os.path.join(tools_dir, "*.py"))
   tool_files.sort()
   results = []
   for tool_file in tool_files:
-    if tool_file.endswith('__init__.py'):
+    if tool_file.endswith("__init__.py"):
       continue
-    print(f'Processing {tool_file}...')
+    print(f"Processing {tool_file}...")
     # Extract @jsonrpc tools from backend
     results.extend(extract_with_ast(tool_file, decorator_filter='@jsonrpc'))
   # 3. Generate Proxy
-  with open('gateway/proxy.py', 'w') as f:
+  with open("gateway/proxy.py", "w") as f:
     f.write(FIRST_PART)
     for item in results:
       # Skip if defined in gateway
-      if item['name'] in gateway_tools:
+      if item["name"] in gateway_tools:
         print(
             f"Skipping proxy generation for {item['name']} (defined in gateway)"
         )
@@ -253,54 +255,54 @@ def main():
 
       # Skip tools marked as internal or skip_proxy
       if any(
-          d.startswith(('@internal', '@skip_proxy')) for d in item['decorators']
+          d.startswith(("@internal", "@skip_proxy")) for d in item["decorators"]
       ):
         print(
             f"Skipping proxy generation for {item['name']} (marked as internal)"
         )
         continue
 
-      description_arg = ''
-      if item['jsonrpc_description']:
-        description_arg = item['jsonrpc_description']
+      description_arg = ""
+      if item["jsonrpc_description"]:
+        description_arg = item["jsonrpc_description"]
 
       prototype_part1, prototype_part2 = item[
-          'prototype_without_decorator'
-      ].split('(', maxsplit=1)
+          "prototype_without_decorator"
+      ].split("(", maxsplit=1)
       instance_str = (
           'database_id: Annotated[str, "The unique identifier for the target'
-          ' IDA database. You can obtain this ID by calling'
-          ' list_available_databases, reading the ida://databases resource, or'
+          " IDA database. You can obtain this ID by calling"
+          " list_available_databases, reading the ida://databases resource, or"
           ' by opening a new database via idalib_headless_open."], '
       )
 
-      prototype = prototype_part1 + '(' + instance_str + prototype_part2
+      prototype = prototype_part1 + "(" + instance_str + prototype_part2
 
       forward_call = (
           f"  return await forward_to(database_id, \"{item['name']}\","
-          ' locals())'
+          " locals())"
       )
 
       func_body = forward_call
-      if item['docstring']:
-        ds = item['docstring']
+      if item["docstring"]:
+        ds = item["docstring"]
         # Handle triple quotes in docstring
         ds = ds.replace('"""', '\\"\\"\\"')
         func_body = f'  """{ds}"""\n{forward_call}'
 
-      if not prototype.strip().startswith('async '):
-        prototype = prototype.replace('def ', 'async def ', 1)
+      if not prototype.strip().startswith("async "):
+        prototype = prototype.replace("def ", "async def ", 1)
 
       f.write(
-          f'@mcp_tool{description_arg}\n'
+          f"@mcp_tool{description_arg}\n"
           + prototype
-          + '\n'
+          + "\n"
           + func_body
-          + '\n\n'
+          + "\n\n"
       )
 
     f.write(LAST_PART)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
   main()

@@ -23,6 +23,7 @@ import argparse
 import contextlib
 from typing import Annotated, Any, Dict, List, Literal
 from gateway.forward import forward_to, mcp_server, mcp_tool
+from gateway.forward import warn_if_not_loopback
 from shared.config import load_config
 from shared.types import *
 
@@ -1563,6 +1564,7 @@ if __name__ == "__main__":
     port = (
         args.port if args.port is not None else config.get("proxy_port", 8000)
     )
+    warn_if_not_loopback(host, port)
     with contextlib.suppress(KeyboardInterrupt):
       mcp_server.run(transport=args.transport, host=host, port=port)
   else:
