@@ -2966,6 +2966,80 @@
           "tags": []
         }
       },
+      "description": "Looks up the IDAPython API of the running IDA: signatures and docs.\n\nSearches the `ida_*` modules, `idc`, `idautils` and the example scripts that\nship with this IDA installation, so the results match its version. Use it\nbefore writing code for `idapython_eval` when unsure a function exists or\nhow it is called; APIs change between IDA versions (e.g. `ida_struct` and\n`ida_enum` were removed in IDA 9.0). The index is built on the first call\n(about a second) from IDA's files, which are parsed and not imported.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "database_id": {
+            "description": "The unique identifier for the target IDA database. You can obtain this ID by calling list_available_databases, reading the ida://databases resource, or by opening a new database via idalib_headless_open.",
+            "type": "string"
+          },
+          "include_example": {
+            "default": true,
+            "description": "Also return the best matching example script from IDA",
+            "type": "boolean"
+          },
+          "max_results": {
+            "default": 10,
+            "description": "Maximum number of API entries to return (1-50)",
+            "type": "integer"
+          },
+          "query": {
+            "description": "A name ('get_func', 'ida_typeinf.tinfo_t', 'FUNC_NORET') or a short description ('add stack frame member', 'xrefs to address')",
+            "type": "string"
+          }
+        },
+        "required": [
+          "database_id",
+          "query"
+        ],
+        "type": "object"
+      },
+      "name": "idapython_reference",
+      "outputSchema": {
+        "properties": {
+          "example": {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          "ida_version": {
+            "type": "string"
+          },
+          "notes": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "python_dir": {
+            "type": "string"
+          },
+          "results": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "total_matches": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "ida_version",
+          "python_dir",
+          "results",
+          "total_matches"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "_meta": {
+        "fastmcp": {
+          "tags": []
+        }
+      },
       "description": "Navigates the IDA UI (IDA View/Pseudocode) to the specified address.",
       "inputSchema": {
         "additionalProperties": false,

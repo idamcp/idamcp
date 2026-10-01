@@ -422,6 +422,13 @@ inspection tools like `list_functions`, `list_strings`, or `get_xrefs_to`. We
 recommend reminding the model in system or session prompts to prioritize
 `sql_query` for complex lookups, filtering, and relational joins).*
 
+When `idapython_eval` is enabled, the agent can call `idapython_reference` to
+look up IDAPython functions, classes and constants, with their signatures and
+docs, plus a matching example script. The reference is built from the running
+IDA's own `python/` directory, so it matches that version: models trained on
+older scripts often call modules such as `ida_struct` that IDA 9.x no longer
+has.
+
 ## Development
 
 Whenever the backend RPC interfaces have been updated, developers must

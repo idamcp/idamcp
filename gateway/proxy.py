@@ -1443,6 +1443,38 @@ async def hexdump(
 
 
 @mcp_tool
+async def idapython_reference(
+    database_id: Annotated[
+        str,
+        "The unique identifier for the target IDA database. You can obtain this"
+        " ID by calling list_available_databases, reading the ida://databases"
+        " resource, or by opening a new database via idalib_headless_open.",
+    ],
+    query: Annotated[
+        str,
+        "A name ('get_func', 'ida_typeinf.tinfo_t', 'FUNC_NORET') or a short"
+        " description ('add stack frame member', 'xrefs to address')",
+    ],
+    max_results: Annotated[
+        int, "Maximum number of API entries to return (1-50)"
+    ] = 10,
+    include_example: Annotated[
+        bool, "Also return the best matching example script from IDA"
+    ] = True,
+) -> IdapythonReference:
+  """Looks up the IDAPython API of the running IDA: signatures and docs.
+
+  Searches the `ida_*` modules, `idc`, `idautils` and the example scripts that
+  ship with this IDA installation, so the results match its version. Use it
+  before writing code for `idapython_eval` when unsure a function exists or
+  how it is called; APIs change between IDA versions (e.g. `ida_struct` and
+  `ida_enum` were removed in IDA 9.0). The index is built on the first call
+  (about a second) from IDA's files, which are parsed and not imported.
+  """
+  return await forward_to(database_id, "idapython_reference", locals())
+
+
+@mcp_tool
 async def list_enums(
     database_id: Annotated[
         str,

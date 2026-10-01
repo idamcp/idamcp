@@ -51,6 +51,7 @@ import ida_mcp.tools.info
 from ida_mcp.tools.info import get_metadata
 import ida_mcp.tools.memory
 import ida_mcp.tools.query
+import ida_mcp.tools.reference
 import ida_mcp.tools.types
 
 from shared.config import load_config

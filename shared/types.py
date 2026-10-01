@@ -221,6 +221,32 @@ class Bookmark(TypedDict):
   description: str
 
 
+class IdapythonReference(TypedDict):
+  ida_version: Annotated[str, "IDA version the reference was built from"]
+  python_dir: Annotated[str, "IDA's python directory that was indexed"]
+  results: Annotated[
+      list[dict[str, Any]],
+      "Best matches first. Each has `kind` (module, function, class, method"
+      " or constant), `name` (qualified), `doc`, `source` (file:line) and,"
+      " for functions and methods, `signature`.",
+  ]
+  total_matches: Annotated[int, "Number of entries that matched the query"]
+  example: NotRequired[
+      Annotated[
+          dict[str, Any],
+          "Best matching example script shipped with IDA: `name`, `path`,"
+          " `summary` and `content`.",
+      ]
+  ]
+  notes: NotRequired[
+      Annotated[
+          list[str],
+          "Warnings, e.g. a module named in the query that doesn't exist in"
+          " this IDA version.",
+      ]
+  ]
+
+
 class Operand(TypedDict):
   type: str
   value: str | int
