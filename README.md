@@ -347,6 +347,14 @@ ENABLED_UNSAFE_TOOLS=idapython_eval,dbg_step_over <gemini/headless/ida>
 3.  The Gateway will automatically discover this new session, and you can begin
     your analysis with the AI agent.
 
+When you and the agent both edit the database, the agent can call
+`get_changes_since` to see what changed since its last call (renames,
+comments, types, functions, patches, code/data definitions, segments), and
+whether an MCP tool, you in IDA, or the auto-analyzer made each change.
+Recording starts with the agent's first call and is kept in memory (the most
+recent 10,000 edits and 10,000 auto-analysis changes); it adds no overhead
+before that.
+
 ### Headless Mode (Automated)
 
 You can launch IDA instances in the background directly from the command line or

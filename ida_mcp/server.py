@@ -42,6 +42,7 @@ from ida_mcp.core.rpc_registry import rpc_registry
 from ida_mcp.core.security import security_manager
 from shared.rpc import ToolError
 import ida_mcp.tools.analysis
+import ida_mcp.tools.changes
 import ida_mcp.tools.config
 import ida_mcp.tools.debug
 import ida_mcp.tools.edit

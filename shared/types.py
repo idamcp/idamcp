@@ -221,6 +221,41 @@ class Bookmark(TypedDict):
   description: str
 
 
+class ChangesSince(TypedDict):
+  log_id: Annotated[
+      str,
+      "Identifies this change log. If it differs from the previous call, IDA or"
+      " the plugin restarted and the old revision no longer applies.",
+  ]
+  revision: Annotated[
+      int, "Pass this value as `revision` in the next call to continue."
+  ]
+  latest_revision: Annotated[int, "Revision of the newest recorded change."]
+  events: Annotated[
+      list[dict[str, Any]],
+      "Changes after the requested revision, oldest first. Each has"
+      " `revision`, `event`, `source` ('tool' with `tool`, 'ida' for the GUI"
+      " user or scripts run in IDA, or 'analysis'), and event fields such as"
+      " `address`, `function`, `name`, `old_name`, `comment` or `type`.",
+  ]
+  has_more: Annotated[
+      bool, "More changes are available; call again with `revision`."
+  ]
+  truncated: Annotated[
+      bool,
+      "Some changes after the requested revision are no longer in the log"
+      " (it keeps the most recent ones, or it restarted). Re-read the state"
+      " you depend on.",
+  ]
+  started: NotRequired[
+      Annotated[
+          bool,
+          "True if this call started recording; earlier changes are not"
+          " available.",
+      ]
+  ]
+
+
 class Operand(TypedDict):
   type: str
   value: str | int

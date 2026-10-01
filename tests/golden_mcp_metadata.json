@@ -1625,6 +1625,81 @@
           "tags": []
         }
       },
+      "description": "Lists changes made to the database since a revision.\n\nCovers renames, comments, types and prototypes, operand types, local types,\nfunctions added/deleted/resized, byte patches, code/data definitions,\nsegments and stack variable renames. Use it to notice edits made by the IDA\nuser or another agent since you last looked, instead of relying on earlier\nresults. Recording starts with the first call to this tool on a database;\nthat call returns `started: true` and no earlier changes. Each change says\nwho made it: an MCP tool (`source` 'tool' and `tool`), the IDA user or a\nscript run inside IDA ('ida'), or the auto-analyzer ('analysis').\nDecompiler-only edits (local variable names and types, decompiler comments)\nare not recorded.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "database_id": {
+            "description": "The unique identifier for the target IDA database. You can obtain this ID by calling list_available_databases, reading the ida://databases resource, or by opening a new database via idalib_headless_open.",
+            "type": "string"
+          },
+          "include_analysis": {
+            "default": false,
+            "description": "Also return changes made by IDA's auto-analyzer (can be many).",
+            "type": "boolean"
+          },
+          "limit": {
+            "default": 200,
+            "description": "Maximum number of changes to return (1-1000)",
+            "type": "integer"
+          },
+          "revision": {
+            "default": 0,
+            "description": "The `revision` returned by your previous call. Use 0 on the first call.",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "database_id"
+        ],
+        "type": "object"
+      },
+      "name": "get_changes_since",
+      "outputSchema": {
+        "properties": {
+          "events": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "has_more": {
+            "type": "boolean"
+          },
+          "latest_revision": {
+            "type": "integer"
+          },
+          "log_id": {
+            "type": "string"
+          },
+          "revision": {
+            "type": "integer"
+          },
+          "started": {
+            "type": "boolean"
+          },
+          "truncated": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "log_id",
+          "revision",
+          "latest_revision",
+          "events",
+          "has_more",
+          "truncated"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "_meta": {
+        "fastmcp": {
+          "tags": []
+        }
+      },
       "description": "Retrieves the comment associated with a specific address.",
       "inputSchema": {
         "additionalProperties": false,

@@ -35,6 +35,7 @@ project_root = os.path.dirname(current_dir)
 if project_root not in sys.path:
   sys.path.insert(0, project_root)
 
+from ida_mcp.core import change_log  # pylint: disable=g-import-not-at-top,g-bad-import-order
 from ida_mcp.core.security import security_manager  # pylint: disable=g-import-not-at-top,g-bad-import-order
 from ida_mcp.server import mcp_server_thread  # pylint: disable=g-import-not-at-top,g-bad-import-order
 from ida_mcp.server import stop_server  # pylint: disable=g-import-not-at-top,g-bad-import-order
@@ -115,6 +116,10 @@ class MCP(idaapi.plugin_t):
       close_tables()
     except Exception as e:
       print(f"[MCP] Error closing query tables: {e}")
+    try:
+      change_log.stop()
+    except Exception as e:
+      print(f"[MCP] Error stopping the change log: {e}")
 
     # 3. Clear iterator pagination caches
     try:

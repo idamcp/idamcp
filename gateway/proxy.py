@@ -486,6 +486,41 @@ async def get_data_xrefs_from(
 
 
 @mcp_tool
+async def get_changes_since(
+    database_id: Annotated[
+        str,
+        "The unique identifier for the target IDA database. You can obtain this"
+        " ID by calling list_available_databases, reading the ida://databases"
+        " resource, or by opening a new database via idalib_headless_open.",
+    ],
+    revision: Annotated[
+        int,
+        "The `revision` returned by your previous call. Use 0 on the first"
+        " call.",
+    ] = 0,
+    limit: Annotated[int, "Maximum number of changes to return (1-1000)"] = 200,
+    include_analysis: Annotated[
+        bool,
+        "Also return changes made by IDA's auto-analyzer (can be many).",
+    ] = False,
+) -> ChangesSince:
+  """Lists changes made to the database since a revision.
+
+  Covers renames, comments, types and prototypes, operand types, local types,
+  functions added/deleted/resized, byte patches, code/data definitions,
+  segments and stack variable renames. Use it to notice edits made by the IDA
+  user or another agent since you last looked, instead of relying on earlier
+  results. Recording starts with the first call to this tool on a database;
+  that call returns `started: true` and no earlier changes. Each change says
+  who made it: an MCP tool (`source` 'tool' and `tool`), the IDA user or a
+  script run inside IDA ('ida'), or the auto-analyzer ('analysis').
+  Decompiler-only edits (local variable names and types, decompiler comments)
+  are not recorded.
+  """
+  return await forward_to(database_id, "get_changes_since", locals())
+
+
+@mcp_tool
 async def dbg_get_all_registers_for_all_threads(
     database_id: Annotated[
         str,
