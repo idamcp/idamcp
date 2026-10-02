@@ -29,6 +29,8 @@ import pathlib
 import tempfile
 from typing import Any
 
+from shared import protocol
+
 
 class RegistryManager:
   """Manages registration of MCP backends."""
@@ -64,6 +66,8 @@ class RegistryManager:
         "address": address,
         "name": name,
         "metadata": metadata or {},
+        # Gateways from before the protocol check ignore these keys.
+        **protocol.record_fields(),
     }
     file_path = self.registry_dir / f"{name}.json"
     temp_path = ""
