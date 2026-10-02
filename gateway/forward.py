@@ -40,7 +40,9 @@ from fastmcp.exceptions import ToolError
 from pydantic import BaseModel
 from pydantic import ConfigDict
 from pydantic import Field
+from shared import liveness
 from shared import load_options
+from shared import protocol
 from shared.config import load_config
 from shared.rpc import RPCClient
 from shared.rpc import RPCError
@@ -81,6 +83,19 @@ def _is_process_running(pid: int) -> bool:
       return True
     except OSError:
       return False
+
+
+def _record_alive(record: Mapping[str, Any]) -> bool:
+  """Whether a registry record's backend is alive (lock file, else PID)."""
+  return liveness.record_alive(record, _is_process_running)
+
+
+def _backend_alive(database_id: str, pid: int | None = None) -> bool:
+  """Whether a connected backend is alive, using its registry record."""
+  record = _global_records.get(database_id)
+  if record is not None:
+    return _record_alive(record)
+  return bool(pid) and _is_process_running(pid)
 
 
 def _cleanup_stale_registry_file(
@@ -145,6 +160,27 @@ _backend_events: dict[str, asyncio.Event] = collections.defaultdict(
     asyncio.Event
 )
 _background_tasks: set[asyncio.Task] = set()
+# Registry record of each connected backend, for liveness checks.
+_global_records: dict[str, Mapping[str, Any]] = {}
+# Capabilities advertised in the registry record of each connected backend.
+_global_capabilities: dict[str, frozenset[str]] = {}
+# Backends that registered but were not connected because of a protocol
+# version mismatch, mapped to the message shown to the user.
+_incompatible_backends: dict[str, str] = {}
+
+
+def backend_capabilities(database_id: str) -> frozenset[str]:
+  """Returns the optional features a connected backend advertised.
+
+  Backends from before the protocol check advertise none.
+
+  Args:
+    database_id: The ID of the backend.
+
+  Returns:
+    The capability names, or an empty set for unknown backends.
+  """
+  return _global_capabilities.get(database_id, frozenset())
 
 
 def _create_background_task(coro) -> asyncio.Task:
@@ -225,7 +261,15 @@ class HeadlessManager:
     logging.info("[HeadlessManager] unregister started for %s", database_id)
     self.spawned_instances.discard(database_id)
     pid = _global_database_id_to_pid.pop(database_id, None)
-    if pid is not None and _is_process_running(pid):
+    record = _global_records.pop(database_id, None)
+    # With a lock file, a PID that was reused by another process after the
+    # backend exited is not signalled.
+    alive = (
+        _record_alive(record)
+        if record is not None
+        else pid is not None and _is_process_running(pid)
+    )
+    if pid is not None and alive:
       _create_background_task(_kill_process_gracefully(pid))
 
   async def close(self, database_id: str) -> None:
@@ -254,8 +298,7 @@ class HeadlessManager:
           metadata.get("database_path") == path
           or metadata.get("filepath") == path
       ):
-        pid = metadata.get("pid")
-        if pid and _is_process_running(pid):
+        if _backend_alive(db_id, metadata.get("pid")):
           raise ToolError(
               f"Database {path} is already connected (ID: {db_id}). DO NOT"
               " attempt to open it again; use the existing ID to access it"
@@ -415,10 +458,26 @@ async def connect_to_backend(registry_file: pathlib.Path) -> None:
     channel = data.get("channel")
     address = data.get("address")
     pid = data.get("pid")
-    if pid and not _is_process_running(pid):
+    if (pid or data.get(liveness.RECORD_FIELD)) and not _record_alive(data):
       logging.info("Cleaning up stale registry file: %s", registry_file)
       _cleanup_stale_registry_file(registry_file, data)
       return
+
+    # The backend process is alive, so keep its registry file even if the
+    # protocol versions do not match.
+    if reason := protocol.incompatibility_reason(data):
+      logging.error(
+          "[Gateway] Not connecting to backend %s: %s", backend_id, reason
+      )
+      _incompatible_backends[backend_id] = reason
+      return
+    _incompatible_backends.pop(backend_id, None)
+    if protocol.is_legacy_record(data):
+      logging.warning(
+          "[Gateway] Backend %s did not report a protocol version (idamcp"
+          " plugin from before the protocol check); assuming no capabilities.",
+          backend_id,
+      )
 
     metadata = data.get("metadata", {})
     # Ensure database_id is present in the metadata
@@ -461,6 +520,8 @@ async def connect_to_backend(registry_file: pathlib.Path) -> None:
       # Reset the closed state for new connections under the same ID
       _global_clients[backend_id] = client
       _global_metadata[backend_id] = metadata  # type: ignore
+      _global_capabilities[backend_id] = protocol.parse_capabilities(data)
+      _global_records[backend_id] = data
       _global_client_state[backend_id].is_closed = False
       _global_client_state[backend_id].is_broken = False
       logging.info("[Gateway] Successfully connected to backend %s", backend_id)
@@ -485,6 +546,7 @@ async def disconnect_backend(backend_id: str, unregister: bool = True) -> None:
       backend_id,
       unregister,
   )
+  _incompatible_backends.pop(backend_id, None)
   client = None
   with contextlib.suppress(Exception):
     async with _global_client_state[backend_id].condition:
@@ -518,6 +580,7 @@ async def disconnect_backend(backend_id: str, unregister: bool = True) -> None:
           return
       client = _global_clients.pop(backend_id, None)
       _global_metadata.pop(backend_id, None)
+      _global_capabilities.pop(backend_id, None)
     try:
       if client:
         # If it is a headless instance opened by us, request graceful shutdown
@@ -615,6 +678,10 @@ async def forward_to(target: str, tool_name: str, args: dict[str, Any]) -> Any:
     client = _global_clients.get(target)
     if client is None:
       logging.info("[Gateway] forward_to: client for %s not found", target)
+      if reason := _incompatible_backends.get(target):
+        raise ToolError(
+            f"Error: Backend database {target} is not connected. {reason}"
+        )
       raise ToolError(f"Error: Backend database {target} not found")
 
     call_arguments = {k: v for k, v in args.items() if k != "database_id"}
@@ -826,7 +893,7 @@ async def list_available_databases() -> list[DatabaseInfo]:
             if db_id in _global_metadata
             else None
         )
-        if pid and _is_process_running(pid):
+        if _backend_alive(db_id, pid):
           info = dict(_global_metadata[db_id])
           info["busy"] = True
           available.append(info)  # type: ignore
@@ -843,7 +910,7 @@ async def list_available_databases() -> list[DatabaseInfo]:
           if db_id in _global_metadata
           else None
       )
-      if pid and _is_process_running(pid):
+      if _backend_alive(db_id, pid):
         logging.info(
             "Backend %s is busy (ping failed but process is running)", db_id
         )
@@ -860,12 +927,19 @@ async def list_available_databases() -> list[DatabaseInfo]:
     await disconnect_backend(db_id)
     _cleanup_stale_registry_by_id(db_id, metadata)
   if not available:
-    raise ToolError(
+    message = (
         "It looks like there are currently no available IDA databases. If"
         " you've just closed them or haven't opened any yet, you might need to"
         " open your target binary in IDA first, or launch a headless instance"
         " if you want to operate without the UI."
     )
+    if _incompatible_backends:
+      details = " ".join(
+          f"[{db_id}] {reason}"
+          for db_id, reason in sorted(_incompatible_backends.items())
+      )
+      message += f" IDA instances found but not connected: {details}"
+    raise ToolError(message)
   return available
 
 

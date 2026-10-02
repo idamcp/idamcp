@@ -264,6 +264,12 @@ example of all available settings (showing defaults):
 *   **communication_channel**: Use `"uds"` for secure, local-only communication
     (Linux/macOS) or `"tcp"` for networked setups. Windows environments will
     default to `"tcp"`.
+*   **registry_dir**: Where each IDA instance writes a `<id>.json` record so
+    the gateway can find it. On Linux/macOS each instance also holds a lock
+    on `<id>.lock` there for as long as it runs; the gateway uses it to tell a
+    live instance from a record left behind by a crashed one, even if the
+    crashed instance's PID has been reused. A leftover `.lock` file is harmless
+    and is reused by the next instance with the same id.
 *   **max_headless_instances**: Limits how many background IDA processes the MCP
     Client (e.g., Gemini CLI) can spawn. This limit does not apply to manually
     launched instances.
