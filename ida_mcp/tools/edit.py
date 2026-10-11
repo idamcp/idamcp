@@ -30,9 +30,11 @@ import ida_funcs
 import ida_hexrays
 import ida_idp
 import ida_kernwin
+import ida_loader
 from ida_mcp.core.decorators import jsonrpc
 from ida_mcp.core.synchronization import idawrite
 from ida_mcp.utils import helper
+from ida_mcp.utils import save
 import ida_typeinf
 import idaapi
 import idc
@@ -45,6 +47,7 @@ from shared.types import (
     MakeDataRequest,
     PatchBytesRequest,
     RenameAddressRequest,
+    SaveDatabaseResult,
     SetColorRequest,
     SetCommentResult,
     SetTypeRequest,
@@ -52,6 +55,22 @@ from shared.types import (
     StackFrameVariableRename,
     StackFrameVariableTypeChange,
 )
+
+
+@jsonrpc
+@idawrite
+def save_database() -> SaveDatabaseResult:
+  """Saves the IDA database so renames, comments, types and patches persist.
+
+  Saves in place to the current .idb/.i64 path. In the IDA GUI this is the same
+  as File > Save. Headless databases are also saved when they are closed.
+  """
+  try:
+    return SaveDatabaseResult(
+        **save.save_current_database(ida_loader, idc, ida_kernwin)
+    )
+  except RuntimeError as e:
+    raise ToolError(str(e)) from e
 
 
 @jsonrpc

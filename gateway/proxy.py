@@ -719,6 +719,23 @@ async def dbg_enable_breakpoint(
 
 
 @mcp_tool
+async def save_database(
+    database_id: Annotated[
+        str,
+        "The unique identifier for the target IDA database. You can obtain this"
+        " ID by calling list_available_databases, reading the ida://databases"
+        " resource, or by opening a new database via idalib_headless_open.",
+    ],
+) -> SaveDatabaseResult:
+  """Saves the IDA database so renames, comments, types and patches persist.
+
+  Saves in place to the current .idb/.i64 path. In the IDA GUI this is the same
+  as File > Save. Headless databases are also saved when they are closed.
+  """
+  return await forward_to(database_id, "save_database", locals())
+
+
+@mcp_tool
 async def jump_to_address(
     database_id: Annotated[
         str,
