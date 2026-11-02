@@ -347,6 +347,79 @@ class TestConfig(unittest.TestCase):
       config = shared.config.load_config(config_path="/nonexistent")
     self.assertEqual(config.get("omitted_decompiler_warnings"), [])
 
+  def test_size_limit_defaults(self):
+    """Test the default response and eval output limits."""
+    config = shared.config.load_config(config_path="/nonexistent")
+    self.assertEqual(config["max_tool_response_bytes"], 8 * 1024 * 1024)
+    self.assertEqual(config["max_eval_output_bytes"], 1024 * 1024)
+
+  def test_parse_size(self):
+    """Test sizes as integers and as strings with units."""
+    cases = {
+        0: 0,
+        4096: 4096,
+        "0": 0,
+        "4096": 4096,
+        "4096b": 4096,
+        "512k": 512 * 1024,
+        "512kb": 512 * 1024,
+        "512 KiB": 512 * 1024,
+        "8m": 8 * 1024 * 1024,
+        "8MB": 8 * 1024 * 1024,
+        " 8 MiB ": 8 * 1024 * 1024,
+        "1.5mb": 1536 * 1024,
+        "2g": 2 * 1024 * 1024 * 1024,
+        "2GiB": 2 * 1024 * 1024 * 1024,
+    }
+    for value, expected in cases.items():
+      with self.subTest(value=value):
+        self.assertEqual(shared.config._parse_size(value), expected)
+    for bad in (-1, True, 1.5, "", "m", "-1k", "8 parsecs", "1,024", None):
+      with self.subTest(bad=bad):
+        self.assertIsNone(shared.config._parse_size(bad))
+
+  def test_size_limit_user_env_and_zero(self):
+    """Test user values and env overrides with units; 0 means no limit."""
+    with mock.patch(
+        "builtins.open",
+        mock.mock_open(
+            read_data='{"max_tool_response_bytes": "4k",'
+            ' "max_eval_output_bytes": 0}'
+        ),
+    ):
+      with mock.patch("pathlib.Path.is_file", return_value=True):
+        config = shared.config.load_config()
+        self.assertEqual(config["max_tool_response_bytes"], 4096)
+        self.assertEqual(config["max_eval_output_bytes"], 0)
+
+    shared.config.load_config.cache_clear()
+    with mock.patch.dict(
+        "os.environ",
+        {"MAX_TOOL_RESPONSE_BYTES": "0", "MAX_EVAL_OUTPUT_BYTES": " 2 kb "},
+    ):
+      config = shared.config.load_config(config_path="/nonexistent")
+    self.assertEqual(config["max_tool_response_bytes"], 0)
+    self.assertEqual(config["max_eval_output_bytes"], 2048)
+
+  def test_invalid_size_limits_fall_back_to_defaults(self):
+    """Test that negative, boolean, and unknown-unit limits use the default."""
+    for bad in ("-1", "true", "1.5", '"1 parsec"', '"-1k"', '""'):
+      with self.subTest(bad=bad):
+        shared.config.load_config.cache_clear()
+        with (
+            mock.patch(
+                "builtins.open",
+                mock.mock_open(
+                    read_data=f'{{"max_eval_output_bytes": {bad}}}'
+                ),
+            ),
+            mock.patch("pathlib.Path.is_file", return_value=True),
+            self.assertLogs(level="WARNING") as logs,
+        ):
+          config = shared.config.load_config()
+        self.assertEqual(config["max_eval_output_bytes"], 1024 * 1024)
+        self.assertIn("Invalid max_eval_output_bytes", logs.output[0])
+
 
 if __name__ == "__main__":
   unittest.main()

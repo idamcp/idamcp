@@ -879,6 +879,10 @@ async def idapython_eval(
   Supports Jupyter-style evaluation (returns the value of the last expression).
   Each call runs in a fresh namespace unless persist_globals is set; objects
   that must outlive the call (hooks, timers, callbacks) need persist_globals.
+  stdout, stderr, and result are each limited to max_eval_output_bytes (1 MiB
+  by default): code that prints more is stopped, and the call fails with an
+  error that includes the output so far. Print less, or write large output to
+  a file.
   """
   return await forward_to(database_id, "idapython_eval", locals())
 

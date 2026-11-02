@@ -37,9 +37,22 @@ from typing import Annotated, Any, Mapping, NotRequired, Sequence
 from fastmcp import FastMCP
 from fastmcp.exceptions import ResourceError
 from fastmcp.exceptions import ToolError
+from fastmcp.server.middleware import CallNext
+from fastmcp.server.middleware import Middleware
+from fastmcp.server.middleware import MiddlewareContext
 from fastmcp.server.transforms.search import BM25SearchTransform
 from fastmcp.server.transforms.search import serialize_tools_for_output_markdown
 from fastmcp.tools import Tool
+from fastmcp.tools import ToolResult
+
+try:
+  # FastMCP 4 ships the MCP types as mcp_types; FastMCP 3 uses the mcp SDK,
+  # which in both cases provides the same classes under mcp.types.
+  from mcp_types import CallToolRequestParams
+  from mcp_types import TextContent
+except ImportError:
+  from mcp.types import CallToolRequestParams
+  from mcp.types import TextContent
 from pydantic import AliasChoices
 from pydantic import BaseModel
 from pydantic import ConfigDict
@@ -953,12 +966,105 @@ def _build_mcp_instructions() -> str | None:
   return f"{_FULL_INSTRUCTIONS_INTRO}\n{_INSTRUCTIONS_BODY}"
 
 
+# The response limit comes from the max_tool_response_bytes option (8 MiB by
+# default; 0 for no limit). The backend limits idapython_eval's stdout,
+# stderr, and result to max_eval_output_bytes each (1 MiB by default), so a
+# response from a call within those limits must always fit: 8 MiB leaves room
+# for JSON escaping, which can double or treble escape-heavy text. The limit
+# is a safety net for responses nothing else bounds, such as an unbounded
+# SELECT. Requests are not limited: whatever a client can send, the backend
+# can take.
+_RESPONSE_LIMIT_OPTION = "max_tool_response_bytes"
+
+
+def _content_size(content: Sequence[Any], limit: int) -> int:
+  """Returns the size of a tool result's content blocks, in characters.
+
+  Stops counting once the total passes `limit`. FastMCP serializes a tool's
+  return value into the text block itself, so measuring the blocks covers
+  structured results too, with no extra serialization.
+  """
+  total = 0
+  for block in content:
+    text = getattr(block, "text", None)
+    data = getattr(block, "data", None)
+    resource = getattr(block, "resource", None)
+    if isinstance(text, str):
+      total += len(text)
+    elif isinstance(data, (str, bytes)):
+      total += len(data)
+    elif resource is not None:
+      resource_text = getattr(resource, "text", None)
+      resource_blob = getattr(resource, "blob", None)
+      if isinstance(resource_text, str):
+        total += len(resource_text)
+      elif isinstance(resource_blob, (str, bytes)):
+        total += len(resource_blob)
+    else:
+      total += 64
+    if total > limit:
+      break
+  return total
+
+
+def _format_size(num_bytes: int) -> str:
+  """Formats a byte count for an error message, e.g. "8 MiB" or "1.5 KiB"."""
+  for unit, size in (("MiB", 1 << 20), ("KiB", 1 << 10)):
+    if num_bytes >= size:
+      return f"{num_bytes / size:.3g} {unit}"
+  return f"{num_bytes} bytes"
+
+
+class ResponseSizeLimitMiddleware(Middleware):
+  """Replaces tool responses above a size limit with an error.
+
+  Clients hold a tool result in the model's context, so an oversized one is
+  useless there and may break the client. The error tells the model how to
+  ask for less instead.
+  """
+
+  def __init__(self, limit: int):
+    """Initializes the middleware.
+
+    Args:
+      limit: The largest response passed on, in characters of content.
+    """
+    super().__init__()
+    self.limit = limit
+
+  async def on_call_tool(
+      self,
+      context: MiddlewareContext[CallToolRequestParams],
+      call_next: CallNext[CallToolRequestParams, ToolResult],
+  ) -> ToolResult:
+    result = await call_next(context)
+    size = _content_size(result.content or (), self.limit)
+    if size <= self.limit:
+      return result
+    error_msg = (
+        f"Error: Tool '{context.message.name}' response payload size"
+        f" (at least {_format_size(size)}) exceeded the"
+        f" {_format_size(self.limit)} limit (max_tool_response_bytes). Please"
+        " narrow your query, paginate with LIMIT/OFFSET, or write output to a"
+        " file."
+    )
+    return ToolResult(
+        content=[TextContent(type="text", text=error_msg)],
+        is_error=True,
+    )
+
+
 mcp_server = FastMCP(
     "IDA Dynamic Proxy Gateway",
     instructions=_build_mcp_instructions(),
     lifespan=lifespan,
     transforms=_build_mcp_transforms(),
 )
+# The option can't change while the gateway runs, so read it once, and with
+# no limit (0) don't install the middleware at all.
+_response_limit = CONFIG[_RESPONSE_LIMIT_OPTION]
+if _response_limit:
+  mcp_server.add_middleware(ResponseSizeLimitMiddleware(_response_limit))
 
 
 def mcp_tool(func=None, *args, **kwargs):

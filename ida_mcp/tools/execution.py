@@ -37,6 +37,8 @@ from ida_mcp.core.decorators import jsonrpc
 from ida_mcp.core.decorators import unsafe
 from ida_mcp.core.synchronization import idawrite
 from ida_mcp.utils import helper
+from shared.config import load_config
+from shared.rpc import ToolError
 
 # IDA modules and runtime helpers that seed every execution namespace.
 _base_globals: Dict[str, Any] = {}
@@ -98,6 +100,15 @@ def _format_user_traceback(
   )
 
 
+def _output_notes(stdout: str, stderr: str) -> list[str]:
+  """Returns one note per non-empty stream, with its output."""
+  return [
+      f"{name}:\n{text.rstrip()}"
+      for name, text in (("stdout", stdout), ("stderr", stderr))
+      if text.strip()
+  ]
+
+
 def _add_output_notes(error: BaseException, stdout: str, stderr: str) -> None:
   """Adds the output printed so far, one note per non-empty stream, to `error`.
 
@@ -106,9 +117,8 @@ def _add_output_notes(error: BaseException, stdout: str, stderr: str) -> None:
     stdout: The standard output captured so far.
     stderr: The standard error captured so far.
   """
-  for name, text in (("stdout", stdout), ("stderr", stderr)):
-    if text.strip():
-      error.add_note(f"{name}:\n{text.rstrip()}")
+  for note in _output_notes(stdout, stderr):
+    error.add_note(note)
 
 
 async def _await(value: Awaitable[Any]) -> Any:
@@ -336,6 +346,152 @@ def clear_persistent_globals() -> None:
   _persistent_globals.clear()
 
 
+# The limit on each of stdout, stderr, and result of idapython_eval comes from
+# the max_eval_output_bytes option (1 MiB by default; 0 for no limit). It
+# can't change while the backend runs, so it is read once. A model can't read
+# even 1 MiB of output, so a snippet that produces more is stopped rather than
+# left running until its timeout. The traceback limit only bounds a huge
+# exception message.
+_OUTPUT_LIMIT = load_config()["max_eval_output_bytes"]
+_MAX_TRACEBACK_BYTES = 64 * 1024
+
+
+def _utf8_len(s: str) -> int:
+  """Returns the UTF-8 length of `s`; lone surrogates count as 3 bytes."""
+  if s.isascii():
+    return len(s)
+  # surrogatepass: a snippet may print text decoded with surrogateescape,
+  # which io.StringIO accepted and json.dumps can escape.
+  return len(s.encode("utf-8", "surrogatepass"))
+
+
+def _utf8_prefix(s: str, max_bytes: int) -> str:
+  """Returns the longest prefix of `s` within `max_bytes` of UTF-8.
+
+  Slicing str never splits a code point, and the UTF-8 length grows with the
+  prefix length, so a binary search over the prefix length works.
+  """
+  if _utf8_len(s) <= max_bytes:
+    return s
+  low, high = 0, len(s)
+  while low < high:
+    mid = (low + high + 1) // 2
+    if _utf8_len(s[:mid]) <= max_bytes:
+      low = mid
+    else:
+      high = mid - 1
+  return s[:low]
+
+
+def _format_size(num_bytes: int) -> str:
+  """Formats a byte count as a whole number of MiB, KiB, or bytes."""
+  for unit, size in (("MiB", 1 << 20), ("KiB", 1 << 10)):
+    if num_bytes >= size and num_bytes % size == 0:
+      return f"{num_bytes // size} {unit}"
+  return f"{num_bytes} bytes"
+
+
+class _OutputLimitInterrupt(_OperationInterrupt):
+  """Raised in the snippet by a write that would exceed a stream's limit.
+
+  Derived from _OperationInterrupt so that the handlers _protect_cancellation
+  adds to the snippet's try blocks re-raise it instead of letting user code
+  swallow it. idapython_eval reports it as an OutputLimitError.
+  """
+
+
+class OutputLimitError(ToolError):
+  """Raised when a snippet's stdout, stderr, or result exceeds its limit."""
+
+
+def _output_limit_error(
+    name: str,
+    limit: int,
+    stdout: str,
+    stderr: str,
+    result: tuple[str, int] | None = None,
+) -> OutputLimitError:
+  """Returns the error for an output that exceeded its limit.
+
+  Like a timeout error, its message carries the output so far, so the client
+  still gets what the code printed.
+
+  Args:
+    name: "stdout", "stderr", or "result".
+    limit: The limit in bytes.
+    stdout: The standard output captured.
+    stderr: The standard error captured.
+    result: For a result, the prefix of it that fits the limit and its full
+      size in bytes. A stream has none: the code was stopped at the limit.
+  """
+  message = f"{name} exceeded the {_format_size(limit)} output limit"
+  notes = _output_notes(stdout, stderr)
+  if result is None:
+    message += "; execution stopped. Print less, or write to a file."
+  else:
+    prefix, size = result
+    message += f" ({size} bytes). Return less, or write it to a file."
+    notes.insert(0, f"result (first {_format_size(limit)}):\n{prefix}")
+  return OutputLimitError("\n\n".join([message, *notes]))
+
+
+class BoundedStringIO(io.TextIOBase):
+  """A write-only text stream that stops the writer at `max_bytes` of UTF-8.
+
+  A write that would exceed the limit keeps the part that fits, so getvalue()
+  shows the output up to the cut, and raises _OutputLimitInterrupt; so does
+  every later write, in case the first interrupt was swallowed at a C
+  boundary.
+  """
+
+  def __init__(self, max_bytes: int, name: str = "output"):
+    super().__init__()
+    self.max_bytes = max_bytes
+    self.name = name
+    self.exceeded = False
+    self._chunks: list[str] = []
+    self._bytes_written = 0
+
+  def write(self, s: str) -> int:
+    if not isinstance(s, str):
+      s = str(s)
+    if not self.exceeded:
+      s_bytes = _utf8_len(s)
+      if self._bytes_written + s_bytes <= self.max_bytes:
+        self._chunks.append(s)
+        self._bytes_written += s_bytes
+        return len(s)
+      self.exceeded = True
+      prefix = _utf8_prefix(s, self.max_bytes - self._bytes_written)
+      self._chunks.append(prefix)
+      self._bytes_written += _utf8_len(prefix)
+    raise _OutputLimitInterrupt(
+        f"{self.name} exceeded the {_format_size(self.max_bytes)} output limit"
+    )
+
+  def flush(self) -> None:
+    pass
+
+  def readable(self) -> bool:
+    return False
+
+  def writable(self) -> bool:
+    return True
+
+  def seekable(self) -> bool:
+    return False
+
+  def getvalue(self) -> str:
+    return "".join(self._chunks)
+
+
+def _output_capture(name: str) -> io.StringIO | BoundedStringIO:
+  """Returns the stream that captures a snippet's stdout or stderr."""
+  if not _OUTPUT_LIMIT:
+    return io.StringIO()
+  return BoundedStringIO(_OUTPUT_LIMIT, name)
+
+
 @jsonrpc
 @unsafe
 @idawrite
@@ -364,12 +520,17 @@ def idapython_eval(
   Supports Jupyter-style evaluation (returns the value of the last expression).
   Each call runs in a fresh namespace unless persist_globals is set; objects
   that must outlive the call (hooks, timers, callbacks) need persist_globals.
+  stdout, stderr, and result are each limited to max_eval_output_bytes (1 MiB
+  by default): code that prints more is stopped, and the call fails with an
+  error that includes the output so far. Print less, or write large output to
+  a file.
   """
   del timeout  # Enforced by @idawrite.
   namespace = _prepare_namespace(persist_globals)
 
-  stdout_capture = io.StringIO()
-  stderr_capture = io.StringIO()
+  stdout_capture = _output_capture("stdout")
+  stderr_capture = _output_capture("stderr")
+  traceback_text = ""
   result_text = ""
   result_type = ""
 
@@ -394,11 +555,14 @@ def idapython_eval(
     except (Exception, SystemExit) as exc:  # pylint: disable=broad-exception-caught
       # Catch both Exception and SystemExit so `sys.exit()` in user scripts is
       # reported cleanly in stderr instead of terminating the worker/GUI thread.
-      print(
-          _format_user_traceback(exc, _USER_CODE_FILENAME),
-          end="",
-          file=stderr_capture,
-      )
+      # Not written to stderr_capture, which may be full and would then stop
+      # this handler too.
+      traceback_text = _format_user_traceback(exc, _USER_CODE_FILENAME)
+      if _utf8_len(traceback_text) > _MAX_TRACEBACK_BYTES:
+        traceback_text = (
+            _utf8_prefix(traceback_text, _MAX_TRACEBACK_BYTES)
+            + "\n... [traceback truncated]\n"
+        )
     finally:
       if not persist_globals:
         # Break function -> __globals__ -> namespace cycles now, so objects the
@@ -406,17 +570,41 @@ def idapython_eval(
         # IDA's main thread instead of by a later GC pass on another thread.
         namespace.clear()
   except BaseException as exc:
-    # The interrupt for a cancel or timeout, which @idawrite turns into
-    # CancelledError or ToolTimeoutError. A timeout error includes these notes,
-    # so the client still gets the output printed before the timeout. Handled
-    # out here so that it also covers an interrupt raised while the namespace
-    # is cleared, which replaces the interrupt that was unwinding.
-    _add_output_notes(exc, stdout_capture.getvalue(), stderr_capture.getvalue())
+    # Either a stream's _OutputLimitInterrupt, or the interrupt for a cancel or
+    # timeout, which @idawrite turns into CancelledError or ToolTimeoutError. A
+    # timeout error includes these notes, so the client still gets the output
+    # printed before the timeout. Handled out here so that it also covers an
+    # interrupt raised while the namespace is cleared, which replaces the
+    # interrupt that was unwinding.
+    stdout = stdout_capture.getvalue()
+    stderr = stderr_capture.getvalue()
+    for capture in (stdout_capture, stderr_capture):
+      # Checked by flag rather than by type: asyncio may replace the interrupt
+      # that unwound a coroutine with a plain CancelledError.
+      if isinstance(capture, BoundedStringIO) and capture.exceeded:
+        raise _output_limit_error(
+            capture.name, capture.max_bytes, stdout, stderr
+        ) from exc
+    _add_output_notes(exc, stdout, stderr)
     raise
 
+  if _OUTPUT_LIMIT:
+    result_bytes = _utf8_len(result_text)
+    if result_bytes > _OUTPUT_LIMIT:
+      raise _output_limit_error(
+          "result",
+          _OUTPUT_LIMIT,
+          stdout_capture.getvalue(),
+          stderr_capture.getvalue(),
+          result=(_utf8_prefix(result_text, _OUTPUT_LIMIT), result_bytes),
+      )
+
+  stderr = stderr_capture.getvalue()
+  if traceback_text and stderr and not stderr.endswith("\n"):
+    stderr += "\n"
   return {
       "result": result_text,
       "result_type": result_type,
       "stdout": stdout_capture.getvalue(),
-      "stderr": stderr_capture.getvalue(),
+      "stderr": stderr + traceback_text,
   }

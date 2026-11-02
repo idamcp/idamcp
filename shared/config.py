@@ -25,6 +25,7 @@ import json
 import logging
 import os
 import pathlib
+import re
 import sys
 import tempfile
 from typing import Any
@@ -70,7 +71,48 @@ _DEFAULT_CONFIG = {
     # type" notes come with most calls, and "possibly undefined" ones mostly
     # flag call arguments that the pseudocode already shows as never set.
     "omitted_decompiler_warnings": ["WARN_GUESSED_TYPE", "WARN_UNDEF_LVAR"],
+    # Size limits, as bytes or a string with a unit (see _parse_size); 0 means
+    # no limit. The gateway replaces a larger tool response with an error, and
+    # the backend stops idapython_eval code whose stdout, stderr, or result
+    # grows past the limit.
+    "max_tool_response_bytes": "8m",
+    "max_eval_output_bytes": "1m",
 }
+_SIZE_OPTIONS = ("max_tool_response_bytes", "max_eval_output_bytes")
+# Binary multiples, as in most size settings ("8m" is 8 MiB).
+_SIZE_UNITS = {
+    "": 1,
+    "b": 1,
+    "k": 1 << 10,
+    "kb": 1 << 10,
+    "kib": 1 << 10,
+    "m": 1 << 20,
+    "mb": 1 << 20,
+    "mib": 1 << 20,
+    "g": 1 << 30,
+    "gb": 1 << 30,
+    "gib": 1 << 30,
+}
+_SIZE_RE = re.compile(r"(\d+(?:\.\d+)?)\s*([a-z]*)")
+
+
+def _parse_size(value: Any) -> int | None:
+  """Returns a size setting in bytes, or None if `value` is not a size.
+
+  Args:
+    value: A non-negative integer number of bytes, or a string of a number and
+      an optional unit, case-insensitive: b, k, kb, kib, m, mb, mib, g, gb, or
+      gib, e.g. "8m", "512 KiB", or "1.5mb". Units are binary multiples.
+  """
+  if isinstance(value, bool):
+    return None
+  if isinstance(value, int):
+    return value if value >= 0 else None
+  if isinstance(value, str):
+    match = _SIZE_RE.fullmatch(value.strip().lower())
+    if match and match.group(2) in _SIZE_UNITS:
+      return int(float(match.group(1)) * _SIZE_UNITS[match.group(2)])
+  return None
 
 
 def _set_option_from_env(
@@ -203,6 +245,24 @@ def load_config(config_path: str | None = None) -> dict[str, Any]:
   _set_option_from_env(config, "always_visible_tools")
   _set_option_from_env(config, "show_decompiler_warnings")
   _set_option_from_env(config, "omitted_decompiler_warnings")
+
+  # Size options take a string with a unit, so they are read from the
+  # environment as is and parsed together with the config file's value. They
+  # end up as a number of bytes; 0 means no limit.
+  for option in _SIZE_OPTIONS:
+    if (env_val := os.environ.get(option.upper())) is not None:
+      config[option] = env_val
+    size = _parse_size(config[option])
+    if size is None:
+      logging.warning(
+          "Invalid %s %r: expected a size such as 8388608, \"8m\", or"
+          ' "512kb". Using %r.',
+          option,
+          config[option],
+          _DEFAULT_CONFIG[option],
+      )
+      size = _parse_size(_DEFAULT_CONFIG[option])
+    config[option] = size
 
   # Expand registry_dir path
   config["registry_dir"] = pathlib.Path(config["registry_dir"]).expanduser()

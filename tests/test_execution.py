@@ -21,6 +21,7 @@
 """Unit tests for the execution module."""
 
 import gc
+import io
 import sys
 import threading
 import time
@@ -580,6 +581,223 @@ class TestTimeout(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "timeout must be"):
           idapython_eval("x_ran = True", persist_globals=True, timeout=value)
     self.assertNotIn("x_ran", execution._persistent_globals)
+
+
+class TestOutputLimits(unittest.TestCase):
+  """Tests for the stdout, stderr, and result limits of idapython_eval."""
+
+  def setUp(self):
+    super().setUp()
+    execution.clear_persistent_globals()
+    self.addCleanup(execution.clear_persistent_globals)
+
+  def test_stdout_limit_stops_the_code_and_reports_the_output(self):
+    """Test that code is stopped at 1 MiB of stdout, with the output so far."""
+    code = (
+        "n = 0\n"
+        "for _ in range(50000):\n"
+        "    print('A' * 80)\n"
+        "    n += 1\n"
+    )
+    with self.assertRaises(execution.OutputLimitError) as cm:
+      idapython_eval(code, persist_globals=True)
+    message = str(cm.exception)
+    self.assertTrue(
+        message.startswith(
+            "stdout exceeded the 1 MiB output limit; execution stopped"
+        ),
+        message[:120],
+    )
+    _, stdout = message.split("\n\nstdout:\n", 1)
+    self.assertEqual(len(stdout.encode("utf-8")), 1024 * 1024)
+    self.assertTrue(stdout.startswith("A" * 80 + "\n"))
+    # The loop ran until the limit was hit, not to completion.
+    iterations = execution._persistent_globals["n"]
+    self.assertEqual(iterations, 1024 * 1024 // 81)
+    self.assertLess(iterations, 50000)
+
+  def test_stderr_limit_stops_the_code(self):
+    """Test that code is stopped at 1 MiB of stderr."""
+    code = (
+        "import sys\n"
+        "for _ in range(50000):\n"
+        "    sys.stderr.write('E' * 80 + '\\n')\n"
+    )
+    with self.assertRaisesRegex(
+        execution.OutputLimitError,
+        r"^stderr exceeded the 1 MiB output limit; execution stopped",
+    ) as cm:
+      idapython_eval(code)
+    self.assertIn("\n\nstderr:\nEEEE", str(cm.exception))
+    self.assertNotIn("stdout:", str(cm.exception))
+
+  def test_user_handlers_cannot_swallow_the_limit(self):
+    """Test that bare except and except BaseException cannot catch it."""
+    for handler_clause in ("except:", "except BaseException:"):
+      code = (
+          "n = 0\n"
+          "while True:\n"
+          "    try:\n"
+          "        print('x' * 80)\n"
+          f"    {handler_clause}\n"
+          "        pass\n"
+          "    n += 1\n"
+      )
+      with self.subTest(handler_clause=handler_clause):
+        execution.clear_persistent_globals()
+        with self.assertRaises(execution.OutputLimitError):
+          idapython_eval(code, persist_globals=True, timeout=5)
+        self.assertEqual(
+            execution._persistent_globals["n"], 1024 * 1024 // 81
+        )
+
+  def test_async_code_is_stopped_too(self):
+    """Test the limit inside a coroutine, which asyncio.run runs as a task."""
+    code = (
+        "async def main():\n"
+        "    for _ in range(50000):\n"
+        "        print('A' * 80)\n"
+        "main()\n"
+    )
+    with self.assertRaisesRegex(
+        execution.OutputLimitError, r"^stdout exceeded the 1 MiB output limit"
+    ):
+      idapython_eval(code)
+
+  def test_result_limit(self):
+    """Test that a result above 1 MiB fails the call with its prefix."""
+    with self.assertRaises(execution.OutputLimitError) as cm:
+      idapython_eval("print('done')\n'R' * (3 * 1024 * 1024)")
+    message = str(cm.exception)
+    self.assertTrue(
+        message.startswith(
+            "result exceeded the 1 MiB output limit (3145728 bytes)."
+        ),
+        message[:120],
+    )
+    self.assertIn("\n\nresult (first 1 MiB):\n" + "R" * 1024, message)
+    self.assertIn("\n\nstdout:\ndone", message)
+
+  def test_multibyte_output_is_cut_between_code_points(self):
+    """Test that the kept output is valid UTF-8 within the limit."""
+    code = "for _ in range(75000):\n    print('🚀🌟你好世界')"
+    with self.assertRaises(execution.OutputLimitError) as cm:
+      idapython_eval(code)
+    _, stdout = str(cm.exception).split("\n\nstdout:\n", 1)
+    stdout_bytes = stdout.encode("utf-8")  # Raises on a split code point.
+    self.assertLessEqual(len(stdout_bytes), 1024 * 1024)
+    self.assertGreater(len(stdout_bytes), 1024 * 1024 - 32)
+
+  def test_lone_surrogates_are_captured(self):
+    """Test that text decoded with surrogateescape prints like in StringIO."""
+    result = idapython_eval(
+        "print(b'\\xff\\xfeabc'.decode('utf-8', 'surrogateescape'))"
+    )
+    self.assertEqual(result["stdout"], "\udcff\udcfeabc\n")
+    self.assertEqual(result["stderr"], "")
+
+  def test_traceback_is_reported_when_stderr_is_nearly_full(self):
+    """Test that the traceback does not count against the stderr limit."""
+    code = (
+        "import sys\n"
+        f"sys.stderr.write('E' * ({1024 * 1024} - 10))\n"
+        "raise ValueError('boom')\n"
+    )
+    result = idapython_eval(code)
+    self.assertTrue(result["stderr"].startswith("E" * 1000))
+    self.assertIn("\nTraceback (most recent call last):", result["stderr"])
+    self.assertTrue(result["stderr"].endswith("ValueError: boom\n"))
+
+  def test_traceback_is_truncated(self):
+    """Test that a huge exception message cannot grow stderr unboundedly."""
+    result = idapython_eval("raise ValueError('x' * (2 * 1024 * 1024))")
+    stderr = result["stderr"]
+    self.assertLess(len(stderr.encode("utf-8")), 64 * 1024 + 64)
+    self.assertTrue(stderr.startswith("Traceback (most recent call last):"))
+    self.assertTrue(stderr.endswith("\n... [traceback truncated]\n"))
+
+  def test_limit_comes_from_max_eval_output_bytes(self):
+    """Test that the configured limit applies to streams and result."""
+    code = (
+        "n = 0\n"
+        "for _ in range(1000):\n"
+        "    print('A' * 80)\n"
+        "    n += 1\n"
+    )
+    with mock.patch.object(execution, "_OUTPUT_LIMIT", 4096):
+      with self.assertRaisesRegex(
+          execution.OutputLimitError,
+          r"^stdout exceeded the 4 KiB output limit; execution stopped",
+      ):
+        idapython_eval(code, persist_globals=True)
+      self.assertEqual(execution._persistent_globals["n"], 4096 // 81)
+      with self.assertRaisesRegex(
+          execution.OutputLimitError,
+          r"^result exceeded the 4 KiB output limit \(5000 bytes\)",
+      ):
+        idapython_eval("'R' * 5000")
+
+  def test_zero_means_no_limit(self):
+    """Test that max_eval_output_bytes 0 disables the limits."""
+    code = (
+        "for _ in range(20000):\n"
+        "    print('A' * 80)\n"
+        "'R' * (2 * 1024 * 1024)"
+    )
+    with mock.patch.object(execution, "_OUTPUT_LIMIT", 0):
+      self.assertIsInstance(execution._output_capture("stdout"), io.StringIO)
+      result = idapython_eval(code)
+    self.assertEqual(len(result["stdout"]), 20000 * 81)
+    self.assertEqual(len(result["result"]), 2 * 1024 * 1024)
+
+
+class TestBoundedStringIO(unittest.TestCase):
+  """Tests for BoundedStringIO on its own."""
+
+  def test_write_stops_at_the_limit_and_keeps_what_fits(self):
+    stream = execution.BoundedStringIO(max_bytes=10, name="stdout")
+    self.assertEqual(stream.write("abc"), 3)
+    self.assertFalse(stream.exceeded)
+    with self.assertRaisesRegex(
+        execution._OutputLimitInterrupt, "stdout exceeded the 10 bytes"
+    ):
+      stream.write("defghijklmnop")
+    self.assertTrue(stream.exceeded)
+    self.assertEqual(stream.getvalue(), "abcdefghij")
+    # Later writes keep raising, in case the first interrupt was swallowed.
+    with self.assertRaises(execution._OutputLimitInterrupt):
+      stream.write("z")
+    self.assertEqual(stream.getvalue(), "abcdefghij")
+
+  def test_interrupt_is_not_catchable_as_exception(self):
+    self.assertTrue(
+        issubclass(execution._OutputLimitInterrupt, BaseException)
+    )
+    self.assertFalse(issubclass(execution._OutputLimitInterrupt, Exception))
+
+  def test_cut_never_splits_a_code_point(self):
+    stream = execution.BoundedStringIO(max_bytes=9)
+    with self.assertRaises(execution._OutputLimitInterrupt):
+      stream.write("é" * 10)  # 2 bytes each: 4 fit, a 5th would need 10.
+    self.assertEqual(stream.getvalue(), "é" * 4)
+
+  def test_surrogates_count_three_bytes(self):
+    stream = execution.BoundedStringIO(max_bytes=6)
+    self.assertEqual(stream.write("\udcff\udcff"), 2)
+    with self.assertRaises(execution._OutputLimitInterrupt):
+      stream.write("a")
+    self.assertEqual(stream.getvalue(), "\udcff\udcff")
+
+  def test_default_capture_is_bounded_to_one_mib(self):
+    capture = execution._output_capture("stdout")
+    self.assertIsInstance(capture, execution.BoundedStringIO)
+    self.assertEqual(capture.max_bytes, 1024 * 1024)
+    self.assertEqual(capture.name, "stdout")
+
+  def test_limit_names_use_whole_units(self):
+    self.assertEqual(execution._format_size(1024 * 1024), "1 MiB")
+    self.assertEqual(execution._format_size(64 * 1024), "64 KiB")
+    self.assertEqual(execution._format_size(1500), "1500 bytes")
 
 
 if __name__ == "__main__":

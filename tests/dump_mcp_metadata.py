@@ -29,7 +29,9 @@ No IDA installation is needed. The gateway is imported with a throwaway config
 (temporary registry and UDS directories, no user config file, no config
 environment variables), so the output does not depend on the local setup.
 Version strings that come from installed libraries are replaced with a
-placeholder.
+placeholder, and fields that depend on the installed FastMCP version rather
+than on the gateway are left out, so the output is the same under FastMCP 3
+and 4.
 
 Regenerate the golden file after an intended change with:
 
@@ -39,6 +41,7 @@ Regenerate the golden file after an intended change with:
 import argparse
 import asyncio
 import importlib
+import inspect
 import json
 import os
 import pathlib
@@ -84,6 +87,18 @@ def _dump_model(model: Any) -> dict[str, Any]:
   return model.model_dump(mode="json", by_alias=True, exclude_none=True)
 
 
+def _drop_version_dependent_fields(metadata: dict[str, Any]) -> None:
+  """Removes what differs between FastMCP versions for the same gateway."""
+  # FastMCP 3 declares empty experimental and extensions capabilities.
+  capabilities = metadata["initialize"].get("capabilities", {})
+  for key in ("experimental", "extensions"):
+    capabilities.pop(key, None)
+  # FastMCP 4 gives a tool without a title one derived from its name.
+  for tool in metadata["tools"]:
+    if tool.get("title") == tool["name"].replace("_", " ").title():
+      del tool["title"]
+
+
 async def _collect() -> dict[str, Any]:
   """Connects an in-memory MCP client to the gateway and lists its metadata."""
   # The gateway reads its config and registers tools at import time, so these
@@ -95,7 +110,12 @@ async def _collect() -> dict[str, Any]:
 
   # pylint: enable=g-import-not-at-top
 
-  async with fastmcp.Client(mcp_server, mode="legacy") as client:
+  # FastMCP 4 negotiates a newer protocol era unless pinned to the classic
+  # initialize handshake, which is all FastMCP 3 has.
+  client_options = {}
+  if "mode" in inspect.signature(fastmcp.Client.__init__).parameters:
+    client_options["mode"] = "legacy"
+  async with fastmcp.Client(mcp_server, **client_options) as client:
     initialize = _dump_model(client.initialize_result)
     tools = await client.list_tools()
     resources = await client.list_resources()
@@ -104,7 +124,7 @@ async def _collect() -> dict[str, Any]:
 
   initialize["protocolVersion"] = _VERSION_PLACEHOLDER
   initialize["serverInfo"]["version"] = _VERSION_PLACEHOLDER
-  return {
+  metadata = {
       "initialize": initialize,
       "tools": sorted(map(_dump_model, tools), key=lambda t: t["name"]),
       "resources": sorted(map(_dump_model, resources), key=lambda r: r["uri"]),
@@ -113,6 +133,8 @@ async def _collect() -> dict[str, Any]:
       ),
       "prompts": sorted(map(_dump_model, prompts), key=lambda p: p["name"]),
   }
+  _drop_version_dependent_fields(metadata)
+  return metadata
 
 
 def dump(output_path: pathlib.Path) -> None:

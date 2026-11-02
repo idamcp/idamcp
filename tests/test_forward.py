@@ -22,12 +22,17 @@
 
 import asyncio
 import json
+import os
 import pathlib
+import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
 
+import fastmcp.exceptions
 from fastmcp.exceptions import ToolError
+import pydantic
 from gateway import forward
 from gateway.forward import _backend_events
 from gateway.forward import _background_tasks
@@ -45,6 +50,13 @@ from gateway.forward import idalib_headless_close
 from gateway.forward import lifespan
 from gateway.forward import list_available_databases
 from shared.rpc import RPCServer
+
+# FastMCP 4 wraps a rejected argument in its own ValidationError; FastMCP 3
+# lets pydantic's through.
+_VALIDATION_ERRORS = (
+    fastmcp.exceptions.ValidationError,
+    pydantic.ValidationError,
+)
 
 
 class TestHeadlessManager(unittest.IsolatedAsyncioTestCase):
@@ -907,20 +919,19 @@ class TestIntegerAddresses(unittest.IsolatedAsyncioTestCase):
   async def test_address_tools_reject_invalid_or_unsafe_integers(self):
     """Test booleans, floats, negative ints, and ints >= 2^53 are rejected."""
     # pylint: disable=g-import-not-at-top
-    from fastmcp.exceptions import ValidationError
     from shared.types import MAX_SAFE_JSON_INT
 
     # pylint: enable=g-import-not-at-top
     for bad in (True, False, 4198400.0, -1):
       with self.subTest(bad=bad):
-        with self.assertRaises(ValidationError):
+        with self.assertRaises(_VALIDATION_ERRORS):
           await self.mcp_server.call_tool(
               "decompile_function", {"database_id": "db1", "address": bad}
           )
 
     for unsafe_int in (MAX_SAFE_JSON_INT + 1, 0xFFFFFFFF81000001):
       with self.subTest(unsafe_int=unsafe_int):
-        with self.assertRaisesRegex(ValidationError, "0x1fffffffffffff"):
+        with self.assertRaisesRegex(_VALIDATION_ERRORS, "0x1fffffffffffff"):
           await self.mcp_server.call_tool(
               "decompile_function",
               {"database_id": "db1", "address": unsafe_int},
@@ -942,7 +953,6 @@ class TestIntegerAddresses(unittest.IsolatedAsyncioTestCase):
   async def test_range_and_base_address_parameters_accept_integers(self):
     """Test start_ea, end_ea, and base_address accept safe integers."""
     # pylint: disable=g-import-not-at-top
-    from fastmcp.exceptions import ValidationError
     from shared.load_options import LoadOptions
     from shared.types import MAX_SAFE_JSON_INT
 
@@ -1040,7 +1050,7 @@ class TestIntegerAddresses(unittest.IsolatedAsyncioTestCase):
           mock_spawn.await_args.args[1], LoadOptions(base_address=0x10000)
       )
 
-    with self.assertRaisesRegex(ValidationError, "0x1fffffffffffff"):
+    with self.assertRaisesRegex(_VALIDATION_ERRORS, "0x1fffffffffffff"):
       await self.mcp_server.call_tool(
           "idalib_headless_open",
           {"path": "/tmp/test.bin", "base_address": MAX_SAFE_JSON_INT + 1},
@@ -1049,7 +1059,6 @@ class TestIntegerAddresses(unittest.IsolatedAsyncioTestCase):
   async def test_batch_request_addresses_accept_integers(self):
     """Test list and dataclass request address fields accept safe integers."""
     # pylint: disable=g-import-not-at-top
-    from fastmcp.exceptions import ValidationError
     from shared.types import MAX_SAFE_JSON_INT
 
     # pylint: enable=g-import-not-at-top
@@ -1122,7 +1131,7 @@ class TestIntegerAddresses(unittest.IsolatedAsyncioTestCase):
       ctx_args = mock_patch_forward.await_args_list[0].args[2]
       self.assertEqual(ctx_args["reqs"][0].address, "0x401000")
 
-    with self.assertRaisesRegex(ValidationError, "0x1fffffffffffff"):
+    with self.assertRaisesRegex(_VALIDATION_ERRORS, "0x1fffffffffffff"):
       await self.mcp_server.call_tool(
           "rename_addresses",
           {
@@ -1132,3 +1141,194 @@ class TestIntegerAddresses(unittest.IsolatedAsyncioTestCase):
               ],
           },
       )
+
+
+class TestResponseSizeLimitMiddleware(unittest.IsolatedAsyncioTestCase):
+  """Unit tests for ResponseSizeLimitMiddleware on mcp_server."""
+
+  async def asyncSetUp(self):
+    self.mcp_server = forward.mcp_server
+    self.limit = forward.CONFIG["max_tool_response_bytes"]
+    self.assertEqual(self.limit, 8 * 1024 * 1024)
+    self.db_id = "test_mw_db"
+    self.mock_client = mock.AsyncMock()
+    _global_clients[self.db_id] = self.mock_client
+
+  async def asyncTearDown(self):
+    _global_clients.pop(self.db_id, None)
+
+  async def test_large_request_is_forwarded(self):
+    """Test that requests are not limited, however large."""
+    huge_code = "X" * (self.limit + 4096)
+    self.mock_client.call.return_value = {
+        "result": "", "result_type": "", "stdout": "", "stderr": ""
+    }
+    res = await self.mcp_server.call_tool(
+        "idapython_eval",
+        {"database_id": self.db_id, "code": huge_code},
+    )
+    self.assertFalse(res.is_error)
+    self.mock_client.call.assert_awaited_once()
+    call_kwargs = self.mock_client.call.await_args.kwargs
+    self.assertEqual(call_kwargs["method"], "idapython_eval")
+    self.assertEqual(call_kwargs["params"]["code"], huge_code)
+
+  async def test_oversized_string_response_rejected(self):
+    """Test that string responses above the limit are rejected."""
+    big_s = "A" * (self.limit + 4096)
+    self.mock_client.call.return_value = big_s
+
+    res = await self.mcp_server.call_tool(
+        "decompile_function",
+        {"database_id": self.db_id, "address": "0x1000"},
+    )
+    self.assertTrue(res.is_error)
+    self.assertIn("response payload size", res.content[0].text)
+
+  async def test_oversized_structured_dict_response_rejected(self):
+    """Test that dict responses above the limit are rejected."""
+    payload = {
+        "result": "R" * (self.limit // 2),
+        "result_type": "str",
+        "stdout": "O" * (self.limit // 2),
+        "stderr": "E" * (self.limit // 2),
+    }
+    self.mock_client.call.return_value = payload
+
+    res = await self.mcp_server.call_tool(
+        "idapython_eval",
+        {"database_id": self.db_id, "code": "pass"},
+    )
+    self.assertTrue(res.is_error)
+    self.assertIn("response payload size", res.content[0].text)
+
+  async def test_oversized_list_response_rejected(self):
+    """Test that list responses above the limit are rejected."""
+    # Each item serializes to about 40 characters.
+    count = self.limit // 20
+    payload = [{"address": hex(i * 4), "type": "call"} for i in range(count)]
+    self.mock_client.call.return_value = payload
+
+    res = await self.mcp_server.call_tool(
+        "get_xrefs_from",
+        {"database_id": self.db_id, "address": "0x1000"},
+    )
+    self.assertTrue(res.is_error)
+    self.assertIn("response payload size", res.content[0].text)
+
+  async def test_batched_sql_query_oversized_rejected(self):
+    """Test that a batched sql_query response above the limit is rejected."""
+    # Each row serializes to about 35 characters.
+    count = self.limit // 16
+    payload = [{"rows": [{"id": i, "name": f"func_{i}"} for i in range(count)]}]
+    self.mock_client.call.return_value = payload
+
+    res = await self.mcp_server.call_tool(
+        "sql_query",
+        {"database_id": self.db_id, "sql": "SELECT * FROM functions"},
+    )
+    self.assertTrue(res.is_error)
+    self.assertIn("response payload size", res.content[0].text)
+
+  async def test_idapython_eval_at_the_stdout_limit_passes_middleware(self):
+    """Test that idapython_eval with 1 MiB of stdout passes the middleware."""
+    payload = {
+        "result": "42",
+        "result_type": "int",
+        "stdout": "O" * (1024 * 1024),
+        "stderr": "",
+    }
+    self.mock_client.call.return_value = payload
+
+    res = await self.mcp_server.call_tool(
+        "idapython_eval",
+        {"database_id": self.db_id, "code": "print('big')"},
+    )
+    self.assertFalse(res.is_error)
+    self.assertEqual(res.structured_content["result"], "42")
+
+  async def test_all_outputs_at_their_limits_pass_middleware_when_escaped(
+      self,
+  ):
+    """Test that the largest allowed idapython_eval result fits once escaped."""
+    # Lines of quotes double in size when JSON-escaped; the backend allows up
+    # to 1 MiB in each of stdout, stderr, and result.
+    line = '"' * 79 + "\n"
+    at_limit = line * (1024 * 1024 // len(line))
+    payload = {
+        "result": at_limit,
+        "result_type": "str",
+        "stdout": at_limit,
+        "stderr": at_limit,
+    }
+    self.mock_client.call.return_value = payload
+
+    res = await self.mcp_server.call_tool(
+        "idapython_eval",
+        {"database_id": self.db_id, "code": "print('big')"},
+    )
+    self.assertFalse(res.is_error)
+    self.assertEqual(res.structured_content["stdout"], at_limit)
+
+  async def test_output_schema_intact_with_middleware(self):
+    """Test that tool output_schema is not modified or stripped."""
+    tool_dec = await self.mcp_server.get_tool("decompile_function")
+    self.assertIsNotNone(tool_dec.output_schema)
+    tool_eval = await self.mcp_server.get_tool("idapython_eval")
+    self.assertIsNotNone(tool_eval.output_schema)
+
+  async def test_limit_comes_from_max_tool_response_bytes(self):
+    """Test that the middleware is installed once with the configured limit."""
+    installed = [
+        m
+        for m in self.mcp_server.middleware
+        if isinstance(m, forward.ResponseSizeLimitMiddleware)
+    ]
+    self.assertEqual(len(installed), 1)
+    self.assertEqual(installed[0].limit, self.limit)
+
+    self.mock_client.call.return_value = "A" * 4096
+    with mock.patch.object(installed[0], "limit", 1024):
+      res = await self.mcp_server.call_tool(
+          "decompile_function",
+          {"database_id": self.db_id, "address": "0x1000"},
+      )
+    self.assertTrue(res.is_error)
+    self.assertIn(
+        "size (at least 4 KiB) exceeded the 1 KiB limit"
+        " (max_tool_response_bytes)",
+        res.content[0].text,
+    )
+
+  def test_zero_limit_installs_no_middleware(self):
+    """Test that max_tool_response_bytes 0 leaves the middleware out."""
+    # A fresh interpreter is required: the gateway installs the middleware
+    # when it is imported.
+    with tempfile.TemporaryDirectory() as tmp_dir:
+      config_path = pathlib.Path(tmp_dir) / "config.json"
+      config_path.write_text(
+          json.dumps({
+              "registry_dir": f"{tmp_dir}/registry",
+              "uds_dir": f"{tmp_dir}/uds",
+              "max_tool_response_bytes": 0,
+          })
+      )
+      code = (
+          "from gateway import forward\n"
+          "print([type(m).__name__ for m in forward.mcp_server.middleware])\n"
+      )
+      proc = subprocess.run(
+          [sys.executable, "-c", code],
+          env=dict(os.environ, IDAMCP_CONFIG=str(config_path)),
+          cwd=pathlib.Path(__file__).resolve().parent.parent,
+          capture_output=True,
+          text=True,
+          timeout=120,
+          check=False,
+      )
+    self.assertEqual(proc.returncode, 0, proc.stderr)
+    self.assertNotIn("ResponseSizeLimitMiddleware", proc.stdout)
+
+
+if __name__ == "__main__":
+  unittest.main()

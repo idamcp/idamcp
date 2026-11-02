@@ -265,7 +265,9 @@ example of all available settings (showing defaults):
     "idapython_eval"
   ],
   "show_decompiler_warnings": false,
-  "omitted_decompiler_warnings": ["WARN_GUESSED_TYPE", "WARN_UNDEF_LVAR"]
+  "omitted_decompiler_warnings": ["WARN_GUESSED_TYPE", "WARN_UNDEF_LVAR"],
+  "max_tool_response_bytes": "8m",
+  "max_eval_output_bytes": "1m"
 }
 ```
 
@@ -352,6 +354,22 @@ example of all available settings (showing defaults):
     type" notes come with most calls, and "possibly undefined" ones mostly
     flag call arguments that the pseudocode already shows as never set. `[]`
     shows all warnings.
+*   **max_tool_response_bytes**: The largest tool response that the gateway
+    passes on to the client; a larger one is replaced by an error that tells
+    the model to narrow the query, paginate, or write to a file. Clients keep
+    tool results in the model's context, so a huge result is useless there and
+    may break the client. Requests are not limited. A size is a number of
+    bytes (`8388608`) or a string with a unit: `k`, `m`, or `g`, also written
+    `kb`/`kib`, `mb`/`mib`, `gb`/`gib`, case-insensitive and in binary
+    multiples (`"8m"`, `"512 KiB"`, `"1.5mb"`). `0` means no limit. Defaults
+    to `"8m"`.
+*   **max_eval_output_bytes**: The limit on each of `stdout`, `stderr`, and
+    `result` of `idapython_eval`, as a size like above. Code that prints more
+    is stopped at the limit, and the call fails with an error that includes
+    the output so far, like a timeout does; a larger result fails the call
+    with the first part of the value. `0` means no limit. Keep it well below
+    `max_tool_response_bytes`: JSON escaping can double the size of
+    escape-heavy output. Defaults to `"1m"`.
 
 </details>
 
