@@ -850,7 +850,7 @@ class TestParameterAliases(unittest.IsolatedAsyncioTestCase):
             if getattr(m, "validation_alias", None) is not None
         ]
         self.assertEqual(aliases, [shared_types.ADDRESS_ALIASES])
-    self.assertEqual(checked, 38)
+    self.assertEqual(checked, 39)
 
   def test_shared_types_fallback_without_pydantic(self):
     """Test shared.types defines dummy Field/AliasChoices without pydantic."""
@@ -964,11 +964,11 @@ class TestIntegerAddresses(unittest.IsolatedAsyncioTestCase):
       mock_forward.return_value = "nop"
       await self.mcp_server.call_tool(
           "get_ida_view",
-          {"database_id": "db1", "start_ea": 0x401000, "end_ea": 0x401020},
+          {"database_id": "db1", "address": 0x401000, "count": 4},
       )
       _, _, args = mock_forward.await_args.args
-      self.assertEqual(args["start_ea"], "0x401000")
-      self.assertEqual(args["end_ea"], "0x401020")
+      self.assertEqual(args["address"], "0x401000")
+      self.assertEqual(args["count"], 4)
 
       mock_forward.return_value = {"nodes": [], "edges": []}
       await self.mcp_server.call_tool(

@@ -103,12 +103,20 @@ async def disassemble_code(
 @mcp_tool
 async def get_ida_view(
     database_id: DatabaseId,
-    start_ea: Annotated[
-        AddressValue, Field(description="Start address of the view")
+    address: Annotated[
+        Address,
+        Field(
+            description=(
+                "Address of the first item to show. An address inside an item"
+                " shows the whole item."
+            )
+        ),
     ],
-    end_ea: Annotated[
-        AddressValue, Field(description="End address of the view")
-    ],
+    count: Annotated[
+        int,
+        "Number of items to show, counting instructions, data definitions, and"
+        " unexplored bytes as the view lists them",
+    ] = 16,
     include_bytes: Annotated[
         bool, "Whether to include opcode or data bytes in the view output"
     ] = False,
@@ -119,7 +127,9 @@ async def get_ida_view(
   global variables, arrays, or applied C-structures. It accurately renders data
   directives (DCB/DCD/DCQ), strings, cross-references, and applied struct
   formatting (e.g., my_struct_t <1, 2>). It is also the preferred tool for
-  reading standard assembly code with inline comments.
+  reading standard assembly code with inline comments. The view starts at the
+  item containing address and shows count items; call again with the address
+  after the last item shown to continue.
   """
   return await forward_to(database_id, "get_ida_view", locals())
 

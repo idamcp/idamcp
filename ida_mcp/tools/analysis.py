@@ -346,15 +346,44 @@ def _get_ida_view(start_ea: "idaapi.ea_t", end_ea: "idaapi.ea_t") -> str:
   return "\n".join(lines)
 
 
+# Most items a get_ida_view call shows. Each is at least one line of output.
+_MAX_VIEW_ITEMS = 0x1000
+
+
+def _item_range(ea: "idaapi.ea_t", count: int) -> tuple[int, int]:
+  """Returns the address range of `count` items, from the item containing ea.
+
+  An item is what the IDA view lists on its own: an instruction, a data
+  definition, an alignment directive, or one unexplored byte. The range ends
+  at the end of the database if there are fewer items.
+  """
+  start = ida_bytes.get_item_head(ea)
+  end = start
+  max_ea = idaapi.inf_get_max_ea()
+  for _ in range(count):
+    if end >= max_ea:
+      break
+    end += max(1, ida_bytes.get_item_size(end))
+  return start, min(end, max_ea)
+
+
 @jsonrpc
 @idaread
 def get_ida_view(
-    start_ea: Annotated[
-        AddressValue, Field(description="Start address of the view")
+    address: Annotated[
+        Address,
+        Field(
+            description=(
+                "Address of the first item to show. An address inside an item"
+                " shows the whole item."
+            )
+        ),
     ],
-    end_ea: Annotated[
-        AddressValue, Field(description="End address of the view")
-    ],
+    count: Annotated[
+        int,
+        "Number of items to show, counting instructions, data definitions, and"
+        " unexplored bytes as the view lists them",
+    ] = 16,
     include_bytes: Annotated[
         bool, "Whether to include opcode or data bytes in the view output"
     ] = False,
@@ -365,30 +394,21 @@ def get_ida_view(
   global variables, arrays, or applied C-structures. It accurately renders data
   directives (DCB/DCD/DCQ), strings, cross-references, and applied struct
   formatting (e.g., my_struct_t <1, 2>). It is also the preferred tool for
-  reading standard assembly code with inline comments.
+  reading standard assembly code with inline comments. The view starts at the
+  item containing address and shows count items; call again with the address
+  after the last item shown to continue.
   """
-  start_addr = max(helper.parse_int(start_ea), idaapi.inf_get_min_ea())
-  end_addr = min(helper.parse_int(end_ea), idaapi.inf_get_max_ea())
-
-  if start_addr > end_addr:
+  if count <= 0:
+    raise ToolError(f"Invalid count {count}: expected > 0")
+  if count > _MAX_VIEW_ITEMS:
     raise ToolError(
-        f"range [{start_ea}, {end_ea}) is invalid, the start_ea is supposed to"
-        " be less than the end_ea"
+        f"Invalid count {count}: at most {_MAX_VIEW_ITEMS:#x} items per call"
     )
 
-  max_view_limit = 0x10000
-  if end_addr - start_addr > max_view_limit:
-    raise ToolError(
-        "Requested disassembly range is too large (maximum allowed size is"
-        f" {max_view_limit:#x} bytes)."
-    )
-
-  if start_addr == end_addr:
-    # We accept this edge case
-    end_addr += 1
-
+  ea = helper.parse_and_check_ea(address)
+  start_ea, end_ea = _item_range(ea, count)
   with helper.set_showing_opcode_internal(include_bytes):
-    return _get_ida_view(start_addr, end_addr)
+    return _get_ida_view(start_ea, end_ea)
 
 
 def _get_func_block_ranges(

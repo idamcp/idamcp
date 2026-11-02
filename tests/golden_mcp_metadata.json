@@ -2141,32 +2141,32 @@
           "tags": []
         }
       },
-      "description": "Retrieves the formatted text view directly from IDA Pro's 'IDA View-A'.\n\nCRITICAL: Use this tool (NOT disassemble_code) when inspecting data segments,\nglobal variables, arrays, or applied C-structures. It accurately renders data\ndirectives (DCB/DCD/DCQ), strings, cross-references, and applied struct\nformatting (e.g., my_struct_t <1, 2>). It is also the preferred tool for\nreading standard assembly code with inline comments.",
+      "description": "Retrieves the formatted text view directly from IDA Pro's 'IDA View-A'.\n\nCRITICAL: Use this tool (NOT disassemble_code) when inspecting data segments,\nglobal variables, arrays, or applied C-structures. It accurately renders data\ndirectives (DCB/DCD/DCQ), strings, cross-references, and applied struct\nformatting (e.g., my_struct_t <1, 2>). It is also the preferred tool for\nreading standard assembly code with inline comments. The view starts at the\nitem containing address and shows count items; call again with the address\nafter the last item shown to continue.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
-          "database_id": {
-            "description": "The unique identifier for the target IDA database. You can obtain this ID by calling list_available_databases, reading the ida://databases resource, or by opening a new database via idalib_headless_open.",
+          "address": {
+            "description": "Address of the first item to show. An address inside an item shows the whole item.",
             "type": "string"
           },
-          "end_ea": {
-            "description": "End address of the view",
+          "count": {
+            "default": 16,
+            "description": "Number of items to show, counting instructions, data definitions, and unexplored bytes as the view lists them",
+            "type": "integer"
+          },
+          "database_id": {
+            "description": "The unique identifier for the target IDA database. You can obtain this ID by calling list_available_databases, reading the ida://databases resource, or by opening a new database via idalib_headless_open.",
             "type": "string"
           },
           "include_bytes": {
             "default": false,
             "description": "Whether to include opcode or data bytes in the view output",
             "type": "boolean"
-          },
-          "start_ea": {
-            "description": "Start address of the view",
-            "type": "string"
           }
         },
         "required": [
           "database_id",
-          "start_ea",
-          "end_ea"
+          "address"
         ],
         "type": "object"
       },

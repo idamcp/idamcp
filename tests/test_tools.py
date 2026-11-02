@@ -1325,14 +1325,14 @@ for ea in (0x10d0, 0x10a0):
 
     # Explicit include_bytes=True matches golden
     result_with_bytes = await self.run_tool(
-        "get_ida_view", start_ea="0x11e0", end_ea="0x120e", include_bytes=True
+        "get_ida_view", address="0x11e0", count=11, include_bytes=True
     )
     self.assertIsInstance(result_with_bytes, str)
     self.assertEqual(normalize_text(result_with_bytes), normalize_text(golden))
 
     # Default include_bytes is False
     result = await self.run_tool(
-        "get_ida_view", start_ea="0x11e0", end_ea="0x120e"
+        "get_ida_view", address="0x11e0", count=11
     )
     self.assertIsInstance(result, str)
     self.assertIn("push    rbp", result)
@@ -1340,13 +1340,13 @@ for ea in (0x10d0, 0x10a0):
 
     # Explicit include_bytes=False matches default
     result_no_bytes = await self.run_tool(
-        "get_ida_view", start_ea="0x11e0", end_ea="0x120e", include_bytes=False
+        "get_ida_view", address="0x11e0", count=11, include_bytes=False
     )
     self.assertEqual(normalize_text(result_no_bytes), normalize_text(result))
 
     # Verify opcode/bytes setting is restored after include_bytes=False
     restored = await self.run_tool(
-        "get_ida_view", start_ea="0x11e0", end_ea="0x120e", include_bytes=True
+        "get_ida_view", address="0x11e0", count=11, include_bytes=True
     )
     self.assertEqual(normalize_text(restored), normalize_text(golden))
 
@@ -1596,7 +1596,7 @@ for ea in (0x10d0, 0x10a0):
 
       # 5. Verify it is undefined (should show 'db' instead of 'push rbp' in ida view)
       view_undef = await self.run_tool(
-          "get_ida_view", start_ea="0x1240", end_ea="0x1241"
+          "get_ida_view", address="0x1240", count=1
       )
       self.assertIsInstance(view_undef, str)
       self.assertIn("db", view_undef.lower())
@@ -1609,7 +1609,7 @@ for ea in (0x10d0, 0x10a0):
 
       # 7. Verify instruction re-created (should show 'push rbp' again)
       view_code = await self.run_tool(
-          "get_ida_view", start_ea="0x1240", end_ea="0x1241"
+          "get_ida_view", address="0x1240", count=1
       )
       self.assertIsInstance(view_code, str)
       self.assertIn("push", view_code.lower())
@@ -1659,7 +1659,7 @@ for ea in (0x10d0, 0x10a0):
 
     # 3. Verify it is rendered as string "Hello"
     view = await self.run_tool(
-        "get_ida_view", start_ea="0x40e0", end_ea="0x40e6"
+        "get_ida_view", address="0x40e0", count=1
     )
     self.assertIn("hello", view.lower())
 
@@ -1679,7 +1679,7 @@ for ea in (0x10d0, 0x10a0):
 
     # 7. Verify it shows 'dd 4058h' or 'dd 4058'
     view = await self.run_tool(
-        "get_ida_view", start_ea="0x40e0", end_ea="0x40e4"
+        "get_ida_view", address="0x40e0", count=1
     )
     self.assertIn("4058", view)
     self.assertNotIn("offset", view.lower())
@@ -1691,7 +1691,7 @@ for ea in (0x10d0, 0x10a0):
 
     # 9. Verify it shows 'dd offset global_int'
     view = await self.run_tool(
-        "get_ida_view", start_ea="0x40e0", end_ea="0x40e4"
+        "get_ida_view", address="0x40e0", count=1
     )
     self.assertIn("offset global_int", view.lower())
 
@@ -1710,7 +1710,7 @@ for ea in (0x10d0, 0x10a0):
 
     # 13. Verify it shows 'db 4 dup(...)' or 'db 4' array representation
     view = await self.run_tool(
-        "get_ida_view", start_ea="0x40e0", end_ea="0x40e4"
+        "get_ida_view", address="0x40e0", count=1
     )
     self.assertTrue("db" in view and "4" in view)
 
@@ -1726,7 +1726,7 @@ for ea in (0x10d0, 0x10a0):
 
     # 16. Verify it shows 'TestStruct' structure rendering
     view = await self.run_tool(
-        "get_ida_view", start_ea="0x40e0", end_ea="0x40f0"
+        "get_ida_view", address="0x40e0", count=1
     )
     self.assertIn("teststruct", view.lower())
 
@@ -1749,7 +1749,7 @@ for ea in (0x10d0, 0x10a0):
 
     # 19. Verify it is rendered as 'VAL_42' in ida view
     view = await self.run_tool(
-        "get_ida_view", start_ea="0x13ab", end_ea="0x13af"
+        "get_ida_view", address="0x13ab", count=1
     )
     self.assertIn("val_42", view.lower())
     self.assertNotIn("2ah", view.lower())
