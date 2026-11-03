@@ -215,7 +215,7 @@ class TestPluginLifecycle(unittest.TestCase):
     self.assertIsNone(query._worker_thread)
     self.assertIsNone(query._db_hooks)
     self.assertIsNone(query._db_idp_hooks)
-    self.assertEqual(len(query._created_tables), 0)
+    self.assertEqual(len(query._populated_tables), 0)
     self.assertEqual(len(query._db_local.connections), 0)
     self.assertFalse(_is_connection_open(rw_conn))
 

@@ -215,9 +215,17 @@ queries before execution:
 
 ### 3.3 Live Synchronization & Rebase Lifecycle
 
-Tables are lazily populated on first query or eagerly populated on startup when
-`populate_tables_on_startup` is enabled. The server registers IDA `IDB_Hooks`
-and `IDP_Hooks` to keep relational tables synchronized in real-time:
+Empty table, view, and index schemas are initialized upfront, while table rows
+are lazily populated on first query or eagerly populated on startup when
+`populate_tables_on_startup` is enabled. Lazy population piggybacks on SQLite's
+compile-time authorizer: while a query is compiled, every table it touches
+surfaces as a `SQLITE_READ` callback, and a read of a table that is not yet
+populated is denied, which fails the compile before any row is read. The
+statement is then compiled once more as `EXPLAIN`, which runs nothing but
+rejects a query that would not compile anyway, before the table is populated
+and the query is compiled again. A query whose tables are already populated
+therefore runs exactly once. The server registers IDA `IDB_Hooks` and
+`IDP_Hooks` to keep relational tables synchronized in real-time:
 
 *   **Live IDB Events**: Real-time hooks capture renaming of symbols and
     functions, addition/deletion/updating of functions and segments, and
@@ -246,9 +254,10 @@ and `IDP_Hooks` to keep relational tables synchronized in real-time:
     rebase auto-analysis completes (`ida_auto.auto_is_ok()`), updates the stored
     `image_min_ea` in `_db_metadata`, and triggers table repopulation.
 *   **Schema Versioning & Migration**: The database tracks `PRAGMA
-    user_version = 7` and records `image_min_ea` in `_db_metadata`. On startup,
-    `_check_and_migrate_db` automatically drops and re-initializes tables if a
-    schema version mismatch or image base shift across sessions is detected.
+    user_version = 8` and records `image_min_ea` and `populated_tables` in
+    `_db_metadata`. On startup, `_check_and_migrate_db` automatically drops and
+    re-initializes empty schemas if a schema version mismatch or image base
+    shift across sessions is detected.
 
 ### 3.4 Main-Thread Independence & Concurrency
 

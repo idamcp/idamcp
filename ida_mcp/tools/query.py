@@ -25,15 +25,17 @@ import asyncio
 import contextlib
 import dataclasses
 import functools
+import json
 import logging
 import pathlib
 import queue
+import re
 import signal
 import sqlite3
 import threading
 import time
 import traceback
-from typing import Any, Iterable, Iterator, Tuple
+from typing import Any, Callable, Iterable, Iterator, Tuple
 import weakref
 import ida_auto
 import ida_bytes
@@ -59,7 +61,141 @@ from shared.types import QueryResult
 _image_min_ea = 0
 _is_rebasing = False
 _db_version_checked = False
-_created_tables: set[str] = set()
+_populated_tables: set[str] = set()
+
+TARGET_DB_VERSION = 8
+
+TABLE_SCHEMAS: dict[str, str] = {
+    "functions": (
+        "start_ea INTEGER PRIMARY KEY, end_ea INTEGER, name TEXT,"
+        " demangled_name TEXT, prototype TEXT, size INTEGER, is_lib INTEGER"
+    ),
+    "__internal_strings": (
+        "start_ea INTEGER, end_ea INTEGER, length INTEGER, string TEXT"
+    ),
+    "names": "address INTEGER PRIMARY KEY, name TEXT",
+    "imports": "address INTEGER, name TEXT, module TEXT",
+    "segments": (
+        "name TEXT, class TEXT, start_ea INTEGER, end_ea INTEGER, size"
+        " INTEGER, permissions TEXT"
+    ),
+    "local_types": "ordinal INTEGER PRIMARY KEY, name TEXT, declaration TEXT",
+    "xrefs": (
+        "from_ea INTEGER, to_ea INTEGER, type TEXT, from_function_ea"
+        " INTEGER, UNIQUE(from_ea, to_ea, type)"
+    ),
+    "entries": "index_id INTEGER, ordinal INTEGER, address INTEGER, name TEXT",
+}
+
+STRINGS_VIEW_DDL = (
+    "CREATE VIEW IF NOT EXISTS strings AS SELECT start_ea AS address,"
+    " length, string FROM __internal_strings"
+)
+
+TABLE_INDEXES: dict[str, tuple[str, ...]] = {
+    "functions": (
+        "CREATE INDEX IF NOT EXISTS idx_functions_end ON functions (end_ea)",
+        (
+            "CREATE INDEX IF NOT EXISTS idx_functions_name ON functions"
+            " (name, start_ea, size)"
+        ),
+        "CREATE INDEX IF NOT EXISTS idx_functions_is_lib ON functions (is_lib)",
+    ),
+    "__internal_strings": (
+        (
+            "CREATE INDEX IF NOT EXISTS idx_strings_range ON"
+            " __internal_strings (start_ea, end_ea, length)"
+        ),
+    ),
+    "names": (
+        "CREATE INDEX IF NOT EXISTS idx_names_name ON names (name, address)",
+    ),
+    "imports": (
+        "CREATE INDEX IF NOT EXISTS idx_imports_address ON imports (address)",
+        (
+            "CREATE INDEX IF NOT EXISTS idx_imports_name ON imports (name,"
+            " module, address)"
+        ),
+    ),
+    "segments": (
+        (
+            "CREATE INDEX IF NOT EXISTS idx_segments_start ON segments"
+            " (start_ea, end_ea)"
+        ),
+    ),
+    "local_types": (
+        (
+            "CREATE INDEX IF NOT EXISTS idx_local_types_name ON local_types"
+            " (name, ordinal)"
+        ),
+    ),
+    "xrefs": (
+        "CREATE INDEX IF NOT EXISTS idx_xrefs_from ON xrefs (from_ea)",
+        "CREATE INDEX IF NOT EXISTS idx_xrefs_to ON xrefs (to_ea)",
+        (
+            "CREATE INDEX IF NOT EXISTS idx_xrefs_from_func ON xrefs"
+            " (from_function_ea)"
+        ),
+        (
+            "CREATE INDEX IF NOT EXISTS idx_xrefs_from_func_cov ON xrefs"
+            " (from_function_ea, to_ea, type)"
+        ),
+        (
+            "CREATE INDEX IF NOT EXISTS idx_xrefs_to_cov ON xrefs (to_ea,"
+            " from_ea, type, from_function_ea)"
+        ),
+    ),
+    "entries": (
+        "CREATE INDEX IF NOT EXISTS idx_entries_address ON entries (address)",
+        "CREATE INDEX IF NOT EXISTS idx_entries_name ON entries (name)",
+        "CREATE INDEX IF NOT EXISTS idx_entries_ordinal ON entries (ordinal)",
+    ),
+}
+
+POPULATOR_ALIASES: dict[str, str] = {
+    "functions": "functions",
+    "strings": "strings",
+    "__internal_strings": "strings",
+    "names": "names",
+    "imports": "imports",
+    "segments": "segments",
+    "local_types": "local_types",
+    "xrefs": "xrefs",
+    "entries": "entries",
+}
+
+# Schema introspection pragmas whose argument is a table or index name.
+_INTROSPECTION_PRAGMAS = frozenset({
+    "foreign_key_list",
+    "index_info",
+    "index_list",
+    "index_xinfo",
+    "table_info",
+    "table_list",
+    "table_xinfo",
+})
+
+# Pragmas allowed only in their argument-less getter form. The setter form
+# (`PRAGMA x = v`) is denied: FLAG pragmas such as foreign_keys take effect at
+# prepare time and would change the state of the long-lived RO connection.
+_GETTER_PRAGMAS = frozenset({
+    "compile_options",
+    "data_version",
+    "database_list",
+    "foreign_keys",
+    "function_list",
+    "module_list",
+    "pragma_list",
+    "user_version",
+})
+
+_DENIED_RO_FUNCTIONS = frozenset({
+    "edit",
+    "fts3_tokenizer",
+    "load_extension",
+    "readfile",
+    "writefile",
+})
 
 
 @contextlib.contextmanager
@@ -174,20 +310,26 @@ def _is_tid(n: int) -> bool:
 
 
 def _ro_authorizer(action, arg1, arg2, dbname, source):
-  """Intercepts and denies any write operations for the RO connection."""
-  del arg1, arg2, dbname, source  # Unused
-  # Allowed operations for read-only query
-  allowed = {
-      sqlite3.SQLITE_SELECT,
-      sqlite3.SQLITE_READ,
-      sqlite3.SQLITE_FUNCTION,
-      sqlite3.SQLITE_PRAGMA,
-  }
-  if hasattr(sqlite3, "SQLITE_RECURSIVE"):
-    allowed.add(sqlite3.SQLITE_RECURSIVE)
-  if action in allowed:
+  """Intercepts and denies write or unsafe operations for the RO connection."""
+  del source  # Unused
+  if action in (sqlite3.SQLITE_SELECT, sqlite3.SQLITE_RECURSIVE):
     return sqlite3.SQLITE_OK
-  # Deny everything else (INSERT, UPDATE, DROP, etc.)
+  if action == sqlite3.SQLITE_READ:
+    if dbname not in (None, "main", "temp"):
+      return sqlite3.SQLITE_DENY
+    return sqlite3.SQLITE_OK
+  if action == sqlite3.SQLITE_FUNCTION:
+    if arg2 and arg2.lower() in _DENIED_RO_FUNCTIONS:
+      return sqlite3.SQLITE_DENY
+    return sqlite3.SQLITE_OK
+  if action == sqlite3.SQLITE_PRAGMA:
+    pragma_name = arg1.lower() if arg1 else ""
+    if pragma_name in _INTROSPECTION_PRAGMAS:
+      return sqlite3.SQLITE_OK
+    if pragma_name in _GETTER_PRAGMAS and arg2 is None:
+      return sqlite3.SQLITE_OK
+    return sqlite3.SQLITE_DENY
+  # Deny everything else (INSERT, UPDATE, DROP, ATTACH, etc.)
   return sqlite3.SQLITE_DENY
 
 
@@ -228,6 +370,21 @@ def _ea_range_clause(
   return f"{col} >= ? AND {col} < ?", (signed_start, signed_end)
 
 
+def _run_ro_with_lock_retry(fn):
+  """Runs a SQLite operation, retrying once under _db_write_lock if locked.
+
+  Shared-cache readers get "database table/schema is locked" while the RW
+  connection holds a write transaction; retrying under the lock waits for it.
+  """
+  try:
+    return fn()
+  except sqlite3.OperationalError as e:
+    if "locked" not in str(e).lower():
+      raise
+    with _db_write_lock:
+      return fn()
+
+
 def _create_connection(read_only: bool = False):
   """Creates a SQLite connection."""
   path, is_uri = _get_db_path_and_uri()
@@ -241,25 +398,37 @@ def _create_connection(read_only: bool = False):
   conn = sqlite3.connect(
       path, uri=is_uri, isolation_level=None, check_same_thread=False
   )
+  try:
 
-  # Performance pragmas
-  conn.execute("PRAGMA cache_size = -65536")  # 64MB page cache
-  if not is_uri:
-    conn.execute("PRAGMA journal_mode = WAL")  # Non-blocking concurrent I/O
-    conn.execute("PRAGMA synchronous = NORMAL")  # Fast, crash-safe sync in WAL
-    conn.execute("PRAGMA mmap_size = 4294967296")  # 4GB memory-mapped I/O
+    def _configure_pragmas() -> None:
+      # Performance pragmas
+      conn.execute("PRAGMA cache_size = -65536")  # 64MB page cache
+      if not is_uri:
+        conn.execute("PRAGMA journal_mode = WAL")  # Non-blocking concurrent I/O
+        conn.execute(
+            "PRAGMA synchronous = NORMAL"
+        )  # Fast, crash-safe sync in WAL
+        conn.execute("PRAGMA mmap_size = 4294967296")  # 4GB memory-mapped I/O
 
-  if read_only:
-    conn.set_authorizer(_ro_authorizer)
+    _run_ro_with_lock_retry(_configure_pragmas)
+    if read_only:
+      conn.set_authorizer(_ro_authorizer)
+  except BaseException:
+    conn.close()
+    raise
 
   return conn
 
 
-def _set_stored_min_ea(conn: sqlite3.Connection, min_ea: int) -> None:
+def _ensure_metadata_table(conn: sqlite3.Connection) -> None:
   conn.execute(
       "CREATE TABLE IF NOT EXISTS _db_metadata (key TEXT PRIMARY KEY, value"
       " TEXT)"
   )
+
+
+def _set_stored_min_ea(conn: sqlite3.Connection, min_ea: int) -> None:
+  _ensure_metadata_table(conn)
   conn.execute(
       "INSERT OR REPLACE INTO _db_metadata (key, value) VALUES"
       " ('image_min_ea', ?)",
@@ -278,12 +447,63 @@ def _get_stored_min_ea(conn: sqlite3.Connection) -> int | None:
   return None
 
 
+def _save_populated_tables(
+    conn: sqlite3.Connection, tables: Iterable[str]
+) -> None:
+  _ensure_metadata_table(conn)
+  conn.execute(
+      "INSERT OR REPLACE INTO _db_metadata (key, value) VALUES"
+      " ('populated_tables', ?)",
+      (json.dumps(sorted({t.lower() for t in tables})),),
+  )
+
+
+def _load_populated_tables(conn: sqlite3.Connection) -> set[str]:
+  with contextlib.suppress(sqlite3.OperationalError, json.JSONDecodeError):
+    cursor = conn.execute(
+        "SELECT value FROM _db_metadata WHERE key = 'populated_tables'"
+    )
+    row = cursor.fetchone()
+    if row and row[0]:
+      parsed = json.loads(row[0])
+      if isinstance(parsed, list):
+        return {str(t).lower() for t in parsed}
+  return set()
+
+
+def _existing_canonical_names(conn: sqlite3.Connection) -> set[str]:
+  """Returns canonical table and view names whose schemas currently exist."""
+  existing = {
+      (row[0].lower(), row[1].lower())
+      for row in conn.execute(
+          "SELECT type, name FROM sqlite_master WHERE type IN ('table', 'view')"
+      ).fetchall()
+  }
+  valid = {name for name in TABLE_SCHEMAS if ("table", name) in existing}
+  if "__internal_strings" in valid and ("view", "strings") in existing:
+    valid.add("strings")
+  else:
+    valid.discard("__internal_strings")
+  return valid
+
+
+def _ensure_empty_schemas(conn: sqlite3.Connection) -> None:
+  """Ensures all canonical tables, views, and indexes exist in SQLite."""
+  _ensure_metadata_table(conn)
+  for table_name, schema in TABLE_SCHEMAS.items():
+    conn.execute(f'CREATE TABLE IF NOT EXISTS "{table_name}" ({schema})')
+    for index_ddl in TABLE_INDEXES.get(table_name, ()):
+      conn.execute(index_ddl)
+  conn.execute(STRINGS_VIEW_DDL)
+
+
 def _check_and_migrate_db(conn: sqlite3.Connection) -> None:
   """Checks user_version and image_min_ea; migrates (recreates) DB if outdated.
 
-  Version 7.0 (represented as integer 7) anchors the table schema.
-  If target_version is older than 7 or if the recorded image_min_ea has changed,
-  all tables are dropped and re-created from scratch.
+  Version 8.0 (represented as integer 8) anchors the upfront table schemas and
+  persisted `populated_tables` metadata. If current_version is older than 8 or
+  if the recorded image_min_ea has changed, all tables are dropped and empty
+  schemas are re-created from scratch.
 
   Args:
     conn: SQLite connection to inspect and migrate.
@@ -293,7 +513,7 @@ def _check_and_migrate_db(conn: sqlite3.Connection) -> None:
     row = cursor.fetchone()
     current_version = row[0] if row else 0
 
-    target_version = 7
+    target_version = TARGET_DB_VERSION
     stored_min_ea = _get_stored_min_ea(conn)
 
     needs_migration = (
@@ -324,8 +544,10 @@ def _check_and_migrate_db(conn: sqlite3.Connection) -> None:
 
         conn.execute(f"PRAGMA user_version = {target_version}")
         _set_stored_min_ea(conn, _image_min_ea)
+        _save_populated_tables(conn, ())
+        _ensure_empty_schemas(conn)
         conn.execute("COMMIT")
-        _created_tables.clear()
+        _populated_tables.clear()
         logging.info(
             "Database re-created, version set to %d, image_min_ea recorded as"
             " %s.",
@@ -337,12 +559,16 @@ def _check_and_migrate_db(conn: sqlite3.Connection) -> None:
         logging.exception("Failed to migrate database")
         raise
     else:
-      tables = conn.execute(
-          "SELECT name FROM sqlite_master WHERE type IN ('table', 'view')"
-      ).fetchall()
-      _created_tables.update(
-          t[0].lower() for t in tables if t[0].lower() != "_db_metadata"
-      )
+      existing = _existing_canonical_names(conn)
+      loaded = _load_populated_tables(conn)
+      valid = loaded & existing
+      if "strings" in valid or "__internal_strings" in valid:
+        valid.update(("strings", "__internal_strings"))
+      _ensure_empty_schemas(conn)
+      if valid != loaded:
+        _save_populated_tables(conn, valid)
+      _populated_tables.intersection_update(valid)
+      _populated_tables.update(valid)
 
 
 def _get_rw_conn():
@@ -351,8 +577,10 @@ def _get_rw_conn():
   if not hasattr(_db_local, "rw_conn"):
     _db_local.rw_conn = _create_connection(read_only=False)
   if not _db_version_checked:
-    _check_and_migrate_db(_db_local.rw_conn)
-    _db_version_checked = True
+    with _db_write_lock:
+      if not _db_version_checked:
+        _check_and_migrate_db(_db_local.rw_conn)
+        _db_version_checked = True
   return _db_local.rw_conn
 
 
@@ -392,8 +620,11 @@ def _recreate_and_insert(
     data: Iterable[tuple[Any, ...]],
     column_count: int,
     batch_size: int = 1000,
+    indexes: Iterable[str] = (),
+    drop_views: Iterable[str] = (),
+    create_views: Iterable[tuple[str, str]] = (),
 ):
-  """Recreates a table and inserts data using the RW connection."""
+  """Recreates a table and inserts data atomically using the RW connection."""
   with _db_write_lock:
     conn = _get_rw_conn()
     tmp_table = f"{table_name}_tmp"
@@ -401,12 +632,12 @@ def _recreate_and_insert(
     with interruptible_sqlite(conn):
       conn.execute("BEGIN TRANSACTION")
       try:
-        conn.execute(f"DROP TABLE IF EXISTS {tmp_table}")
-        conn.execute(f"CREATE TABLE {tmp_table} ({schema})")
+        conn.execute(f'DROP TABLE IF EXISTS "{tmp_table}"')
+        conn.execute(f'CREATE TABLE "{tmp_table}" ({schema})')
 
         batch = []
         placeholders = ", ".join(["?"] * column_count)
-        sql_insert = f"INSERT INTO {tmp_table} VALUES ({placeholders})"
+        sql_insert = f'INSERT INTO "{tmp_table}" VALUES ({placeholders})'
 
         for item in data:
           batch.append(item)
@@ -417,10 +648,22 @@ def _recreate_and_insert(
         if batch:
           conn.executemany(sql_insert, batch)
 
-        conn.execute(f"DROP TABLE IF EXISTS {table_name}")
-        conn.execute(f"ALTER TABLE {tmp_table} RENAME TO {table_name}")
+        for view_name in drop_views:
+          conn.execute(f'DROP VIEW IF EXISTS "{view_name}"')
+        conn.execute(f'DROP TABLE IF EXISTS "{table_name}"')
+        conn.execute(f'ALTER TABLE "{tmp_table}" RENAME TO "{table_name}"')
+        for index_ddl in indexes:
+          conn.execute(index_ddl)
+        for _, view_ddl in create_views:
+          conn.execute(view_ddl)
+
+        marked = {
+            table_name.lower(),
+            *(name.lower() for name, _ in create_views),
+        }
+        _save_populated_tables(conn, _populated_tables | marked)
         conn.execute("COMMIT")
-        _created_tables.add(table_name.lower())
+        _populated_tables.update(marked)
       except (Exception, asyncio.CancelledError):
         conn.execute("ROLLBACK")
         raise
@@ -435,11 +678,11 @@ def _recreate_and_insert(
             conn.execute("ROLLBACK")
 
 
-def _table_exists(table_name: str) -> bool:
-  """Checks if a table exists in the database."""
+def _is_table_populated(table_name: str) -> bool:
+  """Checks if a table has been populated with IDA data."""
   if not _db_version_checked:
     _get_rw_conn()
-  return table_name.lower() in _created_tables
+  return table_name.lower() in _populated_tables
 
 
 @dataclasses.dataclass
@@ -537,23 +780,11 @@ def populate_functions():
 
   _recreate_and_insert(
       "functions",
-      "start_ea INTEGER PRIMARY KEY, end_ea INTEGER, name TEXT, demangled_name"
-      " TEXT, prototype TEXT, size INTEGER, is_lib INTEGER",
+      TABLE_SCHEMAS["functions"],
       _gen(),
       column_count=7,
+      indexes=TABLE_INDEXES["functions"],
   )
-  with _db_write_lock:
-    conn = _get_rw_conn()
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_functions_end ON functions (end_ea)"
-    )
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_functions_name ON functions (name,"
-        " start_ea, size)"
-    )
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_functions_is_lib ON functions (is_lib)"
-    )
 
 
 @_time_populator
@@ -575,28 +806,15 @@ def populate_strings():
           str(item),
       )
 
-  with _db_write_lock:
-    conn = _get_rw_conn()
-    conn.execute("DROP VIEW IF EXISTS strings")
-
   _recreate_and_insert(
       "__internal_strings",
-      "start_ea INTEGER, end_ea INTEGER, length INTEGER, string TEXT",
+      TABLE_SCHEMAS["__internal_strings"],
       _gen(),
       column_count=4,
+      indexes=TABLE_INDEXES["__internal_strings"],
+      drop_views=("strings",),
+      create_views=(("strings", STRINGS_VIEW_DDL),),
   )
-  with _db_write_lock:
-    conn = _get_rw_conn()
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_strings_range ON __internal_strings"
-        " (start_ea, end_ea, length)"
-    )
-    conn.execute("DROP VIEW IF EXISTS strings")
-    conn.execute(
-        "CREATE VIEW IF NOT EXISTS strings AS SELECT start_ea AS address,"
-        " length, string FROM __internal_strings"
-    )
-    _created_tables.add("strings")
   _strings_dirty = False
 
 
@@ -611,13 +829,12 @@ def populate_names():
         yield (_to_signed_64(addr), name)
 
   _recreate_and_insert(
-      "names", "address INTEGER PRIMARY KEY, name TEXT", _gen(), column_count=2
+      "names",
+      TABLE_SCHEMAS["names"],
+      _gen(),
+      column_count=2,
+      indexes=TABLE_INDEXES["names"],
   )
-  with _db_write_lock:
-    conn = _get_rw_conn()
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_names_name ON names (name, address)"
-    )
 
 
 @_time_populator
@@ -648,19 +865,11 @@ def populate_imports():
 
   _recreate_and_insert(
       "imports",
-      "address INTEGER, name TEXT, module TEXT",
+      TABLE_SCHEMAS["imports"],
       _gen(),
       column_count=3,
+      indexes=TABLE_INDEXES["imports"],
   )
-  with _db_write_lock:
-    conn = _get_rw_conn()
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_imports_address ON imports (address)"
-    )
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_imports_name ON imports (name, module,"
-        " address)"
-    )
 
 
 def _get_segments_info_inner():
@@ -685,17 +894,11 @@ def populate_segments():
   data = _get_segments_info_inner()
   _recreate_and_insert(
       "segments",
-      "name TEXT, class TEXT, start_ea INTEGER, end_ea INTEGER, size"
-      " INTEGER, permissions TEXT",
+      TABLE_SCHEMAS["segments"],
       data,
       column_count=6,
+      indexes=TABLE_INDEXES["segments"],
   )
-  with _db_write_lock:
-    conn = _get_rw_conn()
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_segments_start ON segments (start_ea,"
-        " end_ea)"
-    )
 
 
 @dataclasses.dataclass
@@ -755,16 +958,11 @@ def populate_local_types():
   _local_types_dirty = False
   _recreate_and_insert(
       "local_types",
-      "ordinal INTEGER PRIMARY KEY, name TEXT, declaration TEXT",
+      TABLE_SCHEMAS["local_types"],
       _iter_local_types_info(),
       column_count=3,
+      indexes=TABLE_INDEXES["local_types"],
   )
-  with _db_write_lock:
-    conn = _get_rw_conn()
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_local_types_name ON local_types (name,"
-        " ordinal)"
-    )
 
 
 @_time_populator
@@ -856,29 +1054,11 @@ def populate_xrefs() -> None:
 
   _recreate_and_insert(
       "xrefs",
-      (
-          "from_ea INTEGER, to_ea INTEGER, type TEXT, from_function_ea INTEGER,"
-          " UNIQUE(from_ea, to_ea, type)"
-      ),
+      TABLE_SCHEMAS["xrefs"],
       _gen(),
       column_count=4,
+      indexes=TABLE_INDEXES["xrefs"],
   )
-  with _db_write_lock:
-    conn = _get_rw_conn()
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_xrefs_from ON xrefs (from_ea)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_xrefs_to ON xrefs (to_ea)")
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_xrefs_from_func ON xrefs"
-        " (from_function_ea)"
-    )
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_xrefs_from_func_cov ON xrefs"
-        " (from_function_ea, to_ea, type)"
-    )
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_xrefs_to_cov ON xrefs"
-        " (to_ea, from_ea, type, from_function_ea)"
-    )
 
 
 _entries_fingerprint: tuple[int, tuple[tuple[int, int], ...]] | None = None
@@ -936,21 +1116,11 @@ def populate_entries():
 
   _recreate_and_insert(
       "entries",
-      "index_id INTEGER, ordinal INTEGER, address INTEGER, name TEXT",
+      TABLE_SCHEMAS["entries"],
       _gen(),
       column_count=4,
+      indexes=TABLE_INDEXES["entries"],
   )
-  with _db_write_lock:
-    conn = _get_rw_conn()
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_entries_address ON entries (address)"
-    )
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_entries_name ON entries (name)"
-    )
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_entries_ordinal ON entries (ordinal)"
-    )
 
   _entries_fingerprint = (len(fingerprint_items), tuple(fingerprint_items))
 
@@ -972,6 +1142,162 @@ _strings_dirty = False
 _local_types_dirty = False
 
 
+def _execute_ro(
+    conn: sqlite3.Connection, sql: str
+) -> tuple[list[tuple[Any, ...]], list[str]]:
+  """Runs `sql` on the RO connection and returns (rows, column names)."""
+  with interruptible_sqlite(conn):
+    with contextlib.closing(conn.execute(sql)) as cursor:
+      if not cursor.description:
+        return [], []
+      return cursor.fetchall(), [desc[0] for desc in cursor.description]
+
+
+def _refresh_table(
+    table_name: str, entries_check_enabled: Callable[[], bool]
+) -> None:
+  """Populates or refreshes `table_name` so that a query can read it."""
+  if not _is_table_populated(table_name):
+    POPULATORS[table_name]()
+  elif table_name == "strings" and _strings_dirty:
+    POPULATORS[table_name]()
+  elif table_name == "local_types" and _local_types_dirty:
+    refresh_local_types()
+  elif (
+      table_name == "entries"
+      and entries_check_enabled()
+      and _is_entries_dirty()
+  ):
+    populate_entries()
+
+
+def _missing_populator_table(message: str) -> str | None:
+  """Returns the populator table named by a "no such table" error, if any."""
+  _, found, rest = message.lower().partition("no such table:")
+  if not found:
+    return None
+  name = rest.strip().split(".")[-1].strip("\"'`")
+  return name if name in POPULATOR_ALIASES else None
+
+
+def _recreate_missing_schemas() -> None:
+  """Re-creates any externally dropped schemas and marks them unpopulated."""
+  with _db_write_lock:
+    conn = _get_rw_conn()
+    existing = _existing_canonical_names(conn)
+    _ensure_empty_schemas(conn)
+    _populated_tables.intersection_update(existing)
+    _save_populated_tables(conn, _populated_tables)
+
+
+_EXPLAIN_PREFIX = re.compile(
+    r"(?:\s|--[^\n]*(?:\n|$)|/\*.*?\*/)*EXPLAIN\b",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _check_compiles(
+    conn: sqlite3.Connection, sql: str, healed: set[str]
+) -> None:
+  """Raises the error `sql` fails to compile with, without reading any row.
+
+  SQLite compiles an EXPLAIN statement exactly like the statement itself but
+  only lists its program instead of running it, so this costs one compile and
+  touches no table.
+  """
+  explain_sql = sql if _EXPLAIN_PREFIX.match(sql) else f"EXPLAIN {sql}"
+
+  def _compile_once() -> None:
+    with interruptible_sqlite(conn):
+      with contextlib.closing(conn.execute(explain_sql)):
+        pass
+
+  while True:
+    try:
+      _run_ro_with_lock_retry(_compile_once)
+      return
+    except sqlite3.OperationalError as e:
+      missing = _missing_populator_table(str(e))
+      if missing is None or missing in healed:
+        raise
+      healed.add(missing)
+      _recreate_missing_schemas()
+
+
+def _fetch_ro(
+    conn: sqlite3.Connection, sql: str
+) -> tuple[list[tuple[Any, ...]], list[str]]:
+  """Runs `sql` on the RO connection, populating the tables it reads first.
+
+  While SQLite compiles the statement, the authorizer receives a SQLITE_READ
+  for every table the statement touches. A read of a table that still needs
+  populating (or refreshing) is denied, which fails the compile before any
+  row is read; the table is then populated and the statement compiled again.
+  A query whose tables are all ready therefore runs exactly once.
+
+  set_authorizer also expires the prepared statements SQLite has cached, so
+  the check is not skipped for a statement Python already prepared earlier.
+  """
+  settled: set[str] = set()  # Tables refreshed for this query.
+  healed: set[str] = set()  # Tables whose schema was re-created.
+  pending: set[str] = set()  # Tables denied by the last compile.
+  compile_checked = False
+  check_entries: bool | None = None
+
+  def _entries_check_enabled() -> bool:
+    nonlocal check_entries
+    if check_entries is None:
+      check_entries = bool(load_config().get("check_entries_freshness"))
+    return check_entries
+
+  def _authorizer(action, arg1, arg2, dbname, source):
+    verdict = _ro_authorizer(action, arg1, arg2, dbname, source)
+    if verdict != sqlite3.SQLITE_OK or action != sqlite3.SQLITE_READ:
+      return verdict
+    table_name = POPULATOR_ALIASES.get(arg1.lower()) if arg1 else None
+    if table_name is None or table_name in settled:
+      return verdict
+    # This runs inside SQLite's compile step: never use a connection or call
+    # into IDA here.
+    if (
+        table_name not in _populated_tables
+        or (table_name == "strings" and _strings_dirty)
+        or (table_name == "local_types" and _local_types_dirty)
+        or (table_name == "entries" and _entries_check_enabled())
+    ):
+      pending.add(table_name)
+      return sqlite3.SQLITE_DENY
+    return verdict
+
+  while True:
+    pending.clear()
+    conn.set_authorizer(_authorizer)
+    try:
+      return _run_ro_with_lock_retry(functools.partial(_execute_ro, conn, sql))
+    except sqlite3.OperationalError as e:
+      missing = _missing_populator_table(str(e))
+      if missing is None or missing in healed:
+        raise
+      healed.add(missing)
+      _recreate_missing_schemas()
+    except sqlite3.DatabaseError:
+      if not pending:
+        raise
+    finally:
+      conn.set_authorizer(_ro_authorizer)
+
+    if pending and not compile_checked:
+      # The denied compile stopped at the first table that needs populating.
+      # Make sure the rest of the statement compiles before spending seconds
+      # in a populator for a query that would fail anyway.
+      _check_compiles(conn, sql, healed)
+      compile_checked = True
+
+    for table_name in sorted(pending):
+      _refresh_table(table_name, _entries_check_enabled)
+      settled.add(table_name)
+
+
 @jsonrpc
 def sql_query(
     queries: list[dict[str, Any]],
@@ -979,8 +1305,8 @@ def sql_query(
   """Executes pre-rewritten read-only SQL queries against IDA Pro using SQLite.
 
   Args:
-    queries: A list of dicts, where each dict has: - 'sql': The rewritten SQL
-      query string. - 'tables': A list of table names required by this query.
+    queries: A list of dicts, each with a 'sql' key holding the rewritten SQL
+      query string.
 
   Returns:
     A list of QueryResult objects (one per input query in the batch).
@@ -999,33 +1325,11 @@ def sql_query(
     q = item.get("sql", "").strip()
     if not q:
       continue
-    tables = item.get("tables", [])
     try:
-      # Ensure required tables are populated
-      for table_name in map(str.lower, tables):
-        if table_name in POPULATORS:
-          if not _table_exists(table_name):
-            POPULATORS[table_name]()
-          elif table_name == "local_types" and _local_types_dirty:
-            refresh_local_types()
-          elif (
-              table_name == "entries"
-              and load_config().get("check_entries_freshness")
-              and _is_entries_dirty()
-          ):
-            populate_entries()
-          elif table_name == "strings" and _strings_dirty:
-            POPULATORS[table_name]()
-
-      conn = _get_ro_conn()
-      with interruptible_sqlite(conn):
-        cursor = conn.execute(q)
-        if not cursor.description:
-          results.append(QueryResult(rows=[]))
-          continue
-
-        rows = cursor.fetchall()
-        columns = [desc[0] for desc in cursor.description]
+      rows, columns = _fetch_ro(_get_ro_conn(), q)
+      if not columns:
+        results.append(QueryResult(rows=[]))
+        continue
 
       res = []
       for row in rows:
@@ -1051,7 +1355,7 @@ _db_update_queue: queue.Queue[tuple[Any, ...]] = queue.Queue()
 def _populate_tables() -> None:
   print("[>] Populating all tables, please wait...", flush=True)
   for table_name, populator in POPULATORS.items():
-    if not _table_exists(table_name):
+    if not _is_table_populated(table_name):
       try:
         populator()
       except Exception as e:  # pylint: disable=broad-exception-caught
@@ -1076,6 +1380,7 @@ def _db_worker():
       if action == "rebase_invalidation":
         with _db_write_lock:
           try:
+            conn.execute("BEGIN TRANSACTION")
             entities = conn.execute(
                 "SELECT type, name FROM sqlite_master WHERE type IN ('table',"
                 " 'view') AND name NOT LIKE 'sqlite_%'"
@@ -1085,8 +1390,14 @@ def _db_worker():
                 conn.execute(f'DROP VIEW IF EXISTS "{name}"')
               elif ent_type == "table":
                 conn.execute(f'DROP TABLE IF EXISTS "{name}"')
-            _created_tables.clear()
+            _save_populated_tables(conn, ())
+            _ensure_empty_schemas(conn)
+            conn.execute("COMMIT")
+            _populated_tables.clear()
           except Exception as e:  # pylint: disable=broad-exception-caught
+            if conn.in_transaction:
+              with contextlib.suppress(sqlite3.Error):
+                conn.execute("ROLLBACK")
             logging.exception("Error during rebase_invalidation: %s", e)
         continue
 
@@ -1114,7 +1425,7 @@ def _db_worker():
               ea, new_name, func_info = event[1:4]
               old_name = event[4] if len(event) > 4 else ""
               signed_ea = _to_signed_64(ea)
-              if _table_exists("names"):
+              if _is_table_populated("names"):
                 if new_name:
                   cursor.execute(
                       "INSERT OR REPLACE INTO names (address, name) VALUES"
@@ -1126,7 +1437,7 @@ def _db_worker():
                       "DELETE FROM names WHERE address = ?", (signed_ea,)
                   )
 
-              if _table_exists("functions"):
+              if _is_table_populated("functions"):
                 cursor.execute(
                     "UPDATE functions SET name = ? WHERE start_ea = ?",
                     (new_name, signed_ea),
@@ -1143,7 +1454,7 @@ def _db_worker():
                       ),
                   )
 
-              if _table_exists("entries"):
+              if _is_table_populated("entries"):
                 # Constrain by old_name when available to avoid clobbering
                 # multiple distinct export aliases sharing the same address.
                 if old_name:
@@ -1164,7 +1475,7 @@ def _db_worker():
               signed_end = _to_signed_64(end_ea)
               new_size = _to_signed_64(end_ea - new_start_ea)
 
-              if _table_exists("functions"):
+              if _is_table_populated("functions"):
                 cursor.execute(
                     """
                     UPDATE functions
@@ -1183,7 +1494,7 @@ def _db_worker():
                       (signed_new_start, new_size, signed_old_start),
                   )
 
-              if _table_exists("xrefs"):
+              if _is_table_populated("xrefs"):
                 cursor.execute(
                     "UPDATE xrefs SET from_function_ea = NULL WHERE"
                     " from_function_ea = ?",
@@ -1208,7 +1519,7 @@ def _db_worker():
               signed_new_end = _to_signed_64(new_end_ea)
               new_size = _to_signed_64(new_end_ea - start_ea)
 
-              if _table_exists("functions"):
+              if _is_table_populated("functions"):
                 cursor.execute(
                     """
                     UPDATE functions
@@ -1227,7 +1538,7 @@ def _db_worker():
                       (signed_new_end, new_size, signed_start),
                   )
 
-              if _table_exists("xrefs"):
+              if _is_table_populated("xrefs"):
                 if new_end_ea < old_end_ea:
                   range_clause, params = _ea_range_clause(
                       "from_ea", new_end_ea, old_end_ea
@@ -1258,7 +1569,7 @@ def _db_worker():
               start_ea, end_ea, func_info = event[1:4]
               signed_start = _to_signed_64(start_ea)
               signed_end = _to_signed_64(end_ea)
-              if _table_exists("functions"):
+              if _is_table_populated("functions"):
                 if func_info is None:
                   cursor.execute(
                       "DELETE FROM functions WHERE start_ea = ?",
@@ -1279,7 +1590,7 @@ def _db_worker():
                       ),
                   )
 
-              if _table_exists("xrefs"):
+              if _is_table_populated("xrefs"):
                 range_clause, params = _ea_range_clause(
                     "from_ea", start_ea, end_ea
                 )
@@ -1296,7 +1607,7 @@ def _db_worker():
               func_info: FuncInfo | None
               ea, func_info = event[1:3]
               signed_ea = _to_signed_64(ea)
-              if _table_exists("functions"):
+              if _is_table_populated("functions"):
                 if func_info is None:
                   cursor.execute(
                       "DELETE FROM functions WHERE start_ea = ?", (signed_ea,)
@@ -1319,13 +1630,13 @@ def _db_worker():
             case "func_deleted":
               ea = event[1]
               signed_ea = _to_signed_64(ea)
-              if _table_exists("functions"):
+              if _is_table_populated("functions"):
                 cursor.execute(
                     "DELETE FROM functions WHERE start_ea = ?",
                     (signed_ea,),
                 )
 
-              if _table_exists("xrefs"):
+              if _is_table_populated("xrefs"):
                 cursor.execute(
                     "UPDATE xrefs SET from_function_ea = NULL WHERE"
                     " from_function_ea = ?",
@@ -1335,7 +1646,7 @@ def _db_worker():
             case "local_type_changed":
               info: LocalTypeInfo | None
               ordinal, info = event[1:3]
-              if _table_exists("local_types"):
+              if _is_table_populated("local_types"):
                 if info is None:
                   cursor.execute(
                       "DELETE FROM local_types WHERE ordinal = ?", (ordinal,)
@@ -1351,7 +1662,7 @@ def _db_worker():
 
             case "cref_added" | "dref_added":
               from_ea, to_ea, type_val, from_function_ea = event[1:5]
-              if _table_exists("xrefs"):
+              if _is_table_populated("xrefs"):
                 cursor.execute(
                     "INSERT OR IGNORE INTO xrefs (from_ea,"
                     " to_ea, type, from_function_ea)"
@@ -1370,7 +1681,7 @@ def _db_worker():
 
             case "cref_deleted":
               from_ea, to_ea = event[1:3]
-              if _table_exists("xrefs"):
+              if _is_table_populated("xrefs"):
                 cursor.execute(
                     "DELETE FROM xrefs WHERE from_ea = ? AND"
                     " to_ea = ? AND type IN ('call', 'jmp', 'other')",
@@ -1382,7 +1693,7 @@ def _db_worker():
 
             case "dref_deleted":
               from_ea, to_ea = event[1:3]
-              if _table_exists("xrefs"):
+              if _is_table_populated("xrefs"):
                 cursor.execute(
                     """
                     DELETE FROM xrefs
@@ -1398,7 +1709,7 @@ def _db_worker():
 
             case "string_updated":
               start_ea, new_end_ea, new_content, new_length = event[1:5]
-              if _table_exists("__internal_strings"):
+              if _is_table_populated("__internal_strings"):
                 signed_start = _to_signed_64(start_ea)
                 signed_new_end = _to_signed_64(new_end_ea)
                 if not new_content:
@@ -1418,7 +1729,7 @@ def _db_worker():
           cursor.close()
 
       if _db_update_queue.empty() and dirty_tables:
-        if "segments" in dirty_tables and _table_exists("segments"):
+        if "segments" in dirty_tables and _is_table_populated("segments"):
           with _db_write_lock:
             conn.execute("BEGIN TRANSACTION")
             try:
@@ -1637,7 +1948,7 @@ class DBUpdateHooks(ida_idp.IDB_Hooks):
   ) -> None:
     del old_value, args
     global _strings_dirty
-    if not _table_exists("__internal_strings"):
+    if not _is_table_populated("__internal_strings"):
       return
 
     if idc.get_func_attr(ea, idc.FUNCATTR_START) != idc.BADADDR:
@@ -1807,7 +2118,7 @@ def init_tables() -> bool:
 def close_tables() -> None:
   """Shuts down the background DB worker, unhooks IDA hooks, and closes SQLite connections."""
   global _db_initialized, _db_hooks, _db_idp_hooks, _worker_thread, _db_local
-  global _db_version_checked, _created_tables, _strings_dirty, _comments_dirty
+  global _db_version_checked, _populated_tables, _strings_dirty, _comments_dirty
   global _entries_fingerprint, _image_min_ea, _is_rebasing, _local_types_dirty
 
   # 1. Unhook IDA IDB/IDP hooks
@@ -1850,7 +2161,7 @@ def close_tables() -> None:
   _db_local = SQLiteConnectionLocal()
 
   # 6. Reset all module state
-  _created_tables.clear()
+  _populated_tables.clear()
   _db_initialized = False
   _db_version_checked = False
   _strings_dirty = False

@@ -21,6 +21,7 @@
 """Unit tests for query database update hooks and worker synchronization."""
 
 import asyncio
+import functools
 import importlib
 import inspect
 import queue
@@ -129,8 +130,8 @@ class TestDBUpdateHooks(unittest.TestCase):
           "CREATE INDEX IF NOT EXISTS idx_strings_range ON __internal_strings"
           " (start_ea, end_ea, length)"
       )
-      query._created_tables.add("strings")
-      query._created_tables.add("__internal_strings")
+      query._populated_tables.add("strings")
+      query._populated_tables.add("__internal_strings")
 
   def tearDown(self):
     _drain_queue()
@@ -138,8 +139,8 @@ class TestDBUpdateHooks(unittest.TestCase):
       conn = query._get_rw_conn()
       conn.execute("DROP TABLE IF EXISTS __internal_strings")
       conn.execute("DROP VIEW IF EXISTS strings")
-      query._created_tables.discard("strings")
-      query._created_tables.discard("__internal_strings")
+      query._populated_tables.discard("strings")
+      query._populated_tables.discard("__internal_strings")
     super().tearDown()
 
   def test_set_func_start_enqueues_when_changed(self):
@@ -386,8 +387,8 @@ class TestDBWorkerFunctionAndXrefSync(unittest.TestCase):
           UNIQUE(from_ea, to_ea, type)
         )
       """)
-      query._created_tables.add("functions")
-      query._created_tables.add("xrefs")
+      query._populated_tables.add("functions")
+      query._populated_tables.add("xrefs")
 
   def test_set_func_start_shrink_and_expand(self):
     # Seed initial function 0x1000..0x1050 and xrefs
@@ -504,8 +505,8 @@ class TestDBWorkerFunctionAndXrefSync(unittest.TestCase):
           "CREATE TABLE names (address INTEGER PRIMARY KEY, name TEXT)"
       )
       self.conn.execute("INSERT INTO names VALUES (4096, 'old_name')")
-    query._created_tables.add("names")
-    self.addCleanup(query._created_tables.discard, "names")
+    query._populated_tables.add("names")
+    self.addCleanup(query._populated_tables.discard, "names")
 
     query._db_update_queue.put(("renamed", 4096, "new_name", None, "old_name"))
     query._db_update_queue.join()
@@ -528,8 +529,8 @@ class TestDBWorkerFunctionAndXrefSync(unittest.TestCase):
           "INSERT INTO local_types VALUES (?, ?, ?)",
           [(1, "TypeA", "struct TypeA;"), (2, "TypeB", "struct TypeB;")],
       )
-    query._created_tables.add("local_types")
-    self.addCleanup(query._created_tables.discard, "local_types")
+    query._populated_tables.add("local_types")
+    self.addCleanup(query._populated_tables.discard, "local_types")
 
     for event in (
         ("local_type_changed", 1, query.LocalTypeInfo(1, "A2", "struct A2;")),
@@ -649,8 +650,8 @@ class TestDBWorkerFunctionAndXrefSync(unittest.TestCase):
         CREATE VIEW IF NOT EXISTS strings AS SELECT start_ea AS address,
           length, string FROM __internal_strings
       """)
-      query._created_tables.add("strings")
-      query._created_tables.add("__internal_strings")
+      query._populated_tables.add("strings")
+      query._populated_tables.add("__internal_strings")
       self.conn.execute(
           "INSERT INTO __internal_strings VALUES (?, ?, ?, ?)",
           (
@@ -712,8 +713,8 @@ class TestDBWorkerFunctionAndXrefSync(unittest.TestCase):
         CREATE VIEW IF NOT EXISTS strings AS SELECT start_ea AS address,
           length, string FROM __internal_strings
       """)
-      query._created_tables.add("strings")
-      query._created_tables.add("__internal_strings")
+      query._populated_tables.add("strings")
+      query._populated_tables.add("__internal_strings")
       self.conn.execute(
           "INSERT INTO __internal_strings VALUES (?, ?, ?, ?)",
           (
@@ -842,7 +843,7 @@ class TestDBWorkerSegmentsSync(unittest.TestCase):
           "INSERT INTO segments VALUES ('.old', 'CODE', 4096, 8192, 4096,"
           " 'r-x')"
       )
-    query._created_tables.add("segments")
+    query._populated_tables.add("segments")
     self.worker = threading.Thread(target=query._db_worker, daemon=True)
     self.worker.start()
 
@@ -851,7 +852,7 @@ class TestDBWorkerSegmentsSync(unittest.TestCase):
     self.worker.join(timeout=2.0)
     with query._db_write_lock:
       self.conn.execute("DROP TABLE IF EXISTS segments")
-    query._created_tables.discard("segments")
+    query._populated_tables.discard("segments")
     super().tearDown()
 
   def test_segment_changed_replaces_rows_and_keeps_index(self):
@@ -902,8 +903,8 @@ class TestLocalTypesSync(unittest.TestCase):
           "CREATE INDEX idx_local_types_name ON local_types (name, ordinal)"
       )
       conn.executemany("INSERT INTO local_types VALUES (?, ?, ?)", rows)
-    query._created_tables.add("local_types")
-    self.addCleanup(query._created_tables.discard, "local_types")
+    query._populated_tables.add("local_types")
+    self.addCleanup(query._populated_tables.discard, "local_types")
     return conn
 
   @mock.patch.object(query, "_get_local_type_info")
@@ -980,10 +981,7 @@ class TestLocalTypesSync(unittest.TestCase):
         mock.patch.object(query, "refresh_local_types") as mock_refresh,
     ):
       results = asyncio.run(
-          query.sql_query([{
-              "sql": "SELECT name FROM local_types",
-              "tables": ["local_types"],
-          }])
+          query.sql_query([{"sql": "SELECT name FROM local_types"}])
       )
     mock_refresh.assert_called_once_with()
     self.assertEqual(results[0]["rows"], [{"name": "TypeA"}])
@@ -1035,8 +1033,8 @@ class TestUnsigned64BitPopulation(unittest.TestCase):
       )
       results = asyncio.run(
           query.sql_query([
-              {"sql": eq_sql, "tables": ["entries"]},
-              {"sql": ge_sql, "tables": ["entries"]},
+              {"sql": eq_sql},
+              {"sql": ge_sql},
           ])
       )
 
@@ -1074,10 +1072,9 @@ class TestUnsigned64BitPopulation(unittest.TestCase):
     ):
       query.populate_segments()
       results = asyncio.run(
-          query.sql_query([{
-              "sql": "SELECT name, start_ea, end_ea, size FROM segments",
-              "tables": ["segments"],
-          }])
+          query.sql_query(
+              [{"sql": "SELECT name, start_ea, end_ea, size FROM segments"}]
+          )
       )
 
     self.assertEqual(
@@ -1119,10 +1116,10 @@ class TestDirtyStringsRebuild(unittest.TestCase):
       conn.execute(
           "INSERT INTO __internal_strings VALUES (4096, 4101, 5, ?)", (text,)
       )
-    query._created_tables.add("strings")
-    query._created_tables.add("__internal_strings")
-    self.addCleanup(query._created_tables.discard, "strings")
-    self.addCleanup(query._created_tables.discard, "__internal_strings")
+    query._populated_tables.add("strings")
+    query._populated_tables.add("__internal_strings")
+    self.addCleanup(query._populated_tables.discard, "strings")
+    self.addCleanup(query._populated_tables.discard, "__internal_strings")
 
   def test_sql_query_dirty_strings_rebuilds_directly_without_popup(self):
     self._create_strings_table("stale")
@@ -1140,10 +1137,7 @@ class TestDirtyStringsRebuild(unittest.TestCase):
         mock.patch.dict(query.POPULATORS, {"strings": fake_populate_strings}),
     ):
       results = asyncio.run(
-          query.sql_query([{
-              "sql": "SELECT string FROM strings",
-              "tables": ["strings"],
-          }])
+          query.sql_query([{"sql": "SELECT string FROM strings"}])
       )
 
     self.assertFalse(query._strings_dirty)
@@ -1160,14 +1154,446 @@ class TestDirtyStringsRebuild(unittest.TestCase):
         mock.patch.dict(query.POPULATORS, {"strings": pop}),
     ):
       results = asyncio.run(
-          query.sql_query([{
-              "sql": "SELECT string FROM strings",
-              "tables": ["strings"],
-          }])
+          query.sql_query([{"sql": "SELECT string FROM strings"}])
       )
 
     pop.assert_not_called()
     self.assertEqual(results[0]["rows"], [{"string": "existing"}])
+
+
+class TestAuthorizerTableExtraction(unittest.TestCase):
+  """Tests compile-time SQLite authorizer table extraction and RO hardening."""
+
+  def setUp(self):
+    super().setUp()
+    _drain_queue()
+    query.close_tables()
+    conn = query._get_rw_conn()
+    with query._db_write_lock:
+      query._check_and_migrate_db(conn)
+
+  def tearDown(self):
+    _drain_queue()
+    query.close_tables()
+    super().tearDown()
+
+  def test_upfront_schemas_and_zero_populator_pragma_introspection(self):
+    pop_funcs = mock.MagicMock()
+    with (
+        mock.patch.object(query, "_db_initialized", True),
+        mock.patch.dict(query.POPULATORS, {"functions": pop_funcs}),
+    ):
+      results = asyncio.run(
+          query.sql_query([
+              {"sql": "PRAGMA table_info('functions')"},
+              {"sql": "SELECT name FROM pragma_table_info('functions')"},
+              {
+                  "sql": (
+                      "SELECT name FROM sqlite_master WHERE type IN ('table',"
+                      " 'view')"
+                  )
+              },
+          ])
+      )
+
+    pop_funcs.assert_not_called()
+    self.assertEqual(
+        [r["name"] for r in results[0]["rows"]],
+        [
+            "start_ea",
+            "end_ea",
+            "name",
+            "demangled_name",
+            "prototype",
+            "size",
+            "is_lib",
+        ],
+    )
+    self.assertEqual(
+        [r["name"] for r in results[1]["rows"]],
+        [
+            "start_ea",
+            "end_ea",
+            "name",
+            "demangled_name",
+            "prototype",
+            "size",
+            "is_lib",
+        ],
+    )
+    master_names = {r["name"] for r in results[2]["rows"]}
+    self.assertTrue(
+        {
+            "functions",
+            "strings",
+            "__internal_strings",
+            "names",
+            "imports",
+            "segments",
+            "local_types",
+            "xrefs",
+            "entries",
+        }.issubset(master_names)
+    )
+
+  def _run_with_recording_populators(self, sql):
+    """Runs `sql` with populators that only record their name."""
+    calls: list[str] = []
+    fakes = {
+        name: functools.partial(calls.append, name) for name in query.POPULATORS
+    }
+    with (
+        mock.patch.object(query, "_db_initialized", True),
+        mock.patch.dict(query.POPULATORS, fakes),
+    ):
+      results = asyncio.run(query.sql_query([{"sql": sql}]))
+    return results[0], sorted(calls)
+
+  def test_query_populates_exactly_the_tables_it_reads(self):
+    for sql, expected in (
+        (
+            (
+                "WITH c AS (SELECT to_ea FROM xrefs) SELECT f.name FROM"
+                " functions f JOIN c ON f.start_ea = c.to_ea"
+            ),
+            ["functions", "xrefs"],
+        ),
+        ("SELECT COUNT(*) FROM imports", ["imports"]),
+        (
+            "SELECT name FROM segments WHERE EXISTS (SELECT 1 FROM entries)",
+            ["entries", "segments"],
+        ),
+        ("SELECT address, string FROM strings", ["strings"]),
+        ("SELECT start_ea FROM __internal_strings", ["strings"]),
+        ("SELECT name FROM sqlite_master", []),
+    ):
+      with self.subTest(sql=sql):
+        result, populated = self._run_with_recording_populators(sql)
+        self.assertNotIn("error", result)
+        self.assertEqual(populated, expected)
+
+  def test_cte_named_like_a_table_is_not_populated(self):
+    result, populated = self._run_with_recording_populators(
+        "WITH RECURSIVE functions(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM"
+        " functions WHERE x < 3) SELECT x FROM functions"
+    )
+    self.assertNotIn("error", result)
+    self.assertEqual(populated, [])
+    self.assertEqual(result["rows"], [{"x": "0x1"}, {"x": "0x2"}, {"x": "0x3"}])
+
+  def test_compile_error_after_unpopulated_table_populates_nothing(self):
+    # The denied compile stops at xrefs, before SQLite gets to f.typo_col.
+    result, populated = self._run_with_recording_populators(
+        "SELECT x.from_ea, f.typo_col FROM xrefs x JOIN functions f"
+        " ON f.start_ea = x.to_ea"
+    )
+    self.assertIn("no such column: f.typo_col", result["error"])
+    self.assertEqual(populated, [])
+
+  def test_ready_tables_run_the_statement_once(self):
+    with mock.patch.object(
+        query.idautils, "Names", return_value=[(0x1000, "f")]
+    ):
+      query.populate_names()
+    conn = query._get_ro_conn()
+    statements: list[str] = []
+    conn.set_trace_callback(statements.append)
+    try:
+      rows, columns = query._fetch_ro(conn, "SELECT name FROM names")
+    finally:
+      conn.set_trace_callback(None)
+    self.assertEqual((rows, columns), ([("f",)], ["name"]))
+    self.assertEqual(statements, ["SELECT name FROM names"])
+
+  def test_first_read_populates_then_runs_the_statement_once(self):
+    conn = query._get_ro_conn()
+    statements: list[str] = []
+    conn.set_trace_callback(statements.append)
+    try:
+      # populate_names swaps the table (DROP + RENAME) on the RW connection
+      # between the denied compile and the retry, in shared-cache mode.
+      with mock.patch.object(
+          query.idautils, "Names", return_value=[(0x1000, "f")]
+      ):
+        rows, _ = query._fetch_ro(conn, "SELECT name FROM names")
+    finally:
+      conn.set_trace_callback(None)
+    self.assertEqual(rows, [("f",)])
+    self.assertIn("names", query._populated_tables)
+    # Neither the denied compile nor the EXPLAIN compile check runs a VDBE
+    # program (the statement trace fires from OP_Init), so the statement is
+    # seen running exactly once.
+    self.assertEqual(statements, ["SELECT name FROM names"])
+
+  def test_ro_authorizer_blocks_unsafe_functions_and_pragmas(self):
+    with mock.patch.object(query, "_db_initialized", True):
+      results = asyncio.run(
+          query.sql_query([
+              {"sql": "SELECT load_extension('evil.so')"},
+              {"sql": "PRAGMA writable_schema = ON"},
+              {"sql": "PRAGMA user_version = 1"},
+              {"sql": "PRAGMA user_version"},
+              # FLAG pragmas apply at prepare time, so the getter that follows
+              # also proves the denied setter never took effect.
+              {"sql": "PRAGMA foreign_keys = ON"},
+              {"sql": "PRAGMA foreign_keys"},
+              {"sql": "PRAGMA index_list('functions')"},
+          ])
+      )
+
+    self.assertIn("not authorized", (results[0]["error"] or "").lower())
+    self.assertIn("not authorized", (results[1]["error"] or "").lower())
+    self.assertIn("not authorized", (results[2]["error"] or "").lower())
+    self.assertNotIn("error", results[3])
+    self.assertEqual(results[3]["rows"], [{"user_version": "0x8"}])
+    self.assertIn("not authorized", (results[4]["error"] or "").lower())
+    self.assertNotIn("error", results[5])
+    self.assertEqual(results[5]["rows"], [{"foreign_keys": "0x0"}])
+    self.assertNotIn("error", results[6])
+    self.assertEqual(
+        {r["name"] for r in results[6]["rows"]},
+        {"idx_functions_end", "idx_functions_name", "idx_functions_is_lib"},
+    )
+
+  def test_gateway_explain_query_plan_rewrites_and_populates(self):
+    # pylint: disable=g-import-not-at-top
+    from gateway import query as gw_query
+
+    # pylint: enable=g-import-not-at-top
+
+    def fake_populate_names():
+      conn = query._get_rw_conn()
+      with query._db_write_lock:
+        conn.execute(
+            "INSERT INTO names VALUES (-9223372036854775808, 'hi_sym')"
+        )
+        query._populated_tables.add("names")
+
+    async def fake_forward(_db_id, _method, params):
+      return await query.sql_query(params["queries"])
+
+    with (
+        mock.patch.object(query, "_db_initialized", True),
+        mock.patch.dict(query.POPULATORS, {"names": fake_populate_names}),
+        mock.patch.object(gw_query, "forward_to", side_effect=fake_forward),
+    ):
+      res = asyncio.run(
+          gw_query.sql_query(
+              database_id="db1",
+              sql=(
+                  "EXPLAIN QUERY PLAN SELECT name FROM names WHERE address >="
+                  " 0x8000000000000000"
+              ),
+          )
+      )
+
+    self.assertNotIn("error", res)
+    self.assertGreater(len(res["rows"]), 0)
+    self.assertIn("names", query._populated_tables)
+
+  def test_populated_tables_persisted_across_check_and_migrate(self):
+    with mock.patch.object(
+        query.idautils, "Names", return_value=[(0x1000, "f")]
+    ):
+      query.populate_names()
+
+    self.assertIn("names", query._populated_tables)
+    self.assertNotIn("functions", query._populated_tables)
+
+    # Simulate session reload where user_version and image_min_ea match
+    query._populated_tables.clear()
+    query._db_version_checked = False
+    conn = query._get_rw_conn()
+    self.assertIsNotNone(conn)
+    self.assertEqual(query._populated_tables, {"names"})
+
+  def test_explain_compile_error_after_unpopulated_table_populates_nothing(
+      self,
+  ):
+    for prefix in ("EXPLAIN", "EXPLAIN QUERY PLAN", "/* c */ EXPLAIN"):
+      with self.subTest(prefix=prefix):
+        result, populated = self._run_with_recording_populators(
+            f"{prefix} SELECT x.from_ea, f.typo_col FROM xrefs x"
+            " JOIN functions f ON f.start_ea = x.to_ea"
+        )
+        self.assertIn("no such column: f.typo_col", result["error"])
+        self.assertEqual(populated, [])
+
+  def test_check_and_migrate_prunes_dropped_tables_and_partial_strings(self):
+    s = mock.Mock(ea=0x1000, length=3, strtype=0)
+    s.__str__ = lambda self=s: "abc"
+    with (
+        mock.patch.object(
+            query.idautils, "Names", return_value=[(0x1000, "n")]
+        ),
+        mock.patch.object(query.helper, "iter_function_addresses", list),
+        mock.patch.object(query.idautils, "Strings", return_value=[s]),
+        mock.patch.object(query.ida_nalt, "get_strtype_bpu", return_value=1),
+    ):
+      query.populate_names()
+      query.populate_functions()
+      query.populate_strings()
+
+    conn = query._get_rw_conn()
+    with query._db_write_lock:
+      # Drop functions and __internal_strings (leaving VIEW strings behind).
+      conn.execute("DROP TABLE functions")
+      conn.execute("DROP TABLE __internal_strings")
+
+    query._populated_tables.clear()
+    query._db_version_checked = False
+    conn = query._get_rw_conn()
+    self.assertEqual(query._populated_tables, {"names"})
+    self.assertEqual(query._load_populated_tables(conn), {"names"})
+
+  def test_healing_dropped_tables_reconciles_all_and_heals_inside_explain(self):
+    with (
+        mock.patch.object(
+            query.idautils, "Names", return_value=[(0x1000, "n1")]
+        ),
+        mock.patch.object(
+            query.helper, "iter_function_addresses", return_value=[0x1000]
+        ),
+        mock.patch.object(
+            query,
+            "_get_func_info",
+            return_value=query.FuncInfo(
+                0x1000, 0x1010, "fn1", None, None, 0x10, 0
+            ),
+        ),
+    ):
+      query.populate_names()
+      query.populate_functions()
+
+    conn = query._get_rw_conn()
+    with query._db_write_lock:
+      conn.execute("DROP TABLE functions")
+      conn.execute("DROP TABLE names")
+
+    # Query with a bad column heals both dropped schemas and persists metadata
+    # even though compilation fails before any populator runs.
+    with mock.patch.object(query, "_db_initialized", True):
+      bad = asyncio.run(
+          query.sql_query([{"sql": "SELECT typo_col FROM functions"}])
+      )
+    self.assertIn("no such column: typo_col", bad[0]["error"])
+    self.assertEqual(query._populated_tables, set())
+    self.assertEqual(query._load_populated_tables(conn), set())
+
+    # Also heal when the first table in a join is unpopulated (xrefs) and the
+    # second table (functions) was dropped externally and hit during EXPLAIN.
+    with query._db_write_lock:
+      conn.execute("DROP TABLE functions")
+      query._populated_tables.add("functions")
+
+    def fake_populate_xrefs():
+      with query._db_write_lock:
+        conn.execute("INSERT INTO xrefs VALUES (4096, 4096, 'call', 4096)")
+        query._populated_tables.add("xrefs")
+
+    def fake_populate_functions():
+      with query._db_write_lock:
+        conn.execute(
+            "INSERT INTO functions VALUES (4096, 4112, 'fn1', NULL, NULL,"
+            " 16, 0)"
+        )
+        query._populated_tables.add("functions")
+
+    with (
+        mock.patch.object(query, "_db_initialized", True),
+        mock.patch.dict(
+            query.POPULATORS,
+            {
+                "xrefs": fake_populate_xrefs,
+                "functions": fake_populate_functions,
+            },
+        ),
+    ):
+      joined = asyncio.run(
+          query.sql_query([{
+              "sql": (
+                  "SELECT f.name FROM xrefs x JOIN functions f"
+                  " ON f.start_ea = x.to_ea"
+              )
+          }])
+      )
+    self.assertNotIn("error", joined[0])
+    self.assertEqual(joined[0]["rows"], [{"name": "fn1"}])
+
+  def test_check_compiles_retries_when_shared_cache_schema_is_locked(self):
+    # Exercise both: (1) creating a fresh RO connection while DDL holds the
+    # shared-cache schema lock, and (2) _check_compiles on an existing RO
+    # connection while DDL holds the shared-cache schema lock.
+    for prewarm_ro in (False, True):
+      with self.subTest(prewarm_ro=prewarm_ro):
+        query.close_tables()
+        conn = query._get_rw_conn()
+        with query._db_write_lock:
+          query._check_and_migrate_db(conn)
+        if prewarm_ro:
+          query._get_ro_conn()
+
+        locked_entered = threading.Event()
+        release_lock = threading.Event()
+
+        def hold_ddl_lock(entered=locked_entered, release=release_lock):
+          rw = query._get_rw_conn()
+          with query._db_write_lock:
+            rw.execute("BEGIN TRANSACTION")
+            rw.execute("CREATE TABLE _lock_probe (x INT)")
+            entered.set()
+            release.wait(timeout=5.0)
+            rw.execute("ROLLBACK")
+
+        holder = threading.Thread(target=hold_ddl_lock, daemon=True)
+        holder.start()
+        self.assertTrue(locked_entered.wait(timeout=2.0))
+
+        releaser = threading.Timer(0.05, release_lock.set)
+        releaser.start()
+        try:
+          result, populated = self._run_with_recording_populators(
+              "SELECT name FROM names"
+          )
+        finally:
+          release_lock.set()
+          releaser.cancel()
+          holder.join(timeout=2.0)
+
+        self.assertNotIn("error", result)
+        self.assertEqual(populated, ["names"])
+
+  def test_gateway_intersect_and_commented_explain_rewrite(self):
+    # pylint: disable=g-import-not-at-top
+    from gateway import query as gw_query
+
+    # pylint: enable=g-import-not-at-top
+
+    captured: list[dict[str, str]] = []
+
+    async def fake_forward(_db_id, _method, params):
+      captured.extend(params["queries"])
+      return [{"rows": []} for _ in params["queries"]]
+
+    with mock.patch.object(gw_query, "forward_to", side_effect=fake_forward):
+      res = asyncio.run(
+          gw_query.sql_query(
+              database_id="db1",
+              sql=[
+                  (
+                      "SELECT start_ea FROM functions WHERE start_ea >="
+                      " 0x8000000000000000 INTERSECT SELECT address FROM names"
+                  ),
+                  "EXPLAIN /* c */ QUERY PLAN SELECT name FROM names",
+              ],
+          )
+      )
+
+    self.assertEqual(len(res), 2)
+    self.assertNotIn("error", res[0])
+    self.assertNotIn("error", res[1])
+    self.assertIn("INTERSECT", captured[0]["sql"])
+    self.assertTrue(captured[1]["sql"].startswith("EXPLAIN QUERY PLAN SELECT"))
 
 
 if __name__ == "__main__":

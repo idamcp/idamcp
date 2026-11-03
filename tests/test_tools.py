@@ -2815,18 +2815,21 @@ for ea in (0x10d0, 0x10a0):
     for r in res_to_in:
       self.assertIn(int(r["to_ea"], 16), {to_addrs[0], to_addrs[1]})
 
-    # 8. Verify PRAGMA statements (regression test for rewrite bug)
+    # 8. Verify PRAGMA statements (getter/introspection allowed, setter denied)
     pragma_res = await self.run_tool(
         "sql_query", sql="PRAGMA foreign_keys = ON"
     )
     self.assertIsInstance(pragma_res, dict)
-    self.assertIn("rows", pragma_res)
-    self.assertNotIn("error", pragma_res)
-    self.assertEqual(pragma_res["rows"], [])
+    self.assertIn("error", pragma_res)
+    self.assertNotIn("rows", pragma_res)
+    self.assertIn("not authorized", pragma_res["error"].lower())
 
     pragma_val = await run_sql("PRAGMA foreign_keys")
     self.assertIsInstance(pragma_val, list)
-    self.assertEqual(pragma_val[0]["foreign_keys"], "0x1")
+    self.assertEqual(pragma_val[0]["foreign_keys"], "0x0")
+
+    pragma_cols = await run_sql("PRAGMA table_info('functions')")
+    self.assertTrue(any(c["name"] == "start_ea" for c in pragma_cols))
 
     # 9. Verify NOT IN with subquery (regression test for rewrite bug)
     notin_res = await run_sql(
@@ -3746,7 +3749,7 @@ print(f"REBASE RESULT: {rc}")
 
   async def verify_db_versioning_and_migration(self):
     """Verifies that DB version is set and database is migrated if version is old."""
-    # 1. Verify current version is 7 (target version)
+    # 1. Verify current version is 8 (target version)
     res_dict = await self.run_tool("sql_query", sql="PRAGMA user_version")
     self.assertIsInstance(res_dict, dict)
     self.assertIn("rows", res_dict)
@@ -3754,7 +3757,7 @@ print(f"REBASE RESULT: {rc}")
     res = res_dict["rows"]
     self.assertEqual(len(res), 1)
     self.assertIn("user_version", res[0])
-    self.assertEqual(res[0]["user_version"], "0x7")
+    self.assertEqual(res[0]["user_version"], "0x8")
 
     # Verify functions table exists and has data (triggered population)
     funcs_res = await self.run_tool(
@@ -3787,19 +3790,18 @@ print("DEBUG: Force set version to 1 and created legacy view/table")
     res = res_dict["rows"]
     self.assertEqual(res[0]["user_version"], "0x1")
 
-    # Now reset _db_version_checked and _created_tables to force migration on
+    # Now reset _db_version_checked and _populated_tables to force migration on
     # next query
     reset_code = """
 import ida_mcp.tools.query as q
 q._db_version_checked = False
-q._created_tables.clear()
+q._populated_tables.clear()
 print("DEBUG: Reset checked flag")
 """
     await self.run_tool("idapython_eval", code=reset_code)
 
-    # 3. Trigger a query. This should trigger migration (drop tables and views,
-    # set version to 5). We query sqlite_master to verify tables and views were
-    # dropped.
+    # 3. Trigger a query. This should trigger migration (drop legacy tables and
+    # views, set version to 8, and initialize empty canonical schemas).
     entities_res = await self.run_tool(
         "sql_query",
         sql=(
@@ -3811,28 +3813,37 @@ print("DEBUG: Reset checked flag")
     self.assertIn("rows", entities_res)
     self.assertNotIn("error", entities_res)
     entities = entities_res["rows"]
-    entity_names = [e["name"] for e in entities]
-    print(f"DEBUG: Entities after migration trigger: {entity_names}")
+    entity_map = {e["name"]: e["type"] for e in entities}
+    print(f"DEBUG: Entities after migration trigger: {entity_map}")
+    self.assertNotIn("__internal_xrefs", entity_map)
+    self.assertEqual(entity_map.get("xrefs"), "table")
+    self.assertEqual(entity_map.get("strings"), "view")
     for ent in [
         "functions",
-        "strings",
         "names",
         "imports",
         "segments",
         "local_types",
         "xrefs",
-        "__internal_xrefs",
+        "entries",
         "__internal_strings",
     ]:
-      self.assertNotIn(ent, entity_names)
+      self.assertEqual(entity_map.get(ent), "table")
 
-    # Now verify version is back to 7
+    pop_res = await self.run_tool(
+        "sql_query",
+        sql="SELECT value FROM _db_metadata WHERE key = 'populated_tables'",
+    )
+    self.assertNotIn("error", pop_res)
+    self.assertEqual(pop_res["rows"], [{"value": "[]"}])
+
+    # Now verify version is back to 8
     res_dict = await self.run_tool("sql_query", sql="PRAGMA user_version")
     self.assertIsInstance(res_dict, dict)
     self.assertIn("rows", res_dict)
     self.assertNotIn("error", res_dict)
     res = res_dict["rows"]
-    self.assertEqual(res[0]["user_version"], "0x7")
+    self.assertEqual(res[0]["user_version"], "0x8")
 
     # Now query functions again, it should trigger re-population and succeed
     funcs_res = await self.run_tool(
@@ -3844,17 +3855,12 @@ print("DEBUG: Reset checked flag")
     funcs = funcs_res["rows"]
     self.assertGreater(int(funcs[0]["cnt"], 16), 0)
 
-    # Verify tables exist again
-    tables_res = await self.run_tool(
-        "sql_query", sql="SELECT name FROM sqlite_master WHERE type='table'"
+    pop_after_res = await self.run_tool(
+        "sql_query",
+        sql="SELECT value FROM _db_metadata WHERE key = 'populated_tables'",
     )
-    self.assertIsInstance(tables_res, dict)
-    self.assertIn("rows", tables_res)
-    self.assertNotIn("error", tables_res)
-    tables_after = tables_res["rows"]
-    table_names_after = [t["name"] for t in tables_after]
-    print(f"DEBUG: Tables after re-population: {table_names_after}")
-    self.assertIn("functions", table_names_after)
+    self.assertNotIn("error", pop_after_res)
+    self.assertEqual(pop_after_res["rows"], [{"value": '["functions"]'}])
 
     # 4. Verify _db_metadata recorded image_min_ea
     meta_res = await self.run_tool(
@@ -3869,44 +3875,26 @@ print("DEBUG: Reset checked flag")
     stored_ea = int(meta_rows[0]["value"], 16)
     print(f"DEBUG: Stored image_min_ea in metadata: {hex(stored_ea)}")
 
-    # 5. Simulate image_min_ea change in metadata while version is 4
+    # 5. Simulate image_min_ea change in metadata while version is 8
     corrupt_min_ea_code = """
 import ida_mcp.tools.query as q
 conn = q._get_rw_conn()
 conn.execute("UPDATE _db_metadata SET value = '0x12345' WHERE key = 'image_min_ea'")
 q._db_version_checked = False
-q._created_tables.clear()
+q._populated_tables.clear()
 print("DEBUG: Corrupted image_min_ea to 0x12345 and reset checked flag")
 """
     await self.run_tool("idapython_eval", code=corrupt_min_ea_code)
 
-    # Trigger a query. Since stored image_min_ea != current_min_ea, all tables should be dropped and re-created
-    entities_res = await self.run_tool(
+    # Trigger a query. Since stored image_min_ea != current_min_ea, populated
+    # tables should be reset and empty canonical schemas re-created.
+    pop_reset_res = await self.run_tool(
         "sql_query",
-        sql=(
-            "SELECT type, name FROM sqlite_master WHERE type IN ('table',"
-            " 'view') AND name NOT LIKE 'sqlite_%'"
-        ),
+        sql="SELECT value FROM _db_metadata WHERE key = 'populated_tables'",
     )
-    self.assertIsInstance(entities_res, dict)
-    self.assertIn("rows", entities_res)
-    self.assertNotIn("error", entities_res)
-    entities_after_ea_change = entities_res["rows"]
-    ea_entity_names = [e["name"] for e in entities_after_ea_change]
-    print(
-        "DEBUG: Entities after image_min_ea mismatch migration:"
-        f" {ea_entity_names}"
-    )
-    for ent in [
-        "functions",
-        "strings",
-        "names",
-        "imports",
-        "segments",
-        "local_types",
-        "xrefs",
-    ]:
-      self.assertNotIn(ent, ea_entity_names)
+    self.assertIsInstance(pop_reset_res, dict)
+    self.assertNotIn("error", pop_reset_res)
+    self.assertEqual(pop_reset_res["rows"], [{"value": "[]"}])
 
     # Verify metadata was updated back to current image_min_ea
     meta_res_updated = await self.run_tool(
