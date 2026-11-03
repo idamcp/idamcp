@@ -180,8 +180,8 @@ IDA Pro database state:
 *   **`functions`**: `name`, `demangled_name`, `start_ea`, `end_ea`, `size`,
     `prototype`, `is_lib`
 *   **`strings`**: `address`, `length`, `string` (view over
-    `__internal_strings(start_ea, end_ea, length, string)` for fast range
-    invalidation)
+    `__internal_strings(start_ea, end_ea, length, strtype, string)` for fast
+    range invalidation)
 *   **`names`**: `address`, `name`
 *   **`imports`**: `address`, `name`, `module`
 *   **`segments`**: `name`, `class`, `start_ea`, `end_ea`, `size`, `permissions`

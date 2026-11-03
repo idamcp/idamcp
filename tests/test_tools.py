@@ -2605,7 +2605,9 @@ for ea in (0x10d0, 0x10a0):
     self.assertIsInstance(internal_cols, list)
     col_names = {c["name"].lower() for c in internal_cols}
     self.assertTrue(
-        {"start_ea", "end_ea", "length", "string"}.issubset(col_names)
+        {"start_ea", "end_ea", "length", "strtype", "string"}.issubset(
+            col_names
+        )
     )
 
     # 3. Verify Hexadecimal Literals parser (e.g. WHERE address = 0x1240)
@@ -3050,6 +3052,87 @@ for ea in (0x10d0, 0x10a0):
         "SELECT name FROM functions WHERE start_ea >= end_ea"
     )
     self.assertEqual(len(func_cmp_inv), 0)
+
+    # 15. Verify __internal_strings byte spans and byte_patched fast/dirty paths
+    span_mismatch = await run_sql(
+        "SELECT start_ea FROM __internal_strings WHERE end_ea - start_ea !="
+        " length"
+    )
+    self.assertEqual(span_mismatch, [])
+
+    sample_rows = await run_sql(
+        "SELECT start_ea, length, string FROM __internal_strings WHERE"
+        " strtype = 0 AND length >= 8 ORDER BY start_ea LIMIT 1"
+    )
+    self.assertEqual(len(sample_rows), 1)
+    str_ea_hex = sample_rows[0]["start_ea"]
+    str_ea = int(str_ea_hex, 16)
+    orig_len = int(sample_rows[0]["length"], 16)
+    orig_str = sample_rows[0]["string"]
+
+    orig_bytes_eval = await self.run_tool(
+        "idapython_eval",
+        code=(
+            f"import ida_bytes; result = ida_bytes.get_bytes({str_ea},"
+            f" {orig_len}).hex()"
+        ),
+    )
+    orig_hex = orig_bytes_eval["result"]
+    self.assertEqual(len(orig_hex), orig_len * 2)
+
+    try:
+      replacement_char = "Z" if orig_str[0] != "Z" else "Y"
+      await self.run_tool(
+          "patch_bytes",
+          reqs=[{
+              "address": str_ea_hex,
+              "hex_string": f"{ord(replacement_char):02x}",
+          }],
+      )
+      dirty_after_char = await self.run_tool(
+          "idapython_eval",
+          code="from ida_mcp.tools import query; result = query._strings_dirty",
+      )
+      self.assertEqual(dirty_after_char["result"], "False")
+
+      patched_rows = await run_sql(
+          f"SELECT length, string FROM strings WHERE address = {str_ea_hex}"
+      )
+      self.assertEqual(
+          patched_rows,
+          [{
+              "length": hex(orig_len),
+              "string": replacement_char + orig_str[1:],
+          }],
+      )
+
+      # Patching an interior byte to NUL changes max strlit length -> dirty
+      await self.run_tool(
+          "patch_bytes",
+          reqs=[{"address": hex(str_ea + 2), "hex_string": "00"}],
+      )
+      dirty_after_nul = await self.run_tool(
+          "idapython_eval",
+          code="from ida_mcp.tools import query; result = query._strings_dirty",
+      )
+      self.assertEqual(dirty_after_nul["result"], "True")
+    finally:
+      await self.run_tool(
+          "patch_bytes",
+          reqs=[{"address": str_ea_hex, "hex_string": orig_hex}],
+      )
+      # Force strings refresh if dirty so subsequent tests see clean state
+      await self.run_tool(
+          "idapython_eval",
+          code="from ida_mcp.tools import query; query._strings_dirty = True",
+      )
+      restored_rows = await run_sql(
+          f"SELECT length, string FROM strings WHERE address = {str_ea_hex}"
+      )
+      self.assertEqual(
+          restored_rows,
+          [{"length": hex(orig_len), "string": orig_str}],
+      )
 
   async def verify_xrefs_lifecycle(self):
     """Verifies pre-population and dynamic add/del of xrefs."""

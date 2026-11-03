@@ -71,7 +71,8 @@ TABLE_SCHEMAS: dict[str, str] = {
         " demangled_name TEXT, prototype TEXT, size INTEGER, is_lib INTEGER"
     ),
     "__internal_strings": (
-        "start_ea INTEGER, end_ea INTEGER, length INTEGER, string TEXT"
+        "start_ea INTEGER, end_ea INTEGER, length INTEGER, strtype INTEGER,"
+        " string TEXT"
     ),
     "names": "address INTEGER PRIMARY KEY, name TEXT",
     "imports": "address INTEGER, name TEXT, module TEXT",
@@ -104,7 +105,7 @@ TABLE_INDEXES: dict[str, tuple[str, ...]] = {
     "__internal_strings": (
         (
             "CREATE INDEX IF NOT EXISTS idx_strings_range ON"
-            " __internal_strings (start_ea, end_ea, length)"
+            " __internal_strings (start_ea, end_ea, length, strtype)"
         ),
     ),
     "names": (
@@ -797,12 +798,12 @@ def populate_strings():
     for item in idautils.Strings():
       if item is None:
         continue
-      bpu = ida_nalt.get_strtype_bpu(item.strtype)
-      end_ea = item.ea + (item.length * bpu)
+      end_ea = item.ea + item.length
       yield (
           _to_signed_64(item.ea),
           _to_signed_64(end_ea),
           item.length,
+          item.strtype,
           str(item),
       )
 
@@ -810,7 +811,7 @@ def populate_strings():
       "__internal_strings",
       TABLE_SCHEMAS["__internal_strings"],
       _gen(),
-      column_count=4,
+      column_count=5,
       indexes=TABLE_INDEXES["__internal_strings"],
       drop_views=("strings",),
       create_views=(("strings", STRINGS_VIEW_DDL),),
@@ -1708,21 +1709,13 @@ def _db_worker():
                 )
 
             case "string_updated":
-              start_ea, new_end_ea, new_content, new_length = event[1:5]
+              start_ea, new_content = event[1:3]
               if _is_table_populated("__internal_strings"):
-                signed_start = _to_signed_64(start_ea)
-                signed_new_end = _to_signed_64(new_end_ea)
-                if not new_content:
-                  cursor.execute(
-                      "DELETE FROM __internal_strings WHERE start_ea = ?",
-                      (signed_start,),
-                  )
-                else:
-                  cursor.execute(
-                      "UPDATE __internal_strings SET string = ?, length = ?,"
-                      " end_ea = ? WHERE start_ea = ?",
-                      (new_content, new_length, signed_new_end, signed_start),
-                  )
+                cursor.execute(
+                    "UPDATE __internal_strings SET string = ? WHERE"
+                    " start_ea = ?",
+                    (new_content, _to_signed_64(start_ea)),
+                )
         except Exception as e:  # pylint: disable=broad-exception-caught
           logging.exception("DB update error for event %s: %s", action, e)
         finally:
@@ -1948,7 +1941,7 @@ class DBUpdateHooks(ida_idp.IDB_Hooks):
   ) -> None:
     del old_value, args
     global _strings_dirty
-    if not _is_table_populated("__internal_strings"):
+    if _strings_dirty or not _is_table_populated("__internal_strings"):
       return
 
     if idc.get_func_attr(ea, idc.FUNCATTR_START) != idc.BADADDR:
@@ -1958,13 +1951,13 @@ class DBUpdateHooks(ida_idp.IDB_Hooks):
     # to get the start address of the string.
     signed_ea = _to_signed_64(ea)
     try:
-      cursor = _get_ro_conn().cursor()
-      cursor.execute(
-          "SELECT start_ea, end_ea, length, string FROM __internal_strings"
-          " WHERE start_ea <= ? AND end_ea > ? ORDER BY start_ea DESC LIMIT 1",
-          (signed_ea, signed_ea),
-      )
-      row = cursor.fetchone()
+      with contextlib.closing(_get_ro_conn().cursor()) as cursor:
+        cursor.execute(
+            "SELECT start_ea, end_ea, strtype FROM __internal_strings WHERE"
+            " start_ea <= ? AND end_ea > ? ORDER BY start_ea DESC LIMIT 1",
+            (signed_ea, signed_ea),
+        )
+        row = cursor.fetchone()
     except (sqlite3.OperationalError, sqlite3.DatabaseError):
       _strings_dirty = True
       return
@@ -1974,27 +1967,23 @@ class DBUpdateHooks(ida_idp.IDB_Hooks):
         _strings_dirty = True
       return
 
-    start_ea, end_ea, _, _ = row
+    start_ea, end_ea, strtype = row
     start_ea = _from_signed_64(start_ea)
     end_ea = _from_signed_64(end_ea)
-    strtype = idc.get_str_type(start_ea) or 0
-    raw = ida_bytes.get_strlit_contents(start_ea, end_ea - start_ea, strtype)
-    if raw is None:
-      raw = ida_bytes.get_strlit_contents(start_ea, -1, strtype)
-      if raw is None:
-        _strings_dirty = True
-        return
-
-    new_content = raw.decode("utf-8", "replace")
-    new_length = len(new_content)
-    bpu = ida_nalt.get_strtype_bpu(strtype)
-    new_end_ea = start_ea + (new_length * bpu)
-    if new_end_ea != end_ea:
+    byte_len = end_ea - start_ea
+    if (
+        strtype == getattr(ida_nalt, "STRTYPE_DECOMP", None)
+        or ida_bytes.get_max_strlit_length(start_ea, strtype) != byte_len
+    ):
       _strings_dirty = True
       return
-    _db_update_queue.put(
-        ("string_updated", start_ea, new_end_ea, new_content, new_length)
-    )
+    raw = ida_bytes.get_strlit_contents(start_ea, byte_len, strtype)
+    if not raw:
+      _strings_dirty = True
+      return
+
+    new_content = raw.decode("utf-8", "replace")
+    _db_update_queue.put(("string_updated", start_ea, new_content))
 
   def allsegs_moved(self, info=None, *args: Any) -> None:
     del info, args
