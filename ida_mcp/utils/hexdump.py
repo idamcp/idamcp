@@ -21,49 +21,74 @@
 import sys
 
 
-def hexdump(data: str | bytes, address: int = 0) -> str:
+def is_defined(mask: bytes | None, index: int) -> bool:
+  """Returns whether byte `index` has a value according to `mask`.
+
+  `mask` is the bitmap returned by ida_bytes.get_bytes_and_mask: one bit per
+  byte, byte-major and least significant bit first. No mask means every byte
+  is defined.
+  """
+  return mask is None or bool((mask[index >> 3] >> (index & 7)) & 1)
+
+
+def hexdump(
+    data: str | bytes, address: int = 0, mask: bytes | None = None
+) -> str:
   """Generates a formatted hexadecimal dump of the provided data.
 
   The output includes the offset (starting from the given address), hex
   representation in two columns (8 bytes each), and ASCII representation.
+  Bytes that `mask` marks as undefined are shown as `??` in the hex columns
+  and `?` in the ASCII column.
 
   Args:
     data: The data to dump, either as a string or bytes.
     address: The starting address for the dump offsets. Defaults to 0.
+    mask: Optional bitmap of defined bytes, as returned by
+      ida_bytes.get_bytes_and_mask (see is_defined).
 
   Returns:
     A string containing the formatted hexdump, or an empty string if data is
     empty or invalid.
   """
-  if (
-      data is None
-      or not isinstance(data, (bytes, str))
-      or (insize := len(data)) == 0
-  ):
+  if data is None or not isinstance(data, (bytes, str)) or not data:
     return ""
   if isinstance(data, str):
     data = data.encode()
+  insize = len(data)
 
-  lines = [f"[ {insize} bytes ] -> 16 bytes per line"]
+  undefined = sum(1 for i in range(insize) if not is_defined(mask, i))
+  summary = f"{insize} bytes"
+  if undefined:
+    summary += f", {undefined} undefined shown as ??"
+  lines = [f"[ {summary} ] -> 16 bytes per line"]
   max_address = address + len(data)
   address_hex_len = 16 if max_address > 0xFFFFFFFF else 8
 
   offset = 0
   while offset < insize:
     chunk = data[offset : offset + 16]
+    cells = []
+    ascii_chars = []
+    for i, b in enumerate(chunk):
+      if is_defined(mask, offset + i):
+        cells.append(f"{b:02X}")
+        ascii_chars.append(chr(b) if 0x20 <= b < 0x7F else ".")
+      else:
+        cells.append("??")
+        ascii_chars.append("?")
 
     # Format the first 8 bytes and pad out to 23 characters
-    hex_part1 = " ".join(f"{b:02X}" for b in chunk[:8]).ljust(23)
+    hex_part1 = " ".join(cells[:8]).ljust(23)
 
     # Decide if we need a hyphen separator.
     # Only when more than 8 bytes exist in this row.
     sep = "-" if len(chunk) > 8 else " "
 
     # Format the remaining bytes (up to 8) and pad out to 23 characters
-    hex_part2 = " ".join(f"{b:02X}" for b in chunk[8:]).ljust(23)
+    hex_part2 = " ".join(cells[8:]).ljust(23)
 
-    # Build the ASCII representation
-    ascii_part = "".join(chr(b) if 0x20 <= b < 0x7F else "." for b in chunk)
+    ascii_part = "".join(ascii_chars)
 
     # Assemble the line exactly matching the C formatting spacing
     lines.append(

@@ -1171,9 +1171,11 @@ async def hexdump(
 ) -> str:
   """Get a formatted hexadecimal dump of memory at the specified address.
 
-  Each request is limited to a maximum of 0x1000 bytes. This tool is useful for
-  examining raw memory contents, such as unknown data structures, encrypted
-  payloads, or inline strings.
+  Each request is limited to a maximum of 0x1000 bytes. Bytes that have no
+  value in the database (gaps between segments, uninitialized data such as
+  .bss) are shown as ??. This tool is useful for examining raw memory
+  contents, such as unknown data structures, encrypted payloads, or inline
+  strings.
   """
   return await forward_to(database_id, "hexdump", locals())
 

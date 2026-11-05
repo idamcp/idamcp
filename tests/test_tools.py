@@ -1812,6 +1812,36 @@ for ea in (0x10d0, 0x10a0):
     self.assertIn(global_int_ea_str[2:].lower(), dump.lower())
     self.assertIn("2A 00 00 00", dump)
 
+    # 5b. hexdump across the end of a segment: bytes without a value must be
+    # shown as ?? rather than whatever the read buffer happened to contain.
+    segments = sorted(
+        await self.run_tool("list_segments"), key=lambda s: int(s["start"], 16)
+    )
+    gap_start = next(
+        int(prev["end"], 16)
+        for prev, nxt in zip(segments, segments[1:])
+        if int(nxt["start"], 16) - int(prev["end"], 16) >= 0x20
+    )
+    dump = await self.run_tool(
+        "hexdump", address=hex(gap_start - 8), length=16
+    )
+    header, row = dump.splitlines()[:2]
+    self.assertIn("8 undefined shown as ??", header)
+    cells = row[10:57].replace("-", " ").split()
+    self.assertEqual(len(cells), 16, row)
+    self.assertNotIn("??", cells[:8], row)
+    self.assertEqual(cells[8:], ["??"] * 8, row)
+    self.assertTrue(row.endswith("????????"), row)
+    with self.assertRaises(RuntimeError) as ctx:
+      await self.run_tool("hexdump", address=hex(gap_start), length=16)
+    self.assertIn("no initialized bytes", str(ctx.exception).lower())
+
+    max_ea = int(segments[-1]["end"], 16)
+    tail_dump = await self.run_tool(
+        "hexdump", address=hex(max_ea - 4), length=16
+    )
+    self.assertTrue(tail_dump.startswith("[ 4 bytes ]"), tail_dump)
+
     # 6. search_binary (search for push rbp; mov rbp, rsp -> 55 48 89 E5)
     # Search down without range (default)
     search_res = await self.run_tool("search_binary", pattern="55 48 89 E5")

@@ -249,22 +249,30 @@ def hexdump(
 ) -> str:
   """Get a formatted hexadecimal dump of memory at the specified address.
 
-  Each request is limited to a maximum of 0x1000 bytes. This tool is useful for
-  examining raw memory contents, such as unknown data structures, encrypted
-  payloads, or inline strings.
+  Each request is limited to a maximum of 0x1000 bytes. Bytes that have no
+  value in the database (gaps between segments, uninitialized data such as
+  .bss) are shown as ??. This tool is useful for examining raw memory
+  contents, such as unknown data structures, encrypted payloads, or inline
+  strings.
   """
   ea = helper.parse_and_check_ea(address)
-  if not idaapi.is_loaded(ea):
-    raise ToolError(
-        f"The specified address {address} is not initialized.",
-    )
+  if length <= 0:
+    raise ToolError(f"length must be positive, got {length}")
+  size = min(length, 0x1000, idaapi.inf_get_max_ea() - ea)
 
-  data = idaapi.get_bytes(ea, min(length, 0x1000), 0)
-  if data is None:
+  # get_bytes alone cannot be trusted here: it only writes the bytes that have
+  # a value and leaves the rest of the (uninitialized) buffer as it was. The
+  # mask tells which bytes IDA actually filled in.
+  result = ida_bytes.get_bytes_and_mask(ea, size)
+  if result is None:
     raise ToolError(
-        f"Memory read failed: idaapi.get_bytes({address},"
-        f" {length:#x}) returned None. This indicates the"
-        " memory range is either invalid, unmapped, or contains"
-        " uninitialized byte(s)."
+        f"Memory read failed: ida_bytes.get_bytes_and_mask({address},"
+        f" {size:#x}) returned None."
     )
-  return utils_hexdump.hexdump(data, address=ea)
+  data, mask = result
+  if not any(mask):
+    raise ToolError(
+        f"No initialized bytes in {ea:#x}..{ea + size:#x}: the range is"
+        " unmapped or uninitialized (such as .bss)."
+    )
+  return utils_hexdump.hexdump(data, address=ea, mask=mask)

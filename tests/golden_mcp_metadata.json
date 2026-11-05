@@ -2687,7 +2687,7 @@
           "tags": []
         }
       },
-      "description": "Get a formatted hexadecimal dump of memory at the specified address.\n\nEach request is limited to a maximum of 0x1000 bytes. This tool is useful for\nexamining raw memory contents, such as unknown data structures, encrypted\npayloads, or inline strings.",
+      "description": "Get a formatted hexadecimal dump of memory at the specified address.\n\nEach request is limited to a maximum of 0x1000 bytes. Bytes that have no\nvalue in the database (gaps between segments, uninitialized data such as\n.bss) are shown as ??. This tool is useful for examining raw memory\ncontents, such as unknown data structures, encrypted payloads, or inline\nstrings.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
