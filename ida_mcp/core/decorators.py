@@ -311,13 +311,13 @@ def cancellation_profile(
   the interrupted code added to the interrupt while it unwound.
 
   Caveat for cleanup code: on Python 3.13 an asynchronous exception that lands
-  while a frame runs a `while` loop can skip that frame's own `except`,
-  `finally`, and `with` cleanup (`for` loops and blocking calls are not
-  affected; 3.11 and 3.12 behave). The exception still propagates, so the
-  callers of that frame, this scope included, see it. Cleanup that must run
-  after a cancel or timeout therefore belongs in a frame that contains no
-  `while` loop and calls the looping code, as the SQLite rollback in
-  tools/query.py does.
+  on a loop back-edge (`while` or `for`, e.g., when a loop body ends with an
+  `if` branch) can skip that frame's own `except`, `finally`, and `with`
+  cleanup (blocking calls are not affected; 3.11 and 3.12 behave). The
+  exception still propagates, so the callers of that frame, this scope
+  included, see it. Cleanup that must run after a cancel or timeout therefore
+  belongs in a loop-free frame that calls the looping code, as the SQLite
+  write transactions in tools/query.py do.
 
   Args:
     token: Token whose cancellation interrupts the scope, or None.

@@ -240,6 +240,37 @@ def _rollback_if_open(conn: sqlite3.Connection) -> None:
       return
 
 
+def _run_write_transaction(
+    conn: sqlite3.Connection,
+    body: Callable[[sqlite3.Connection], None],
+) -> None:
+  """Runs `body(conn)` inside an interrupt-safe BEGIN/COMMIT write transaction.
+
+  Kept free of loops in the `with`/`try` block: on Python 3.13 an asynchronous
+  exception landing on a conditional loop back-edge in `body` skips `body`'s
+  own cleanup, so `interruptible_sqlite` and the `finally` rollback must live
+  in this outer frame.
+  """
+  with interruptible_sqlite(conn):
+    try:
+      conn.execute("BEGIN TRANSACTION")
+      body(conn)
+      conn.execute("COMMIT")
+    finally:
+      # Repeat the rollback until it completes: an interrupt pending from
+      # PyThreadState_SetAsyncExc fires on the first Python call it meets.
+      late_interrupt: BaseException | None = None
+      while True:
+        try:
+          _rollback_if_open(conn)
+          break
+        # pylint: disable-next=broad-exception-caught
+        except BaseException as exc:
+          late_interrupt = exc
+      if late_interrupt is not None:
+        raise late_interrupt
+
+
 class SQLiteConnectionLocal(threading.local):
   """A thread-local container that tracks SQLite connections.
 
@@ -566,53 +597,36 @@ def _check_and_migrate_db(conn: sqlite3.Connection) -> None:
           hex(stored_min_ea) if stored_min_ea is not None else "None",
           hex(_image_min_ea),
       )
-      with interruptible_sqlite(conn):
-        migrated = False
-        try:
-          conn.execute("BEGIN TRANSACTION")
-          entities = conn.execute(
-              "SELECT type, name FROM sqlite_master WHERE type IN ('table',"
-              " 'view') AND name NOT LIKE 'sqlite_%'"
-          ).fetchall()
 
-          for ent_type, name in entities:
-            if ent_type == "view":
-              conn.execute(f'DROP VIEW IF EXISTS "{name}"')
-            elif ent_type == "table":
-              conn.execute(f'DROP TABLE IF EXISTS "{name}"')
+      def _recreate_schema(rw_conn: sqlite3.Connection) -> None:
+        entities = rw_conn.execute(
+            "SELECT type, name FROM sqlite_master WHERE type IN ('table',"
+            " 'view') AND name NOT LIKE 'sqlite_%'"
+        ).fetchall()
 
-          conn.execute(f"PRAGMA user_version = {target_version}")
-          _set_stored_min_ea(conn, _image_min_ea)
-          _save_populated_tables(conn, ())
-          _ensure_empty_schemas(conn)
-          conn.execute("COMMIT")
-          migrated = True
-          _populated_tables.clear()
-          logging.info(
-              "Database re-created, version set to %d, image_min_ea recorded as"
-              " %s.",
-              target_version,
-              hex(_image_min_ea),
-          )
-        finally:
-          # Repeat the rollback until it completes: an interrupt pending from
-          # PyThreadState_SetAsyncExc fires on the first Python call it meets.
-          late_interrupt: BaseException | None = None
-          while True:
-            try:
-              _rollback_if_open(conn)
-              break
-            # pylint: disable-next=broad-exception-caught
-            except BaseException as exc:
-              late_interrupt = exc
-          # The interrupt, if any, has fired by now, so this decision is not
-          # cut short: log a failure unless it is the cancellation itself.
-          if not migrated and late_interrupt is None:
-            token = get_cancellation_token()
-            if token is None or not token.is_cancelled:
-              logging.exception("Failed to migrate database")
-          if late_interrupt is not None:
-            raise late_interrupt
+        for ent_type, name in entities:
+          if ent_type == "view":
+            rw_conn.execute(f'DROP VIEW IF EXISTS "{name}"')
+          elif ent_type == "table":
+            rw_conn.execute(f'DROP TABLE IF EXISTS "{name}"')
+
+        rw_conn.execute(f"PRAGMA user_version = {target_version}")
+        _set_stored_min_ea(rw_conn, _image_min_ea)
+        _save_populated_tables(rw_conn, ())
+        _ensure_empty_schemas(rw_conn)
+
+      try:
+        _run_write_transaction(conn, _recreate_schema)
+      except Exception:
+        logging.exception("Failed to migrate database")
+        raise
+      _populated_tables.clear()
+      logging.info(
+          "Database re-created, version set to %d, image_min_ea recorded as"
+          " %s.",
+          target_version,
+          hex(_image_min_ea),
+      )
     else:
       existing = _existing_canonical_names(conn)
       loaded = _load_populated_tables(conn)
@@ -687,58 +701,45 @@ def _recreate_and_insert(
     create_views: Iterable[tuple[str, str]] = (),
 ):
   """Recreates a table and inserts data atomically using the RW connection."""
+  marked: set[str] = set()
+
+  def _insert_rows(conn: sqlite3.Connection) -> None:
+    tmp_table = f"{table_name}_tmp"
+    conn.execute(f'DROP TABLE IF EXISTS "{tmp_table}"')
+    conn.execute(f'CREATE TABLE "{tmp_table}" ({schema})')
+
+    batch = []
+    placeholders = ", ".join(["?"] * column_count)
+    sql_insert = f'INSERT INTO "{tmp_table}" VALUES ({placeholders})'
+
+    for item in data:
+      batch.append(item)
+      if len(batch) >= batch_size:
+        conn.executemany(sql_insert, batch)
+        batch.clear()
+
+    if batch:
+      conn.executemany(sql_insert, batch)
+
+    for view_name in drop_views:
+      conn.execute(f'DROP VIEW IF EXISTS "{view_name}"')
+    conn.execute(f'DROP TABLE IF EXISTS "{table_name}"')
+    conn.execute(f'ALTER TABLE "{tmp_table}" RENAME TO "{table_name}"')
+    for index_ddl in indexes:
+      conn.execute(index_ddl)
+    for _, view_ddl in create_views:
+      conn.execute(view_ddl)
+
+    marked.update((
+        table_name.lower(),
+        *(name.lower() for name, _ in create_views),
+    ))
+    _save_populated_tables(conn, _populated_tables | marked)
+
   with _db_write_lock:
     conn = _get_rw_conn()
-    tmp_table = f"{table_name}_tmp"
-
-    with interruptible_sqlite(conn):
-      try:
-        conn.execute("BEGIN TRANSACTION")
-        conn.execute(f'DROP TABLE IF EXISTS "{tmp_table}"')
-        conn.execute(f'CREATE TABLE "{tmp_table}" ({schema})')
-
-        batch = []
-        placeholders = ", ".join(["?"] * column_count)
-        sql_insert = f'INSERT INTO "{tmp_table}" VALUES ({placeholders})'
-
-        for item in data:
-          batch.append(item)
-          if len(batch) >= batch_size:
-            conn.executemany(sql_insert, batch)
-            batch.clear()
-
-        if batch:
-          conn.executemany(sql_insert, batch)
-
-        for view_name in drop_views:
-          conn.execute(f'DROP VIEW IF EXISTS "{view_name}"')
-        conn.execute(f'DROP TABLE IF EXISTS "{table_name}"')
-        conn.execute(f'ALTER TABLE "{tmp_table}" RENAME TO "{table_name}"')
-        for index_ddl in indexes:
-          conn.execute(index_ddl)
-        for _, view_ddl in create_views:
-          conn.execute(view_ddl)
-
-        marked = {
-            table_name.lower(),
-            *(name.lower() for name, _ in create_views),
-        }
-        _save_populated_tables(conn, _populated_tables | marked)
-        conn.execute("COMMIT")
-        _populated_tables.update(marked)
-      finally:
-        # Repeat the rollback until it completes: an interrupt pending from
-        # PyThreadState_SetAsyncExc fires on the first Python call it meets.
-        late_interrupt: BaseException | None = None
-        while True:
-          try:
-            _rollback_if_open(conn)
-            break
-          # pylint: disable-next=broad-exception-caught
-          except BaseException as exc:
-            late_interrupt = exc
-        if late_interrupt is not None:
-          raise late_interrupt
+    _run_write_transaction(conn, _insert_rows)
+    _populated_tables.update(marked)
 
 
 def _is_table_populated(table_name: str) -> bool:
@@ -1040,42 +1041,29 @@ def refresh_local_types() -> None:
   """
   global _local_types_dirty
   rows = list(_iter_local_types_info())
+
+  def _apply_local_types(conn: sqlite3.Connection) -> None:
+    existing = {
+        ordinal: (name, declaration)
+        for ordinal, name, declaration in conn.execute(
+            "SELECT ordinal, name, declaration FROM local_types"
+        )
+    }
+    for ordinal, name, declaration in rows:
+      if existing.pop(ordinal, None) != (name, declaration):
+        conn.execute(
+            "INSERT OR REPLACE INTO local_types VALUES (?, ?, ?)",
+            (ordinal, name, declaration),
+        )
+    # The rows left in existing are types that IDA no longer has.
+    conn.executemany(
+        "DELETE FROM local_types WHERE ordinal = ?",
+        [(ordinal,) for ordinal in existing],
+    )
+
   with _db_write_lock:
     conn = _get_rw_conn()
-    with interruptible_sqlite(conn):
-      try:
-        conn.execute("BEGIN TRANSACTION")
-        existing = {
-            ordinal: (name, declaration)
-            for ordinal, name, declaration in conn.execute(
-                "SELECT ordinal, name, declaration FROM local_types"
-            )
-        }
-        for ordinal, name, declaration in rows:
-          if existing.pop(ordinal, None) != (name, declaration):
-            conn.execute(
-                "INSERT OR REPLACE INTO local_types VALUES (?, ?, ?)",
-                (ordinal, name, declaration),
-            )
-        # The rows left in existing are types that IDA no longer has.
-        conn.executemany(
-            "DELETE FROM local_types WHERE ordinal = ?",
-            [(ordinal,) for ordinal in existing],
-        )
-        conn.execute("COMMIT")
-      finally:
-        # Repeat the rollback until it completes: an interrupt pending from
-        # PyThreadState_SetAsyncExc fires on the first Python call it meets.
-        late_interrupt: BaseException | None = None
-        while True:
-          try:
-            _rollback_if_open(conn)
-            break
-          # pylint: disable-next=broad-exception-caught
-          except BaseException as exc:
-            late_interrupt = exc
-        if late_interrupt is not None:
-          raise late_interrupt
+    _run_write_transaction(conn, _apply_local_types)
   _local_types_dirty = False
 
 

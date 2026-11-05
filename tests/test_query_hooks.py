@@ -21,9 +21,11 @@
 """Unit tests for query database update hooks and worker synchronization."""
 
 import asyncio
+import dis
 import functools
 import importlib
 import inspect
+import logging
 import queue
 import sqlite3
 import sys
@@ -1948,6 +1950,176 @@ class TestAuthorizerTableExtraction(unittest.TestCase):
         query._get_ro_conn(), "SELECT name FROM local_types"
     )
     self.assertEqual(rows, [("new_t",)])
+
+  def test_write_transaction_frames_and_loop_cancellation_do_not_leak(self):
+    # pylint: disable=g-import-not-at-top
+    from ida_mcp.core.decorators import CancellationToken
+    from ida_mcp.core.decorators import cancellation_profile
+
+    # pylint: enable=g-import-not-at-top
+
+    # Python 3.13 omits exception-table entries on conditional loop back-edges,
+    # so frames holding _db_write_lock or interruptible_sqlite must not contain
+    # uncovered backward jumps.
+    if hasattr(dis, "_parse_exception_table"):
+      for fn in (
+          query._run_write_transaction,
+          query._check_and_migrate_db,
+          query._recreate_and_insert,
+          inspect.unwrap(query.refresh_local_types),
+      ):
+        co = fn.__code__
+        entries = list(dis._parse_exception_table(co))
+        handlers_at = lambda off, es=entries: [
+            e for e in es if e.start <= off < e.end
+        ]
+        uncovered = [
+            ins.offset
+            for ins in dis.get_instructions(co)
+            if "JUMP_BACKWARD" in ins.opname
+            and len(handlers_at(ins.offset)) < len(handlers_at(ins.argval))
+        ]
+        self.assertEqual(uncovered, [], co.co_name)
+
+    query.close_tables()
+    rw = query._get_rw_conn()
+    rows_data = [(i, f"t{i}", "int x;") for i in range(1, 30001)]
+    with query._db_write_lock:
+      rw.executemany("INSERT INTO local_types VALUES (?, ?, ?)", rows_data)
+      query._populated_tables.add("local_types")
+
+    for _ in range(8):
+      query._local_types_dirty = True
+      entered = threading.Event()
+      token = CancellationToken()
+
+      class _FirstRow:
+
+        def __eq__(self, _other, ev=entered):
+          ev.set()
+          return True
+
+      iter_rows = [(1, _FirstRow(), "int x;")] + rows_data[1:]
+
+      def run_refresh(tok=token):
+        with mock.patch.object(
+            query, "_iter_local_types_info", lambda r=iter_rows: iter(r)
+        ):
+          try:
+            with cancellation_profile(tok):
+              query.refresh_local_types.sync_call()
+          except BaseException:  # pylint: disable=broad-exception-caught
+            pass
+
+      t = threading.Thread(target=run_refresh, daemon=True)
+      t.start()
+      self.assertTrue(entered.wait(timeout=2.0))
+      token.cancel()
+      t.join(timeout=2.0)
+      self.assertFalse(t.is_alive())
+
+      acquired = query._db_write_lock.acquire(blocking=False)
+      self.assertTrue(acquired)
+      query._db_write_lock.release()
+      for conn in query._db_local.connections:
+        self.assertFalse(conn.in_transaction)
+
+    for _ in range(8):
+      entered = threading.Event()
+      token = CancellationToken()
+
+      def row_gen(ev=entered):
+        ev.set()
+        for i in range(30000):
+          yield (i, f"n{i}")
+
+      def run_insert(tok=token, gen=row_gen):
+        try:
+          with cancellation_profile(tok):
+            query._recreate_and_insert(
+                table_name="names",
+                schema=query.TABLE_SCHEMAS["names"],
+                data=gen(),
+                column_count=2,
+                batch_size=100000,
+            )
+        except BaseException:  # pylint: disable=broad-exception-caught
+          pass
+
+      t = threading.Thread(target=run_insert, daemon=True)
+      t.start()
+      self.assertTrue(entered.wait(timeout=2.0))
+      token.cancel()
+      t.join(timeout=2.0)
+      self.assertFalse(t.is_alive())
+
+      acquired = query._db_write_lock.acquire(blocking=False)
+      self.assertTrue(acquired)
+      query._db_write_lock.release()
+      for conn in query._db_local.connections:
+        self.assertFalse(conn.in_transaction)
+
+  def test_migration_logs_exception_failures_but_not_interrupts(self):
+    # pylint: disable=g-import-not-at-top
+    from ida_mcp.core.decorators import ToolTimeoutError
+    from ida_mcp.core.decorators import cancellation_profile
+
+    # pylint: enable=g-import-not-at-top
+
+    query.close_tables()
+    orig_ensure = query._ensure_empty_schemas
+
+    def cancel_mid_migration(conn):
+      orig_ensure(conn)
+      raise asyncio.CancelledError("cancelled during migration")
+
+    with self.assertNoLogs(level=logging.ERROR):
+      with mock.patch.object(
+          query, "_ensure_empty_schemas", side_effect=cancel_mid_migration
+      ):
+        with self.assertRaises(asyncio.CancelledError):
+          query._get_rw_conn()
+
+    def hang_mid_migration(conn):
+      orig_ensure(conn)
+      time.sleep(1.0)
+
+    timeout_errs: list[BaseException] = []
+
+    def run_timed_out_migration():
+      try:
+        with mock.patch.object(
+            query, "_ensure_empty_schemas", side_effect=hang_mid_migration
+        ):
+          with cancellation_profile(None, timeout=0.02):
+            query._get_rw_conn()
+      except BaseException as exc:  # pylint: disable=broad-exception-caught
+        timeout_errs.append(exc)
+
+    with self.assertNoLogs(level=logging.ERROR):
+      t = threading.Thread(target=run_timed_out_migration, daemon=True)
+      t.start()
+      t.join(timeout=2.0)
+    self.assertFalse(t.is_alive())
+    self.assertEqual(len(timeout_errs), 1)
+    self.assertIsInstance(timeout_errs[0], ToolTimeoutError)
+
+    def fail_mid_migration(conn):
+      orig_ensure(conn)
+      raise sqlite3.OperationalError("disk I/O error")
+
+    with self.assertLogs(level=logging.ERROR) as cm:
+      with mock.patch.object(
+          query, "_ensure_empty_schemas", side_effect=fail_mid_migration
+      ):
+        with self.assertRaisesRegex(sqlite3.OperationalError, "disk I/O error"):
+          query._get_rw_conn()
+    self.assertTrue(
+        any("Failed to migrate database" in msg for msg in cm.output)
+    )
+
+    rw = query._get_rw_conn()
+    self.assertFalse(rw.in_transaction)
 
   def test_gateway_intersect_and_commented_explain_rewrite(self):
     # pylint: disable=g-import-not-at-top
