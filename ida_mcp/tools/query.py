@@ -27,15 +27,18 @@ import dataclasses
 import functools
 import json
 import logging
+import os
 import pathlib
 import queue
 import re
+import shutil
 import signal
 import sqlite3
+import tempfile
 import threading
 import time
 import traceback
-from typing import Any, Callable, Iterable, Iterator, Tuple
+from typing import Any, Callable, Iterable, Iterator
 import weakref
 import ida_auto
 import ida_bytes
@@ -212,6 +215,31 @@ def interruptible_sqlite(conn: sqlite3.Connection):
       raise
 
 
+def _rollback_if_open(conn: sqlite3.Connection) -> None:
+  """Rolls back the transaction open on `conn`, if any.
+
+  A cancel that lands during cleanup interrupts the ROLLBACK itself; SQLite
+  resets the interrupt when the next statement starts, so a retry goes
+  through (bounded, in case interrupts keep coming). Any other SQLite error
+  ends the attempt: the transaction is gone already or the connection is
+  closed.
+
+  Callers run this in a loop that catches BaseException: an interrupt pending
+  from PyThreadState_SetAsyncExc may fire on any Python call, this one
+  included, and the rollback must still happen afterwards.
+  """
+  for _ in range(3):
+    try:
+      if not conn.in_transaction:
+        return
+      conn.execute("ROLLBACK")
+    except sqlite3.OperationalError as exc:
+      if getattr(exc, "sqlite_errorcode", None) != sqlite3.SQLITE_INTERRUPT:
+        return
+    except sqlite3.Error:
+      return
+
+
 class SQLiteConnectionLocal(threading.local):
   """A thread-local container that tracks SQLite connections.
 
@@ -300,9 +328,13 @@ class SQLiteConnectionLocal(threading.local):
       inst.close_all_connections()
 
 
-# Global SQLite connections (Shared Memory or Persistent)
+# Global SQLite connections (scratch file or persistent)
 _db_local = SQLiteConnectionLocal()
 _db_write_lock = threading.RLock()
+
+# Per-session directory holding the scratch database; see _get_db_path.
+_scratch_dir: pathlib.Path | None = None
+_scratch_dir_lock = threading.Lock()
 
 
 def _is_tid(n: int) -> bool:
@@ -334,16 +366,37 @@ def _ro_authorizer(action, arg1, arg2, dbname, source):
   return sqlite3.SQLITE_DENY
 
 
-def _get_db_path_and_uri() -> Tuple[str, bool]:
-  """Determines DB path and whether it's a URI."""
+def _get_db_path() -> tuple[str, bool]:
+  """Returns the SQLite database path and whether it outlives the session.
+
+  With sqlite_persistent the database lives next to the IDB. Otherwise it is
+  a scratch file in a per-session temporary directory, which close_tables
+  removes. Either way it is a file opened in WAL mode: a reader then sees the
+  last committed snapshot while a populator or the DB worker writes, whereas
+  a shared-cache memory database fails every concurrent reader with
+  SQLITE_LOCKED, which the busy handler cannot wait out.
+  """
+  global _scratch_dir
   if load_config().get("sqlite_persistent") and (
       idb_path := getattr(idaapi, "idb_path", None)
   ):
-    path = pathlib.Path(idb_path).with_suffix(".db")
-    return str(path), False
+    return str(pathlib.Path(idb_path).with_suffix(".db")), True
 
-  # Default to shared memory if not persistent
-  return "file:memdb?mode=memory&cache=shared", True
+  with _scratch_dir_lock:
+    if _scratch_dir is None:
+      _scratch_dir = pathlib.Path(
+          tempfile.mkdtemp(prefix=f"idamcp-{os.getpid()}-")
+      )
+    return str(_scratch_dir / "idamcp.db"), False
+
+
+def _remove_scratch_dir() -> None:
+  """Deletes the scratch database directory, if one was created."""
+  global _scratch_dir
+  with _scratch_dir_lock:
+    scratch_dir, _scratch_dir = _scratch_dir, None
+  if scratch_dir is not None:
+    shutil.rmtree(scratch_dir, ignore_errors=True)
 
 
 def _to_signed_64(val: int) -> int:
@@ -371,47 +424,30 @@ def _ea_range_clause(
   return f"{col} >= ? AND {col} < ?", (signed_start, signed_end)
 
 
-def _run_ro_with_lock_retry(fn):
-  """Runs a SQLite operation, retrying once under _db_write_lock if locked.
-
-  Shared-cache readers get "database table/schema is locked" while the RW
-  connection holds a write transaction; retrying under the lock waits for it.
-  """
-  try:
-    return fn()
-  except sqlite3.OperationalError as e:
-    if "locked" not in str(e).lower():
-      raise
-    with _db_write_lock:
-      return fn()
-
-
-def _create_connection(read_only: bool = False):
+def _create_connection(
+    read_only: bool = False, *, unlink_stale_wal: bool = False
+):
   """Creates a SQLite connection."""
-  path, is_uri = _get_db_path_and_uri()
-  if not is_uri and not pathlib.Path(path).exists():
+  path, persistent = _get_db_path()
+  if unlink_stale_wal and not pathlib.Path(path).exists():
     for suffix in ("-wal", "-shm"):
       aux_file = pathlib.Path(path + suffix)
       if aux_file.exists():
         with contextlib.suppress(OSError):
           aux_file.unlink()
 
-  conn = sqlite3.connect(
-      path, uri=is_uri, isolation_level=None, check_same_thread=False
-  )
+  conn = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
   try:
+    # Performance pragmas
+    conn.execute("PRAGMA cache_size = -65536")  # 64MB page cache
+    conn.execute("PRAGMA journal_mode = WAL")  # Readers never wait for writers
+    # Only the persistent database has to survive a crash.
+    conn.execute(f"PRAGMA synchronous = {'NORMAL' if persistent else 'OFF'}")
+    conn.execute("PRAGMA mmap_size = 4294967296")  # 4GB memory-mapped I/O
+    # A populator commits one transaction as large as its table, which the
+    # WAL file keeps until the next checkpoint truncates it to this size.
+    conn.execute("PRAGMA journal_size_limit = 67108864")  # 64MB
 
-    def _configure_pragmas() -> None:
-      # Performance pragmas
-      conn.execute("PRAGMA cache_size = -65536")  # 64MB page cache
-      if not is_uri:
-        conn.execute("PRAGMA journal_mode = WAL")  # Non-blocking concurrent I/O
-        conn.execute(
-            "PRAGMA synchronous = NORMAL"
-        )  # Fast, crash-safe sync in WAL
-        conn.execute("PRAGMA mmap_size = 4294967296")  # 4GB memory-mapped I/O
-
-    _run_ro_with_lock_retry(_configure_pragmas)
     if read_only:
       conn.set_authorizer(_ro_authorizer)
   except BaseException:
@@ -530,35 +566,53 @@ def _check_and_migrate_db(conn: sqlite3.Connection) -> None:
           hex(stored_min_ea) if stored_min_ea is not None else "None",
           hex(_image_min_ea),
       )
-      conn.execute("BEGIN TRANSACTION")
-      try:
-        entities = conn.execute(
-            "SELECT type, name FROM sqlite_master WHERE type IN ('table',"
-            " 'view') AND name NOT LIKE 'sqlite_%'"
-        ).fetchall()
+      with interruptible_sqlite(conn):
+        migrated = False
+        try:
+          conn.execute("BEGIN TRANSACTION")
+          entities = conn.execute(
+              "SELECT type, name FROM sqlite_master WHERE type IN ('table',"
+              " 'view') AND name NOT LIKE 'sqlite_%'"
+          ).fetchall()
 
-        for ent_type, name in entities:
-          if ent_type == "view":
-            conn.execute(f'DROP VIEW IF EXISTS "{name}"')
-          elif ent_type == "table":
-            conn.execute(f'DROP TABLE IF EXISTS "{name}"')
+          for ent_type, name in entities:
+            if ent_type == "view":
+              conn.execute(f'DROP VIEW IF EXISTS "{name}"')
+            elif ent_type == "table":
+              conn.execute(f'DROP TABLE IF EXISTS "{name}"')
 
-        conn.execute(f"PRAGMA user_version = {target_version}")
-        _set_stored_min_ea(conn, _image_min_ea)
-        _save_populated_tables(conn, ())
-        _ensure_empty_schemas(conn)
-        conn.execute("COMMIT")
-        _populated_tables.clear()
-        logging.info(
-            "Database re-created, version set to %d, image_min_ea recorded as"
-            " %s.",
-            target_version,
-            hex(_image_min_ea),
-        )
-      except Exception:
-        conn.execute("ROLLBACK")
-        logging.exception("Failed to migrate database")
-        raise
+          conn.execute(f"PRAGMA user_version = {target_version}")
+          _set_stored_min_ea(conn, _image_min_ea)
+          _save_populated_tables(conn, ())
+          _ensure_empty_schemas(conn)
+          conn.execute("COMMIT")
+          migrated = True
+          _populated_tables.clear()
+          logging.info(
+              "Database re-created, version set to %d, image_min_ea recorded as"
+              " %s.",
+              target_version,
+              hex(_image_min_ea),
+          )
+        finally:
+          # Repeat the rollback until it completes: an interrupt pending from
+          # PyThreadState_SetAsyncExc fires on the first Python call it meets.
+          late_interrupt: BaseException | None = None
+          while True:
+            try:
+              _rollback_if_open(conn)
+              break
+            # pylint: disable-next=broad-exception-caught
+            except BaseException as exc:
+              late_interrupt = exc
+          # The interrupt, if any, has fired by now, so this decision is not
+          # cut short: log a failure unless it is the cancellation itself.
+          if not migrated and late_interrupt is None:
+            token = get_cancellation_token()
+            if token is None or not token.is_cancelled:
+              logging.exception("Failed to migrate database")
+          if late_interrupt is not None:
+            raise late_interrupt
     else:
       existing = _existing_canonical_names(conn)
       loaded = _load_populated_tables(conn)
@@ -575,23 +629,30 @@ def _check_and_migrate_db(conn: sqlite3.Connection) -> None:
 def _get_rw_conn():
   """Returns a read-write SQLite connection."""
   global _db_version_checked
-  if not hasattr(_db_local, "rw_conn"):
-    _db_local.rw_conn = _create_connection(read_only=False)
+  db_local = _db_local
   if not _db_version_checked:
     with _db_write_lock:
+      db_local = _db_local
       if not _db_version_checked:
-        _check_and_migrate_db(_db_local.rw_conn)
+        if not hasattr(db_local, "rw_conn"):
+          db_local.rw_conn = _create_connection(
+              read_only=False, unlink_stale_wal=True
+          )
+        _check_and_migrate_db(db_local.rw_conn)
         _db_version_checked = True
-  return _db_local.rw_conn
+  if not hasattr(db_local, "rw_conn"):
+    db_local.rw_conn = _create_connection(read_only=False)
+  return db_local.rw_conn
 
 
 def _get_ro_conn():
   """Returns a read-only SQLite connection enforced by an authorizer."""
+  db_local = _db_local
   if not _db_version_checked:
     _get_rw_conn()
-  if not hasattr(_db_local, "ro_conn"):
-    _db_local.ro_conn = _create_connection(read_only=True)
-  return _db_local.ro_conn
+  if not hasattr(db_local, "ro_conn"):
+    db_local.ro_conn = _create_connection(read_only=True)
+  return db_local.ro_conn
 
 
 # Xref type mapping
@@ -631,8 +692,8 @@ def _recreate_and_insert(
     tmp_table = f"{table_name}_tmp"
 
     with interruptible_sqlite(conn):
-      conn.execute("BEGIN TRANSACTION")
       try:
+        conn.execute("BEGIN TRANSACTION")
         conn.execute(f'DROP TABLE IF EXISTS "{tmp_table}"')
         conn.execute(f'CREATE TABLE "{tmp_table}" ({schema})')
 
@@ -665,18 +726,19 @@ def _recreate_and_insert(
         _save_populated_tables(conn, _populated_tables | marked)
         conn.execute("COMMIT")
         _populated_tables.update(marked)
-      except (Exception, asyncio.CancelledError):
-        conn.execute("ROLLBACK")
-        raise
-
       finally:
-        # We check conn.in_transaction in case the profile function raises
-        # asyncio.CancelledError right before conn.execute, preventing
-        # the ROLLBACK action from completing.
-
-        if conn.in_transaction:
-          with contextlib.suppress(sqlite3.Error):
-            conn.execute("ROLLBACK")
+        # Repeat the rollback until it completes: an interrupt pending from
+        # PyThreadState_SetAsyncExc fires on the first Python call it meets.
+        late_interrupt: BaseException | None = None
+        while True:
+          try:
+            _rollback_if_open(conn)
+            break
+          # pylint: disable-next=broad-exception-caught
+          except BaseException as exc:
+            late_interrupt = exc
+        if late_interrupt is not None:
+          raise late_interrupt
 
 
 def _is_table_populated(table_name: str) -> bool:
@@ -956,7 +1018,6 @@ def _iter_local_types_info() -> Iterator[tuple[int, str, str | None]]:
 def populate_local_types():
   """Populates the local_types table."""
   global _local_types_dirty
-  _local_types_dirty = False
   _recreate_and_insert(
       "local_types",
       TABLE_SCHEMAS["local_types"],
@@ -964,6 +1025,7 @@ def populate_local_types():
       column_count=3,
       indexes=TABLE_INDEXES["local_types"],
   )
+  _local_types_dirty = False
 
 
 @_time_populator
@@ -977,35 +1039,44 @@ def refresh_local_types() -> None:
   reading the types and writing them.
   """
   global _local_types_dirty
-  _local_types_dirty = False
   rows = list(_iter_local_types_info())
   with _db_write_lock:
     conn = _get_rw_conn()
-    conn.execute("BEGIN TRANSACTION")
-    try:
-      existing = {
-          ordinal: (name, declaration)
-          for ordinal, name, declaration in conn.execute(
-              "SELECT ordinal, name, declaration FROM local_types"
-          )
-      }
-      for ordinal, name, declaration in rows:
-        if existing.pop(ordinal, None) != (name, declaration):
-          conn.execute(
-              "INSERT OR REPLACE INTO local_types VALUES (?, ?, ?)",
-              (ordinal, name, declaration),
-          )
-      # The rows left in existing are types that IDA no longer has.
-      conn.executemany(
-          "DELETE FROM local_types WHERE ordinal = ?",
-          [(ordinal,) for ordinal in existing],
-      )
-      conn.execute("COMMIT")
-    except Exception:
-      if conn.in_transaction:
-        with contextlib.suppress(sqlite3.Error):
-          conn.execute("ROLLBACK")
-      raise
+    with interruptible_sqlite(conn):
+      try:
+        conn.execute("BEGIN TRANSACTION")
+        existing = {
+            ordinal: (name, declaration)
+            for ordinal, name, declaration in conn.execute(
+                "SELECT ordinal, name, declaration FROM local_types"
+            )
+        }
+        for ordinal, name, declaration in rows:
+          if existing.pop(ordinal, None) != (name, declaration):
+            conn.execute(
+                "INSERT OR REPLACE INTO local_types VALUES (?, ?, ?)",
+                (ordinal, name, declaration),
+            )
+        # The rows left in existing are types that IDA no longer has.
+        conn.executemany(
+            "DELETE FROM local_types WHERE ordinal = ?",
+            [(ordinal,) for ordinal in existing],
+        )
+        conn.execute("COMMIT")
+      finally:
+        # Repeat the rollback until it completes: an interrupt pending from
+        # PyThreadState_SetAsyncExc fires on the first Python call it meets.
+        late_interrupt: BaseException | None = None
+        while True:
+          try:
+            _rollback_if_open(conn)
+            break
+          # pylint: disable-next=broad-exception-caught
+          except BaseException as exc:
+            late_interrupt = exc
+        if late_interrupt is not None:
+          raise late_interrupt
+  _local_types_dirty = False
 
 
 @_time_populator
@@ -1137,6 +1208,13 @@ POPULATORS = {
     "entries": populate_entries,
 }
 
+# One lock per table, held by _refresh_table while it populates or refreshes
+# the table for a query. Concurrent queries that need the same table wait here
+# and then find it ready instead of each running the populator again.
+_refresh_locks: dict[str, threading.Lock] = {
+    name: threading.Lock() for name in POPULATORS
+}
+
 _strings_dirty = False
 # Set when IDA reports a local type change without saying which type changed;
 # sql_query then calls refresh_local_types before it reads local_types.
@@ -1157,19 +1235,26 @@ def _execute_ro(
 def _refresh_table(
     table_name: str, entries_check_enabled: Callable[[], bool]
 ) -> None:
-  """Populates or refreshes `table_name` so that a query can read it."""
-  if not _is_table_populated(table_name):
-    POPULATORS[table_name]()
-  elif table_name == "strings" and _strings_dirty:
-    POPULATORS[table_name]()
-  elif table_name == "local_types" and _local_types_dirty:
-    refresh_local_types()
-  elif (
-      table_name == "entries"
-      and entries_check_enabled()
-      and _is_entries_dirty()
-  ):
-    populate_entries()
+  """Populates or refreshes `table_name` so that a query can read it.
+
+  The checks run under the table's refresh lock, so a query that waited for
+  another query's populator re-checks and skips the work that was just done.
+  Nothing on IDA's main thread or holding _db_write_lock takes this lock, so a
+  populator can wait for both while holding it.
+  """
+  with _refresh_locks[table_name]:
+    if not _is_table_populated(table_name):
+      POPULATORS[table_name]()
+    elif table_name == "strings" and _strings_dirty:
+      POPULATORS[table_name]()
+    elif table_name == "local_types" and _local_types_dirty:
+      refresh_local_types()
+    elif (
+        table_name == "entries"
+        and entries_check_enabled()
+        and _is_entries_dirty()
+    ):
+      populate_entries()
 
 
 def _missing_populator_table(message: str) -> str | None:
@@ -1207,15 +1292,11 @@ def _check_compiles(
   touches no table.
   """
   explain_sql = sql if _EXPLAIN_PREFIX.match(sql) else f"EXPLAIN {sql}"
-
-  def _compile_once() -> None:
-    with interruptible_sqlite(conn):
-      with contextlib.closing(conn.execute(explain_sql)):
-        pass
-
   while True:
     try:
-      _run_ro_with_lock_retry(_compile_once)
+      with interruptible_sqlite(conn):
+        with contextlib.closing(conn.execute(explain_sql)):
+          pass
       return
     except sqlite3.OperationalError as e:
       missing = _missing_populator_table(str(e))
@@ -1274,7 +1355,7 @@ def _fetch_ro(
     pending.clear()
     conn.set_authorizer(_authorizer)
     try:
-      return _run_ro_with_lock_retry(functools.partial(_execute_ro, conn, sql))
+      return _execute_ro(conn, sql)
     except sqlite3.OperationalError as e:
       missing = _missing_populator_table(str(e))
       if missing is None or missing in healed:
@@ -2144,18 +2225,18 @@ def close_tables() -> None:
       logging.exception("Could not restore signal handler for %s: %s", sig, e)
   _handlers.clear()
 
-  # 5. Close all SQLite connections across all threads
+  # 5. Close all SQLite connections across all threads and reset module state
+  # before deleting the scratch database (Windows cannot delete open files).
   with _db_write_lock:
     _db_local.close_all_connections()
-  _db_local = SQLiteConnectionLocal()
-
-  # 6. Reset all module state
-  _populated_tables.clear()
-  _db_initialized = False
-  _db_version_checked = False
-  _strings_dirty = False
-  _comments_dirty = False
-  _local_types_dirty = False
-  _entries_fingerprint = None
-  _image_min_ea = 0
-  _is_rebasing = False
+    _db_local = SQLiteConnectionLocal()
+    _populated_tables.clear()
+    _db_initialized = False
+    _db_version_checked = False
+    _strings_dirty = False
+    _comments_dirty = False
+    _local_types_dirty = False
+    _entries_fingerprint = None
+    _image_min_ea = 0
+    _is_rebasing = False
+  _remove_scratch_dir()

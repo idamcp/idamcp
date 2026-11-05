@@ -789,18 +789,30 @@ class TestCancellationProfileReuse(unittest.TestCase):
 
   def test_cancellation_profile_token_mismatch_stacking(self):
     """Verifies nested calls with different tokens stack and restore."""
+    token_ctx = CancellationToken()
     token1 = CancellationToken()
     token2 = CancellationToken()
 
-    with cancellation_profile(token1):
-      self.assertIs(getattr(_cancel_tls, "active_token", None), token1)
+    var_tok = cancellation_token_var.set(token_ctx)
+    try:
+      self.assertIs(decorators.get_cancellation_token(), token_ctx)
+      with cancellation_profile(token1):
+        self.assertIs(getattr(_cancel_tls, "active_token", None), token1)
+        self.assertIs(decorators.get_cancellation_token(), token1)
 
-      with cancellation_profile(token2):
-        self.assertIs(getattr(_cancel_tls, "active_token", None), token2)
+        with cancellation_profile(token2):
+          self.assertIs(getattr(_cancel_tls, "active_token", None), token2)
+          self.assertIs(decorators.get_cancellation_token(), token2)
 
-      self.assertIs(getattr(_cancel_tls, "active_token", None), token1)
+        self.assertIs(getattr(_cancel_tls, "active_token", None), token1)
+        self.assertIs(decorators.get_cancellation_token(), token1)
 
-    self.assertIsNone(getattr(_cancel_tls, "active_token", None))
+      self.assertIsNone(getattr(_cancel_tls, "active_token", None))
+      self.assertIs(decorators.get_cancellation_token(), token_ctx)
+    finally:
+      cancellation_token_var.reset(var_tok)
+
+    self.assertIsNone(decorators.get_cancellation_token())
 
   def test_nested_idatools_profile_reuse(self):
     """Verifies nested IDA tools retain the outer cancellation token."""

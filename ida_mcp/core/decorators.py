@@ -239,9 +239,14 @@ cancellation_token_var: contextvars.ContextVar[CancellationToken | None] = (
 cancel_event_var = cancellation_token_var
 
 
+_cancel_tls = threading.local()
+
+
 def get_cancellation_token() -> CancellationToken | None:
   """Retrieves the active cancellation token for the current context."""
-  return cancellation_token_var.get()
+  return getattr(_cancel_tls, "active_token", None) or (
+      cancellation_token_var.get()
+  )
 
 
 @contextlib.contextmanager
@@ -262,8 +267,6 @@ def register_cancel_callback(cb: Callable[[], Any]):
 _set_async_exc = ctypes.pythonapi.PyThreadState_SetAsyncExc
 _set_async_exc.argtypes = (ctypes.c_ulong, ctypes.py_object)
 _set_async_exc.restype = ctypes.c_int
-
-_cancel_tls = threading.local()
 
 
 def _inject_async_exc(tid: int, exc_type: type[BaseException]) -> int:
@@ -306,6 +309,15 @@ def cancellation_profile(
   an interrupt was swallowed; the scope then raises ToolTimeoutError, unless the
   token was cancelled as well. Its message ends with the notes (__notes__) that
   the interrupted code added to the interrupt while it unwound.
+
+  Caveat for cleanup code: on Python 3.13 an asynchronous exception that lands
+  while a frame runs a `while` loop can skip that frame's own `except`,
+  `finally`, and `with` cleanup (`for` loops and blocking calls are not
+  affected; 3.11 and 3.12 behave). The exception still propagates, so the
+  callers of that frame, this scope included, see it. Cleanup that must run
+  after a cancel or timeout therefore belongs in a frame that contains no
+  `while` loop and calls the looping code, as the SQLite rollback in
+  tools/query.py does.
 
   Args:
     token: Token whose cancellation interrupts the scope, or None.

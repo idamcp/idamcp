@@ -25,8 +25,11 @@ import functools
 import importlib
 import inspect
 import queue
+import sqlite3
 import sys
 import threading
+import time
+from typing import Any
 import unittest
 from unittest import mock
 
@@ -1358,7 +1361,8 @@ class TestAuthorizerTableExtraction(unittest.TestCase):
     conn.set_trace_callback(statements.append)
     try:
       # populate_names swaps the table (DROP + RENAME) on the RW connection
-      # between the denied compile and the retry, in shared-cache mode.
+      # between the denied compile and the retry, which re-prepares the
+      # statement against the new schema.
       with mock.patch.object(
           query.idautils, "Names", return_value=[(0x1000, "f")]
       ):
@@ -1371,6 +1375,43 @@ class TestAuthorizerTableExtraction(unittest.TestCase):
     # program (the statement trace fires from OP_Init), so the statement is
     # seen running exactly once.
     self.assertEqual(statements, ["SELECT name FROM names"])
+
+  def test_concurrent_first_reads_populate_once(self):
+    # Queries whose first read of a table arrives while another query is
+    # still populating it must wait for that run and reuse it: on a large
+    # binary a populator takes seconds on IDA's main thread.
+    populator_threads: list[int] = []
+
+    def fake_populate_names():
+      populator_threads.append(threading.get_ident())
+      time.sleep(0.2)  # Let every other thread reach the refresh lock.
+      conn = query._get_rw_conn()
+      with query._db_write_lock:
+        conn.execute("INSERT INTO names VALUES (4096, 'f')")
+        query._populated_tables.add("names")
+
+    results: list[list[tuple[Any, ...]]] = []
+    errors: list[Exception] = []
+
+    def read_names():
+      try:
+        rows, _ = query._fetch_ro(
+            query._get_ro_conn(), "SELECT name FROM names"
+        )
+        results.append(rows)
+      except Exception as e:  # pylint: disable=broad-exception-caught
+        errors.append(e)
+
+    with mock.patch.dict(query.POPULATORS, {"names": fake_populate_names}):
+      threads = [threading.Thread(target=read_names) for _ in range(16)]
+      for t in threads:
+        t.start()
+      for t in threads:
+        t.join(timeout=10)
+
+    self.assertEqual(errors, [])
+    self.assertEqual(len(populator_threads), 1)
+    self.assertEqual(results, [[("f",)]] * 16)
 
   def test_ro_authorizer_blocks_unsafe_functions_and_pragmas(self):
     with mock.patch.object(query, "_db_initialized", True):
@@ -1566,48 +1607,347 @@ class TestAuthorizerTableExtraction(unittest.TestCase):
     self.assertNotIn("error", joined[0])
     self.assertEqual(joined[0]["rows"], [{"name": "fn1"}])
 
-  def test_check_compiles_retries_when_shared_cache_schema_is_locked(self):
-    # Exercise both: (1) creating a fresh RO connection while DDL holds the
-    # shared-cache schema lock, and (2) _check_compiles on an existing RO
-    # connection while DDL holds the shared-cache schema lock.
+  def test_reader_is_not_blocked_by_an_open_write_transaction(self):
+    # A WAL reader sees the last committed snapshot, so the query runs while
+    # the RW connection holds a transaction that already changed the schema,
+    # whether the RO connection is created during that transaction or before
+    # it. The writer holds _db_write_lock the whole time and commits only
+    # once the query has returned; a reader that waited for it would see the
+    # committed row.
     for prewarm_ro in (False, True):
       with self.subTest(prewarm_ro=prewarm_ro):
         query.close_tables()
-        conn = query._get_rw_conn()
-        with query._db_write_lock:
-          query._check_and_migrate_db(conn)
+        query._get_rw_conn()
         if prewarm_ro:
           query._get_ro_conn()
 
-        locked_entered = threading.Event()
-        release_lock = threading.Event()
+        entered = threading.Event()
+        release = threading.Event()
 
-        def hold_ddl_lock(entered=locked_entered, release=release_lock):
+        def hold_write_transaction(entered=entered, release=release):
           rw = query._get_rw_conn()
           with query._db_write_lock:
             rw.execute("BEGIN TRANSACTION")
             rw.execute("CREATE TABLE _lock_probe (x INT)")
+            rw.execute("INSERT INTO names VALUES (4096, 'pending')")
             entered.set()
-            release.wait(timeout=5.0)
-            rw.execute("ROLLBACK")
+            release.wait(timeout=10.0)
+            rw.execute("COMMIT")
 
-        holder = threading.Thread(target=hold_ddl_lock, daemon=True)
+        holder = threading.Thread(target=hold_write_transaction, daemon=True)
         holder.start()
-        self.assertTrue(locked_entered.wait(timeout=2.0))
-
-        releaser = threading.Timer(0.05, release_lock.set)
-        releaser.start()
+        self.assertTrue(entered.wait(timeout=2.0))
         try:
           result, populated = self._run_with_recording_populators(
               "SELECT name FROM names"
           )
         finally:
-          release_lock.set()
-          releaser.cancel()
+          release.set()
           holder.join(timeout=2.0)
 
         self.assertNotIn("error", result)
+        self.assertEqual(result["rows"], [])
         self.assertEqual(populated, ["names"])
+
+  def test_concurrent_first_connections_initialize_wal_safely(self):
+    # Simultaneous _get_rw_conn and _get_ro_conn calls on a fresh database
+    # must not deadlock switching to WAL mode or unlink live -wal/-shm files.
+    for seed_stale_wal in (False, True):
+      for _ in range(5):
+        query.close_tables()
+        if seed_stale_wal:
+          db_path, _ = query._get_db_path()
+          for suffix in ("-wal", "-shm"):
+            with open(db_path + suffix, "wb") as f:
+              f.write(b"stale")
+
+        barrier = threading.Barrier(6)
+        errors: list[BaseException] = []
+        table_sets: list[set[str]] = []
+        lock = threading.Lock()
+
+        def worker(idx: int, bar=barrier, errs=errors, seen=table_sets):
+          try:
+            bar.wait(timeout=5.0)
+            if idx % 2 == 0:
+              conn = query._get_rw_conn()
+            else:
+              conn = query._get_ro_conn()
+            rows = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+            with lock:
+              seen.append({r[0] for r in rows})
+          except BaseException as exc:  # pylint: disable=broad-exception-caught
+            with lock:
+              errs.append(exc)
+
+        threads = [
+            threading.Thread(target=worker, args=(i,), daemon=True)
+            for i in range(6)
+        ]
+        for t in threads:
+          t.start()
+        for t in threads:
+          t.join(timeout=5.0)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(len(table_sets), 6)
+        for names in table_sets:
+          self.assertTrue(set(query.TABLE_SCHEMAS).issubset(names))
+
+  def test_concurrent_dirty_local_types_reads_wait_for_commit(self):
+    # _local_types_dirty must stay set until refresh_local_types commits;
+    # otherwise a concurrent WAL reader skips _refresh_locks["local_types"]
+    # and reads the pre-refresh snapshot.
+    rw = query._get_rw_conn()
+    with query._db_write_lock:
+      rw.execute("INSERT INTO local_types VALUES (1, 'old_t', 'struct old_t;')")
+      query._populated_tables.add("local_types")
+    query._local_types_dirty = True
+
+    in_refresh = threading.Event()
+    allow_finish = threading.Event()
+    calls: list[int] = []
+
+    def slow_iter():
+      calls.append(1)
+      in_refresh.set()
+      allow_finish.wait(timeout=5.0)
+      yield (1, "new_t", "struct new_t;")
+
+    results: list[list[tuple[Any, ...]]] = []
+    errors: list[BaseException] = []
+
+    def read_local_types():
+      try:
+        rows, _ = query._fetch_ro(
+            query._get_ro_conn(), "SELECT name FROM local_types"
+        )
+        results.append(rows)
+      except BaseException as exc:  # pylint: disable=broad-exception-caught
+        errors.append(exc)
+
+    with mock.patch.object(query, "_iter_local_types_info", slow_iter):
+      t1 = threading.Thread(target=read_local_types, daemon=True)
+      t2 = threading.Thread(target=read_local_types, daemon=True)
+      t1.start()
+      self.assertTrue(in_refresh.wait(timeout=2.0))
+      t2.start()
+      time.sleep(0.05)
+      self.assertTrue(t2.is_alive())
+      allow_finish.set()
+      t1.join(timeout=5.0)
+      t2.join(timeout=5.0)
+
+    self.assertEqual(errors, [])
+    self.assertEqual(len(calls), 1)
+    self.assertEqual(results, [[("new_t",)], [("new_t",)]])
+    self.assertFalse(query._local_types_dirty)
+
+  def test_cancelled_migration_and_refresh_roll_back_wal_write_lock(self):
+    # CancelledError inherits from BaseException, not Exception; an aborted
+    # write transaction must still roll back so its thread-local rw_conn does
+    # not keep holding SQLite's WAL write lock.
+    query.close_tables()
+    orig_ensure = query._ensure_empty_schemas
+
+    def cancel_mid_migration(conn):
+      orig_ensure(conn)
+      raise asyncio.CancelledError("cancelled during migration")
+
+    t1_errors: list[BaseException] = []
+
+    def run_cancelled_init():
+      try:
+        with mock.patch.object(
+            query, "_ensure_empty_schemas", side_effect=cancel_mid_migration
+        ):
+          query._get_ro_conn()
+      except BaseException as exc:  # pylint: disable=broad-exception-caught
+        t1_errors.append(exc)
+
+    t1 = threading.Thread(target=run_cancelled_init, daemon=True)
+    t1.start()
+    t1.join(timeout=5.0)
+    self.assertEqual(len(t1_errors), 1)
+    self.assertIsInstance(t1_errors[0], asyncio.CancelledError)
+
+    # A fresh thread must be able to initialize and write without hitting
+    # OperationalError("database is locked").
+    rw = query._get_rw_conn()
+    with query._db_write_lock:
+      rw.execute("INSERT INTO local_types VALUES (1, 'old_t', 'struct old_t;')")
+      query._populated_tables.add("local_types")
+    query._local_types_dirty = True
+
+    class _CancelOnBind:
+
+      def __conform__(self, _protocol):
+        raise asyncio.CancelledError("cancelled mid-refresh")
+
+    def cancelling_iter():
+      yield (1, "mid_t", "struct mid_t;")
+      yield (2, _CancelOnBind(), "struct never;")
+
+    t2_errors: list[BaseException] = []
+
+    def run_cancelled_refresh():
+      try:
+        with mock.patch.object(
+            query, "_iter_local_types_info", cancelling_iter
+        ):
+          query._fetch_ro(query._get_ro_conn(), "SELECT name FROM local_types")
+      except BaseException as exc:  # pylint: disable=broad-exception-caught
+        t2_errors.append(exc)
+
+    t2 = threading.Thread(target=run_cancelled_refresh, daemon=True)
+    t2.start()
+    t2.join(timeout=5.0)
+    self.assertEqual(len(t2_errors), 1)
+    self.assertIsInstance(t2_errors[0], asyncio.CancelledError)
+    self.assertTrue(query._local_types_dirty)
+
+    with mock.patch.object(
+        query,
+        "_iter_local_types_info",
+        lambda: iter([(1, "final_t", "struct final_t;")]),
+    ):
+      rows, _ = query._fetch_ro(
+          query._get_ro_conn(), "SELECT name FROM local_types"
+      )
+    self.assertEqual(rows, [("final_t",)])
+    self.assertFalse(query._local_types_dirty)
+
+  def test_rollback_if_open_retries_only_an_interrupted_rollback(self):
+    # A cancel that lands during cleanup interrupts the ROLLBACK itself; the
+    # helper must try again, but must not spin on other errors or on a
+    # connection that is already closed.
+    interrupted = sqlite3.OperationalError("interrupted")
+    interrupted.sqlite_errorcode = sqlite3.SQLITE_INTERRUPT
+
+    class FakeConn:
+
+      def __init__(self, failures):
+        self.failures = list(failures)
+        self.in_transaction = True
+        self.rollbacks = 0
+
+      def execute(self, sql):
+        assert sql == "ROLLBACK"
+        self.rollbacks += 1
+        if self.failures:
+          raise self.failures.pop(0)
+        self.in_transaction = False
+
+    conn = FakeConn([interrupted, interrupted])
+    query._rollback_if_open(conn)
+    self.assertEqual((conn.rollbacks, conn.in_transaction), (3, False))
+
+    conn = FakeConn([sqlite3.OperationalError("disk I/O error")])
+    query._rollback_if_open(conn)
+    self.assertEqual((conn.rollbacks, conn.in_transaction), (1, True))
+
+    closed = sqlite3.connect(":memory:")
+    closed.close()
+    query._rollback_if_open(closed)  # in_transaction raises; must return
+
+    real = sqlite3.connect(":memory:", isolation_level=None)
+    real.execute("BEGIN")
+    query._rollback_if_open(real)
+    self.assertFalse(real.in_transaction)
+    real.close()
+
+  def test_dual_cancellation_during_select_in_write_txn_rolls_back(self):
+    # pylint: disable=g-import-not-at-top
+    from ida_mcp.core.decorators import CancellationToken
+    from ida_mcp.core.decorators import cancellation_profile
+    from ida_mcp.core.decorators import cancellation_token_var
+
+    # pylint: enable=g-import-not-at-top
+
+    # SQLite does not auto-rollback an explicit transaction on SQLITE_INTERRUPT
+    # during a SELECT, and CPython keeps PyThreadState_SetAsyncExc armed when a
+    # C call raises OperationalError("interrupted"). Exercise both on a thread
+    # where only cancellation_profile(token) is set (like IDA's main thread).
+    query.close_tables()
+    query._get_rw_conn()
+
+    select_started = threading.Event()
+    retry_ready = threading.Event()
+    outcomes: dict[str, Any] = {}
+    token = CancellationToken()
+
+    def main_thread_runner():
+      outcomes["ctx_token"] = cancellation_token_var.get()
+      rw = query._get_rw_conn()
+      with query._db_write_lock:
+        rw.execute(
+            "INSERT INTO local_types VALUES (1, 'old_t', 'struct old_t;')"
+        )
+        query._populated_tables.add("local_types")
+      query._local_types_dirty = True
+
+      rw.create_function(
+          "notify_started", 0, lambda: (select_started.set(), 1)[1]
+      )
+      rw.execute(
+          "CREATE TEMP VIEW local_types AS "
+          "WITH RECURSIVE r(n) AS ("
+          "  SELECT notify_started() "
+          "  UNION ALL "
+          "  SELECT n + 1 FROM r WHERE n < 50000000"
+          ") "
+          "SELECT 1 AS ordinal, 't' AS name, CAST(sum(n) AS TEXT) AS"
+          " declaration FROM r"
+      )
+      try:
+        with mock.patch.object(
+            query,
+            "_iter_local_types_info",
+            lambda: iter([(1, "new_t", "struct new_t;")]),
+        ):
+          with cancellation_profile(token):
+            query.refresh_local_types.sync_call()
+      except BaseException as exc:  # pylint: disable=broad-exception-caught
+        outcomes["exc"] = exc
+      outcomes["in_txn_after_cancel"] = rw.in_transaction
+      outcomes["dirty_after_cancel"] = query._local_types_dirty
+
+      retry_ready.wait(timeout=5.0)
+      rw.execute("DROP VIEW temp.local_types")
+      with mock.patch.object(
+          query,
+          "_iter_local_types_info",
+          lambda: iter([(1, "new_t", "struct new_t;")]),
+      ):
+        query.refresh_local_types.sync_call()
+      outcomes["in_txn_after_retry"] = rw.in_transaction
+
+    worker = threading.Thread(target=main_thread_runner, daemon=True)
+    t0 = time.perf_counter()
+    worker.start()
+    try:
+      self.assertTrue(select_started.wait(timeout=2.0))
+      time.sleep(0.005)
+      token.cancel()
+    finally:
+      retry_ready.set()
+      worker.join(timeout=2.0)
+    elapsed = time.perf_counter() - t0
+
+    self.assertFalse(worker.is_alive())
+    self.assertIsNone(outcomes["ctx_token"])
+    self.assertLess(elapsed, 1.5)
+    self.assertIsInstance(outcomes.get("exc"), asyncio.CancelledError)
+    self.assertFalse(outcomes["in_txn_after_cancel"])
+    self.assertTrue(outcomes["dirty_after_cancel"])
+    self.assertFalse(outcomes["in_txn_after_retry"])
+    self.assertFalse(query._local_types_dirty)
+    rows, _ = query._fetch_ro(
+        query._get_ro_conn(), "SELECT name FROM local_types"
+    )
+    self.assertEqual(rows, [("new_t",)])
 
   def test_gateway_intersect_and_commented_explain_rewrite(self):
     # pylint: disable=g-import-not-at-top
@@ -1640,6 +1980,10 @@ class TestAuthorizerTableExtraction(unittest.TestCase):
     self.assertNotIn("error", res[1])
     self.assertIn("INTERSECT", captured[0]["sql"])
     self.assertTrue(captured[1]["sql"].startswith("EXPLAIN QUERY PLAN SELECT"))
+
+
+def tearDownModule():
+  query.close_tables()
 
 
 if __name__ == "__main__":

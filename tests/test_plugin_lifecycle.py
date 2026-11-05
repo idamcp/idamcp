@@ -22,10 +22,12 @@
 
 import asyncio
 import contextlib
+import importlib
 import io
 import json
 import os
 import pathlib
+import signal
 import sqlite3
 import sys
 import tempfile
@@ -165,10 +167,29 @@ class TestPluginLifecycle(unittest.TestCase):
 
   def setUp(self):
     helper.get_segments = lambda: []
+    # A scratch config keeps the servers these tests start out of the user's
+    # registry and socket directories, and keeps sqlite_persistent off so no
+    # .db file is written next to the (fake) IDB paths.
+    tmp = tempfile.TemporaryDirectory()
+    self.addCleanup(tmp.cleanup)
+    registry_dir = pathlib.Path(tmp.name) / "registry"
+    uds_dir = pathlib.Path(tmp.name) / "uds"
+    registry_dir.mkdir()
+    uds_dir.mkdir()
+    config_path = pathlib.Path(tmp.name) / "idamcp.json"
+    config_path.write_text(
+        json.dumps({"registry_dir": str(registry_dir), "uds_dir": str(uds_dir)})
+    )
+    self.addCleanup(load_config.cache_clear)
+    env_patch = mock.patch.dict(os.environ, IDAMCP_CONFIG=str(config_path))
+    env_patch.start()
+    self.addCleanup(env_patch.stop)
+    os.environ.pop("IDAMCP_NO_USER_CONFIG", None)  # Restored by patch.dict.
+    os.environ.pop("SQLITE_PERSISTENT", None)
+    load_config.cache_clear()
     query.close_tables()
     info.clear_caches()
     security_manager.reset()
-    load_config.cache_clear()
 
   def tearDown(self):
     query.close_tables()
@@ -208,6 +229,9 @@ class TestPluginLifecycle(unittest.TestCase):
     rw_conn = query._get_rw_conn()
     self.assertIsNotNone(rw_conn)
     self.assertTrue(_is_connection_open(rw_conn))
+    scratch_dir = query._scratch_dir
+    self.assertIsNotNone(scratch_dir)
+    self.assertTrue((scratch_dir / "idamcp.db").is_file())
 
     query.close_tables()
 
@@ -218,6 +242,8 @@ class TestPluginLifecycle(unittest.TestCase):
     self.assertEqual(len(query._populated_tables), 0)
     self.assertEqual(len(query._db_local.connections), 0)
     self.assertFalse(_is_connection_open(rw_conn))
+    self.assertIsNone(query._scratch_dir)
+    self.assertFalse(scratch_dir.exists())
 
     # Idempotent second call should not raise
     query.close_tables()
@@ -441,6 +467,69 @@ class TestPluginLifecycle(unittest.TestCase):
     self.assertFalse(query._db_initialized)
     self.assertEqual(len(info._function_iterator_cache), 0)
     self.assertFalse(hasattr(idaapi, "idb_path") and idaapi.idb_path is not None)
+
+  def test_headless_main_closes_tables_before_closing_database(self):
+    """Verifies headless.main cleans up query tables before closing IDA."""
+    fake_idapro = mock.MagicMock()
+    fake_idapro.open_database.return_value = 0
+    order: list[str] = []
+    scratch_seen: list[pathlib.Path | None] = []
+    handled_signals = (signal.SIGINT, signal.SIGTERM)
+    handlers_before = {sig: signal.getsignal(sig) for sig in handled_signals}
+    for sig, handler in handlers_before.items():
+      if handler is not None:
+        self.addCleanup(signal.signal, sig, handler)
+    handlers_in_loop: dict[signal.Signals, object] = {}
+
+    def on_loop():
+      query._get_rw_conn()
+      scratch_seen.append(query._scratch_dir)
+      handlers_in_loop.update(
+          (sig, signal.getsignal(sig)) for sig in handled_signals
+      )
+
+    def on_close_db():
+      order.append("close_database")
+      self.assertIsNone(query._scratch_dir)
+
+    fake_idapro.close_database.side_effect = on_close_db
+
+    with tempfile.NamedTemporaryFile() as bin_file:
+      with mock.patch.dict(sys.modules, {"idapro": fake_idapro}):
+        sys.modules.pop("ida_mcp.headless", None)
+        try:
+          headless = importlib.import_module("ida_mcp.headless")
+          real_close = query.close_tables
+
+          def wrapped_close():
+            order.append("close_tables")
+            real_close()
+
+          with (
+              mock.patch.object(sys, "argv", ["headless", bin_file.name]),
+              mock.patch.object(headless, "_server_thread"),
+              mock.patch.object(headless, "stop_server"),
+              mock.patch.object(headless, "clear_persistent_globals"),
+              mock.patch.object(headless, "close_tables", wrapped_close),
+              mock.patch.object(headless.ida_thread, "loop", on_loop),
+              mock.patch.object(idaapi, "is_headless", None),
+              mock.patch.object(idaapi, "idb_path", None, create=True),
+          ):
+            headless.main()
+        finally:
+          sys.modules.pop("ida_mcp.headless", None)
+
+    self.assertEqual(len(scratch_seen), 1)
+    self.assertIsNotNone(scratch_seen[0])
+    self.assertFalse(scratch_seen[0].exists())
+    self.assertEqual(order, ["close_tables", "close_database"])
+    # main() owned the signals while the loop ran and handed them back after.
+    for sig in handled_signals:
+      self.assertNotEqual(handlers_in_loop[sig], handlers_before[sig])
+    self.assertEqual(
+        {sig: signal.getsignal(sig) for sig in handled_signals},
+        handlers_before,
+    )
 
   def test_plugin_server_waits_less_at_shutdown(self):
     """Verifies the plugin's server waits less at shutdown than the default.

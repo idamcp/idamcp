@@ -285,6 +285,8 @@ example of all available settings (showing defaults):
 *   **sqlite_persistent**: If `True`, the Sqlite database used by `sql_query`
     will be saved to a `.db` file in the same directory as your IDA IDB file.
     This avoids re-populating tables every time you open the database.
+    Otherwise the database is a scratch file in a per-session temporary
+    directory that is removed when the session closes.
 *   **check_entries_freshness**: If `True`, the server verifies whether entry
     points have changed in IDA (using a lightweight in-memory fingerprint)
     before executing queries against the `entries` table, automatically

@@ -170,7 +170,7 @@ cross-references matching specific criteria), the server implements a read-only
 SQL query engine.
 
 Originally evaluated with DuckDB, the engine was built with **SQLite** for
-faster in-memory table population and minimal overhead.
+faster table population and minimal overhead.
 
 ### 3.1 Relational Schema & Tables
 
@@ -224,7 +224,9 @@ populated is denied, which fails the compile before any row is read. The
 statement is then compiled once more as `EXPLAIN`, which runs nothing but
 rejects a query that would not compile anyway, before the table is populated
 and the query is compiled again. A query whose tables are already populated
-therefore runs exactly once. The server registers IDA `IDB_Hooks` and
+therefore runs exactly once. Population runs under a per-table lock, so
+concurrent queries that first touch the same table wait for a single populator
+run instead of each starting their own. The server registers IDA `IDB_Hooks` and
 `IDP_Hooks` to keep relational tables synchronized in real-time:
 
 *   **Live IDB Events**: Real-time hooks capture renaming of symbols and
@@ -272,6 +274,16 @@ acquiring IDA's main thread lock. IDA's main thread is only briefly engaged
 during initial data extraction or when handling incremental IDB update hooks,
 allowing agents to perform broad metadata searches without interrupting
 interactive use.
+
+The database is a file opened in WAL mode: a scratch file in a per-session
+temporary directory that `close_tables` removes, or `<idb>.db` next to the IDB
+when `sqlite_persistent` is enabled. WAL readers see the last committed
+snapshot, so a query neither waits for nor fails because of a populator or the
+DB worker writing at the same time, and writers never wait for readers. A
+shared-cache in-memory database would instead fail every concurrent reader with
+`SQLITE_LOCKED` (even on tables the writer does not touch), which SQLite's busy
+handler cannot wait out. Writers serialize on `_db_write_lock`; once the
+database is initialized, the read path never takes it.
 
 --------------------------------------------------------------------------------
 
@@ -512,7 +524,12 @@ interactive evaluation and opt-in persistent state.
     The message ends with the stdout and stderr the code printed before the
     timeout: `idapython_eval` attaches them to the interrupt as exception
     notes (`__notes__`) while it unwinds, and the wrapper appends the notes of
-    the interrupt to the timeout error.
+    the interrupt to the timeout error. On Python 3.13 (IDA 9.x) the
+    asynchronous exception can skip the `except`, `finally`, and `with`
+    cleanup of the frame it lands in when that frame is running a `while`
+    loop; the callers of that frame still see it. Evaluated code that must
+    restore state after a timeout should keep the loop in a helper function
+    and clean up in the function that calls it.
 *   **Jupyter-Style Interactive Evaluation**: Utilizes Abstract Syntax Tree
     (AST) parsing to divide input code blocks into statements and expressions.
     It automatically executes statements via `exec()` and evaluates the final

@@ -42,6 +42,7 @@ from ida_mcp.core import ida_thread
 from ida_mcp.server import mcp_server_thread
 from ida_mcp.server import stop_server
 from ida_mcp.tools.execution import clear_persistent_globals
+from ida_mcp.tools.query import close_tables
 from shared import load_options
 # fmt: on
 
@@ -171,9 +172,22 @@ def main():
     except Exception as e:  # pylint: disable=broad-exception-caught
       logger.exception("Error clearing idapython_eval globals: %s", e)
     try:
+      close_tables()
+    except Exception as e:  # pylint: disable=broad-exception-caught
+      logger.exception("Error closing query tables: %s", e)
+    try:
       idapro.close_database()
     except Exception as e:  # pylint: disable=broad-exception-caught
       logger.exception("Error closing database: %s", e)
+    # Hand the signals back to the handlers that were installed before main()
+    # replaced them; close_tables() has already restored ours.
+    for sig, handler in original_handlers.items():
+      if handler is None:
+        continue
+      try:
+        signal.signal(sig, handler)
+      except Exception as e:  # pylint: disable=broad-exception-caught
+        logger.exception("Could not restore handler for signal %s: %s", sig, e)
 
 
 if __name__ == "__main__":
