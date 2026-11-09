@@ -218,14 +218,15 @@ def interruptible_sqlite(conn: sqlite3.Connection):
 def _rollback_if_open(conn: sqlite3.Connection) -> None:
   """Rolls back the transaction open on `conn`, if any.
 
-  A cancel that lands during cleanup interrupts the ROLLBACK itself; SQLite
-  resets the interrupt when the next statement starts, so a retry goes
-  through (bounded, in case interrupts keep coming). Any other SQLite error
-  ends the attempt: the transaction is gone already or the connection is
-  closed.
+  A cancel that lands during cleanup interrupts the ROLLBACK itself; once no
+  other statement is active on `conn` (callers materialize SELECT results with
+  fetchall()), SQLite clears the interrupt flag when that statement halts, so
+  a retry goes through (bounded, in case interrupts keep coming). Any other
+  SQLite error ends the attempt: the transaction is gone already or the
+  connection is closed.
 
-  Callers run this in a loop that catches BaseException: an interrupt pending
-  from PyThreadState_SetAsyncExc may fire on any Python call, this one
+  Callers run this in a loop that catches async interrupts: an interrupt
+  pending from PyThreadState_SetAsyncExc may fire on any Python call, this one
   included, and the rollback must still happen afterwards.
   """
   for _ in range(3):
@@ -243,27 +244,53 @@ def _rollback_if_open(conn: sqlite3.Connection) -> None:
 def _run_write_transaction(
     conn: sqlite3.Connection,
     body: Callable[[sqlite3.Connection], None],
+    *,
+    on_commit: Callable[[], None] | None = None,
 ) -> None:
   """Runs `body(conn)` inside an interrupt-safe BEGIN/COMMIT write transaction.
 
   Kept free of loops in the `with`/`try` block: on Python 3.13 an asynchronous
   exception landing on a conditional loop back-edge in `body` skips `body`'s
   own cleanup, so `interruptible_sqlite` and the `finally` rollback must live
-  in this outer frame.
+  in this outer frame. `on_commit`, if given, must be idempotent; it runs
+  whenever SQLite committed, even if an async interrupt fires as COMMIT
+  returns.
   """
   with interruptible_sqlite(conn):
+    committed = False
+    commit_started = False
     try:
       conn.execute("BEGIN TRANSACTION")
       body(conn)
+      commit_started = conn.in_transaction
       conn.execute("COMMIT")
+      committed = True
+    except Exception:
+      commit_started = False
+      raise
     finally:
-      # Repeat the rollback until it completes: an interrupt pending from
-      # PyThreadState_SetAsyncExc fires on the first Python call it meets.
+      # Repeat the rollback and post-commit hook until they complete: an
+      # interrupt pending from PyThreadState_SetAsyncExc fires on the first
+      # Python call it meets.
       late_interrupt: BaseException | None = None
+      checked_commit = False
       while True:
         try:
+          if not checked_commit:
+            if commit_started:
+              try:
+                if not conn.in_transaction:
+                  committed = True
+              except sqlite3.Error:
+                pass
+            checked_commit = True
           _rollback_if_open(conn)
+          if committed and on_commit is not None:
+            on_commit()
+            on_commit = None
           break
+        except Exception:
+          raise
         # pylint: disable-next=broad-exception-caught
         except BaseException as exc:
           late_interrupt = exc
@@ -616,11 +643,12 @@ def _check_and_migrate_db(conn: sqlite3.Connection) -> None:
         _ensure_empty_schemas(rw_conn)
 
       try:
-        _run_write_transaction(conn, _recreate_schema)
+        _run_write_transaction(
+            conn, _recreate_schema, on_commit=_populated_tables.clear
+        )
       except Exception:
         logging.exception("Failed to migrate database")
         raise
-      _populated_tables.clear()
       logging.info(
           "Database re-created, version set to %d, image_min_ea recorded as"
           " %s.",
@@ -633,11 +661,18 @@ def _check_and_migrate_db(conn: sqlite3.Connection) -> None:
       valid = loaded & existing
       if "strings" in valid or "__internal_strings" in valid:
         valid.update(("strings", "__internal_strings"))
-      _ensure_empty_schemas(conn)
-      if valid != loaded:
-        _save_populated_tables(conn, valid)
+
+      def _sync_existing_schema(rw_conn: sqlite3.Connection) -> None:
+        if valid != loaded:
+          _save_populated_tables(rw_conn, valid)
+        _ensure_empty_schemas(rw_conn)
+
       _populated_tables.intersection_update(valid)
-      _populated_tables.update(valid)
+      _run_write_transaction(
+          conn,
+          _sync_existing_schema,
+          on_commit=lambda: _populated_tables.update(valid),
+      )
 
 
 def _get_rw_conn():
@@ -738,8 +773,11 @@ def _recreate_and_insert(
 
   with _db_write_lock:
     conn = _get_rw_conn()
-    _run_write_transaction(conn, _insert_rows)
-    _populated_tables.update(marked)
+    _run_write_transaction(
+        conn,
+        _insert_rows,
+        on_commit=lambda: _populated_tables.update(marked),
+    )
 
 
 def _is_table_populated(table_name: str) -> bool:
@@ -1047,7 +1085,7 @@ def refresh_local_types() -> None:
         ordinal: (name, declaration)
         for ordinal, name, declaration in conn.execute(
             "SELECT ordinal, name, declaration FROM local_types"
-        )
+        ).fetchall()
     }
     for ordinal, name, declaration in rows:
       if existing.pop(ordinal, None) != (name, declaration):
@@ -1061,10 +1099,15 @@ def refresh_local_types() -> None:
         [(ordinal,) for ordinal in existing],
     )
 
+  def _clear_local_types_dirty() -> None:
+    global _local_types_dirty
+    _local_types_dirty = False
+
   with _db_write_lock:
     conn = _get_rw_conn()
-    _run_write_transaction(conn, _apply_local_types)
-  _local_types_dirty = False
+    _run_write_transaction(
+        conn, _apply_local_types, on_commit=_clear_local_types_dirty
+    )
 
 
 @_time_populator
@@ -1256,12 +1299,16 @@ def _missing_populator_table(message: str) -> str | None:
 
 def _recreate_missing_schemas() -> None:
   """Re-creates any externally dropped schemas and marks them unpopulated."""
+
+  def _heal_schemas(rw_conn: sqlite3.Connection) -> None:
+    _save_populated_tables(rw_conn, _populated_tables)
+    _ensure_empty_schemas(rw_conn)
+
   with _db_write_lock:
     conn = _get_rw_conn()
     existing = _existing_canonical_names(conn)
-    _ensure_empty_schemas(conn)
     _populated_tables.intersection_update(existing)
-    _save_populated_tables(conn, _populated_tables)
+    _run_write_transaction(conn, _heal_schemas)
 
 
 _EXPLAIN_PREFIX = re.compile(

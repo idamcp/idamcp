@@ -527,9 +527,9 @@ interactive evaluation and opt-in persistent state.
     the interrupt to the timeout error. On Python 3.13 (IDA 9.x) the
     asynchronous exception can skip the `except`, `finally`, and `with`
     cleanup of the frame it lands in when that frame is running a `while` or
-    `for` loop; the callers of that frame still see it. Evaluated code that
-    must restore state after a timeout should keep the loop in a helper
-    function and clean up in the function that calls it.
+    `for` loop or a filtered comprehension; the callers of that frame still
+    see it. Evaluated code that must restore state after a timeout should keep
+    the loop in a helper function and clean up in the function that calls it.
 *   **Jupyter-Style Interactive Evaluation**: Utilizes Abstract Syntax Tree
     (AST) parsing to divide input code blocks into statements and expressions.
     It automatically executes statements via `exec()` and evaluates the final

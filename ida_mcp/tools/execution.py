@@ -226,10 +226,17 @@ def _execute_user_code(
         namespace,
         namespace,
     )
-    for name in ("run", "execute", "main"):
-      candidate = namespace.get(name)
-      if callable(candidate) and candidate is not previous_entrypoints[name]:
-        return _invoke_callable(candidate, runtime)
+
+    def _find_entrypoint() -> Callable[..., Any] | None:
+      for name in ("run", "execute", "main"):
+        candidate = namespace.get(name)
+        if callable(candidate) and candidate is not previous_entrypoints[name]:
+          return candidate
+      return None
+
+    entrypoint = _find_entrypoint()
+    if entrypoint is not None:
+      return _invoke_callable(entrypoint, runtime)
     return namespace.get("result")
   finally:
     namespace.pop("result", None)
@@ -492,6 +499,16 @@ def _output_capture(name: str) -> io.StringIO | BoundedStringIO:
   return BoundedStringIO(_OUTPUT_LIMIT, name)
 
 
+def _exceeded_capture(
+    *captures: io.StringIO | BoundedStringIO,
+) -> BoundedStringIO | None:
+  """Returns the first capture stream whose byte limit was exceeded, if any."""
+  for capture in captures:
+    if isinstance(capture, BoundedStringIO) and capture.exceeded:
+      return capture
+  return None
+
+
 @jsonrpc
 @unsafe
 @idawrite
@@ -578,13 +595,13 @@ def idapython_eval(
     # interrupt that was unwinding.
     stdout = stdout_capture.getvalue()
     stderr = stderr_capture.getvalue()
-    for capture in (stdout_capture, stderr_capture):
-      # Checked by flag rather than by type: asyncio may replace the interrupt
-      # that unwound a coroutine with a plain CancelledError.
-      if isinstance(capture, BoundedStringIO) and capture.exceeded:
-        raise _output_limit_error(
-            capture.name, capture.max_bytes, stdout, stderr
-        ) from exc
+    # Checked by flag rather than by type: asyncio may replace the interrupt
+    # that unwound a coroutine with a plain CancelledError.
+    exceeded = _exceeded_capture(stdout_capture, stderr_capture)
+    if exceeded is not None:
+      raise _output_limit_error(
+          exceeded.name, exceeded.max_bytes, stdout, stderr
+      ) from exc
     _add_output_notes(exc, stdout, stderr)
     raise
 

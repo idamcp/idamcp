@@ -446,12 +446,16 @@ def disassemble_function(
         " disassemble"
     )
 
-  func_text = []
-  with helper.set_showing_opcode_internal(include_bytes):
+  def _disassemble_ranges() -> list[str]:
+    blocks = []
     for start_ea, end_ea in addr_range:
       text = _get_ida_view(start_ea, end_ea)
       if text:
-        func_text.append(text)
+        blocks.append(text)
+    return blocks
+
+  with helper.set_showing_opcode_internal(include_bytes):
+    func_text = _disassemble_ranges()
 
   if func_text:
     return "\n".join(func_text)

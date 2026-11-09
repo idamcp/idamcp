@@ -26,6 +26,7 @@ import functools
 import importlib
 import inspect
 import logging
+import pathlib
 import queue
 import sqlite3
 import sys
@@ -1958,111 +1959,405 @@ class TestAuthorizerTableExtraction(unittest.TestCase):
 
     # pylint: enable=g-import-not-at-top
 
+    def _find_code(co, name):
+      if co.co_name == name:
+        return co
+      for const in co.co_consts:
+        if hasattr(const, "co_consts"):
+          found = _find_code(const, name)
+          if found is not None:
+            return found
+      return None
+
+    def _handlers_at(entries, offset):
+      return [e for e in entries if e.start <= offset < e.end]
+
     # Python 3.13 omits exception-table entries on conditional loop back-edges,
-    # so frames holding _db_write_lock or interruptible_sqlite must not contain
-    # uncovered backward jumps.
-    if hasattr(dis, "_parse_exception_table"):
-      for fn in (
-          query._run_write_transaction,
-          query._check_and_migrate_db,
-          query._recreate_and_insert,
-          inspect.unwrap(query.refresh_local_types),
-      ):
-        co = fn.__code__
-        entries = list(dis._parse_exception_table(co))
-        handlers_at = lambda off, es=entries: [
-            e for e in es if e.start <= off < e.end
-        ]
+    # so frames holding cleanup handlers must not contain uncovered backward
+    # jumps.
+    parse_exc_table = getattr(dis, "_parse_exception_table", None)
+    if parse_exc_table is not None:
+      repo_root = pathlib.Path(__file__).resolve().parent.parent
+      targets = (
+          ("ida_mcp/tools/query.py", "_run_write_transaction"),
+          ("ida_mcp/tools/query.py", "_check_and_migrate_db"),
+          ("ida_mcp/tools/query.py", "_get_rw_conn"),
+          ("ida_mcp/tools/query.py", "_recreate_and_insert"),
+          ("ida_mcp/tools/query.py", "refresh_local_types"),
+          ("ida_mcp/tools/query.py", "_recreate_missing_schemas"),
+          ("ida_mcp/tools/analysis.py", "disassemble_function"),
+          ("ida_mcp/tools/execution.py", "_execute_user_code"),
+          ("ida_mcp/tools/execution.py", "idapython_eval"),
+      )
+      for rel_path, fn_name in targets:
+        src = (repo_root / rel_path).read_text(encoding="utf-8")
+        mod_code = compile(src, rel_path, "exec")
+        co = _find_code(mod_code, fn_name)
+        assert co is not None, f"{rel_path}:{fn_name}"
+        entries = list(parse_exc_table(co))
+        self.assertTrue(entries, f"{rel_path}:{fn_name}")
         uncovered = [
             ins.offset
             for ins in dis.get_instructions(co)
-            if "JUMP_BACKWARD" in ins.opname
-            and len(handlers_at(ins.offset)) < len(handlers_at(ins.argval))
+            if ins.opname == "JUMP_BACKWARD"
+            and len(_handlers_at(entries, ins.offset))
+            < len(_handlers_at(entries, ins.argval))
         ]
-        self.assertEqual(uncovered, [], co.co_name)
+        self.assertEqual(uncovered, [], f"{rel_path}:{fn_name}")
 
     query.close_tables()
     rw = query._get_rw_conn()
-    rows_data = [(i, f"t{i}", "int x;") for i in range(1, 30001)]
+
+    def _assert_no_lock_or_txn_leak():
+      acquired = query._db_write_lock.acquire(blocking=False)
+      self.assertTrue(acquired)
+      try:
+        for conn in query._db_local.connections:
+          self.assertFalse(conn.in_transaction)
+        rw.execute("BEGIN IMMEDIATE")
+        rw.execute("ROLLBACK")
+      finally:
+        query._db_write_lock.release()
+
+    def _cancel_worker(target, entered, release, token, head_start):
+      t = threading.Thread(target=target, daemon=True)
+      t.start()
+      try:
+        self.assertTrue(entered.wait(timeout=2.0))
+        release.set()
+        time.sleep(head_start)
+        token.cancel()
+      finally:
+        release.set()
+        token.cancel()
+        t.join(timeout=2.0)
+      self.assertFalse(t.is_alive())
+
+    rows_data = [(i, f"t{i}", "int x;") for i in range(1, 50001)]
     with query._db_write_lock:
       rw.executemany("INSERT INTO local_types VALUES (?, ?, ?)", rows_data)
       query._populated_tables.add("local_types")
 
-    for _ in range(8):
+    # 1. Cancel refresh_local_types mid-SELECT (covers Python 3.11 active-cursor
+    #    handling when conn.interrupt() races PyThreadState_SetAsyncExc).
+    for _ in range(6):
       query._local_types_dirty = True
       entered = threading.Event()
+      release = threading.Event()
       token = CancellationToken()
+      unexpected: list[BaseException] = []
+
+      def run_select_cancel(
+          tok=token, ev=entered, rel=release, errs=unexpected
+      ):
+        worker_conn = query._get_rw_conn()
+
+        def on_progress():
+          if worker_conn.in_transaction and not ev.is_set():
+            ev.set()
+            rel.wait(timeout=1.0)
+          return 0
+
+        worker_conn.set_progress_handler(on_progress, 5000)
+        try:
+          with mock.patch.object(
+              query, "_iter_local_types_info", lambda r=rows_data: iter(r)
+          ):
+            with cancellation_profile(tok):
+              query.refresh_local_types.sync_call()
+        except asyncio.CancelledError:
+          pass
+        except BaseException as exc:  # pylint: disable=broad-exception-caught
+          errs.append(exc)
+        finally:
+          worker_conn.set_progress_handler(None, 0)
+
+      _cancel_worker(run_select_cancel, entered, release, token, 0.0005)
+      self.assertEqual(unexpected, [])
+      _assert_no_lock_or_txn_leak()
+
+    # 2. Cancel refresh_local_types during its Python row-comparison loop.
+    for _ in range(6):
+      query._local_types_dirty = True
+      entered = threading.Event()
+      release = threading.Event()
+      token = CancellationToken()
+      unexpected = []
 
       class _FirstRow:
 
-        def __eq__(self, _other, ev=entered):
-          ev.set()
+        def __eq__(self, _other, ev=entered, rel=release):
+          if not ev.is_set():
+            ev.set()
+            rel.wait(timeout=1.0)
           return True
 
       iter_rows = [(1, _FirstRow(), "int x;")] + rows_data[1:]
 
-      def run_refresh(tok=token):
+      def run_refresh(tok=token, rows=iter_rows, errs=unexpected):
         with mock.patch.object(
-            query, "_iter_local_types_info", lambda r=iter_rows: iter(r)
+            query, "_iter_local_types_info", lambda r=rows: iter(r)
         ):
           try:
             with cancellation_profile(tok):
               query.refresh_local_types.sync_call()
-          except BaseException:  # pylint: disable=broad-exception-caught
+          except asyncio.CancelledError:
             pass
+          except BaseException as exc:  # pylint: disable=broad-exception-caught
+            errs.append(exc)
 
-      t = threading.Thread(target=run_refresh, daemon=True)
-      t.start()
-      self.assertTrue(entered.wait(timeout=2.0))
-      token.cancel()
-      t.join(timeout=2.0)
-      self.assertFalse(t.is_alive())
+      _cancel_worker(run_refresh, entered, release, token, 0.0005)
+      self.assertEqual(unexpected, [])
+      _assert_no_lock_or_txn_leak()
 
-      acquired = query._db_write_lock.acquire(blocking=False)
-      self.assertTrue(acquired)
-      query._db_write_lock.release()
-      for conn in query._db_local.connections:
-        self.assertFalse(conn.in_transaction)
-
-    for _ in range(8):
+    # 3. Cancel _recreate_and_insert while iterating a non-generator iterable so
+    #    FOR_ITER runs directly in _insert_rows.
+    insert_rows = [(i, f"n{i}") for i in range(100000)]
+    for _ in range(6):
       entered = threading.Event()
+      release = threading.Event()
       token = CancellationToken()
+      unexpected = []
 
-      def row_gen(ev=entered):
-        ev.set()
-        for i in range(30000):
-          yield (i, f"n{i}")
+      class _SignalingIterable:
 
-      def run_insert(tok=token, gen=row_gen):
+        def __iter__(self, ev=entered, rel=release, rows=insert_rows):
+          ev.set()
+          rel.wait(timeout=1.0)
+          return iter(rows)
+
+      def run_insert(tok=token, data=_SignalingIterable(), errs=unexpected):
         try:
           with cancellation_profile(tok):
             query._recreate_and_insert(
                 table_name="names",
                 schema=query.TABLE_SCHEMAS["names"],
-                data=gen(),
+                data=data,
                 column_count=2,
-                batch_size=100000,
+                batch_size=200000,
             )
-        except BaseException:  # pylint: disable=broad-exception-caught
+        except asyncio.CancelledError:
           pass
+        except BaseException as exc:  # pylint: disable=broad-exception-caught
+          errs.append(exc)
 
-      t = threading.Thread(target=run_insert, daemon=True)
-      t.start()
-      self.assertTrue(entered.wait(timeout=2.0))
-      token.cancel()
-      t.join(timeout=2.0)
-      self.assertFalse(t.is_alive())
+      _cancel_worker(run_insert, entered, release, token, 0.0002)
+      self.assertEqual(unexpected, [])
+      _assert_no_lock_or_txn_leak()
 
-      acquired = query._db_write_lock.acquire(blocking=False)
-      self.assertTrue(acquired)
-      query._db_write_lock.release()
-      for conn in query._db_local.connections:
-        self.assertFalse(conn.in_transaction)
+    # 4. Cancel _check_and_migrate_db while dropping/recreating tables.
+    for _ in range(4):
+      with query._db_write_lock:
+        rw.execute("PRAGMA user_version = 0")
+      entered = threading.Event()
+      release = threading.Event()
+      token = CancellationToken()
+      unexpected = []
+
+      def run_migrate(tok=token, ev=entered, rel=release, errs=unexpected):
+        worker_conn = query._get_rw_conn()
+
+        def on_progress():
+          if worker_conn.in_transaction and not ev.is_set():
+            ev.set()
+            rel.wait(timeout=1.0)
+          return 0
+
+        worker_conn.set_progress_handler(on_progress, 50)
+        try:
+          with cancellation_profile(tok):
+            with query._db_write_lock:
+              query._check_and_migrate_db(worker_conn)
+        except asyncio.CancelledError:
+          pass
+        except BaseException as exc:  # pylint: disable=broad-exception-caught
+          errs.append(exc)
+        finally:
+          worker_conn.set_progress_handler(None, 0)
+
+      _cancel_worker(run_migrate, entered, release, token, 0.0005)
+      self.assertEqual(unexpected, [])
+      _assert_no_lock_or_txn_leak()
+
+  def test_post_commit_interrupt_runs_on_commit_iff_committed(self):
+    # pylint: disable=g-import-not-at-top
+    from ida_mcp.core.decorators import _OperationInterrupt
+
+    # pylint: enable=g-import-not-at-top
+
+    real_conn = sqlite3.connect(":memory:", isolation_level=None)
+    self.addCleanup(real_conn.close)
+    real_conn.execute("CREATE TABLE items (id INTEGER PRIMARY KEY)")
+
+    class _CommitProxy:
+
+      def __init__(self, conn, mode):
+        self._conn = conn
+        self._mode = mode
+
+      @property
+      def in_transaction(self):
+        return self._conn.in_transaction
+
+      def interrupt(self):
+        self._conn.interrupt()
+
+      def execute(self, sql, *args):
+        if sql == "COMMIT":
+          if self._mode == "interrupt_after_commit":
+            self._conn.execute(sql, *args)
+            raise _OperationInterrupt()
+          if self._mode == "interrupt_before_commit":
+            raise _OperationInterrupt()
+          if self._mode == "close_and_interrupt":
+            self._conn.close()
+            raise _OperationInterrupt()
+          if self._mode == "fail_commit":
+            raise sqlite3.OperationalError("database is locked")
+          return self._conn.execute(sql, *args)
+        return self._conn.execute(sql, *args)
+
+    # 1. COMMIT succeeds in SQLite, then async interrupt fires before COMMIT
+    #    returns and once more inside on_commit: on_commit must still complete.
+    hook_calls = 0
+    state: set[str] = set()
+
+    def idempotent_hook():
+      nonlocal hook_calls
+      hook_calls += 1
+      state.add("committed")
+      if hook_calls == 1:
+        raise _OperationInterrupt()
+
+    def insert_first(c):
+      c.execute("INSERT INTO items VALUES (1)")
+
+    proxy: Any = _CommitProxy(real_conn, "interrupt_after_commit")
+    with self.assertRaises(_OperationInterrupt):
+      query._run_write_transaction(
+          proxy,
+          insert_first,
+          on_commit=idempotent_hook,
+      )
+    self.assertFalse(real_conn.in_transaction)
+    self.assertEqual(state, {"committed"})
+    self.assertEqual(hook_calls, 2)
+    self.assertEqual(
+        real_conn.execute("SELECT id FROM items").fetchall(), [(1,)]
+    )
+
+    # 2. COMMIT fails with OperationalError: transaction rolls back and
+    #    on_commit must NOT run.
+    bad_calls = 0
+
+    def bad_hook():
+      nonlocal bad_calls
+      bad_calls += 1
+
+    def insert_second(c):
+      c.execute("INSERT INTO items VALUES (2)")
+
+    proxy = _CommitProxy(real_conn, "fail_commit")
+    with self.assertRaisesRegex(sqlite3.OperationalError, "database is locked"):
+      query._run_write_transaction(
+          proxy,
+          insert_second,
+          on_commit=bad_hook,
+      )
+    self.assertFalse(real_conn.in_transaction)
+    self.assertEqual(bad_calls, 0)
+    self.assertEqual(
+        real_conn.execute("SELECT id FROM items").fetchall(), [(1,)]
+    )
+
+    # 3. Pre-COMMIT interrupt inside body: transaction rolls back and on_commit
+    #    must NOT run.
+    def interrupted_body(c):
+      c.execute("INSERT INTO items VALUES (3)")
+      raise _OperationInterrupt()
+
+    with self.assertRaises(_OperationInterrupt):
+      query._run_write_transaction(
+          real_conn, interrupted_body, on_commit=bad_hook
+      )
+    self.assertFalse(real_conn.in_transaction)
+    self.assertEqual(bad_calls, 0)
+    self.assertEqual(
+        real_conn.execute("SELECT id FROM items").fetchall(), [(1,)]
+    )
+
+    # 4. Synchronous Exception inside on_commit propagates immediately instead
+    #    of spinning in the finally retry loop; a closed connection or an
+    #    already-ended transaction before COMMIT also does not spin or misfire.
+    raising_calls = 0
+
+    def raising_hook():
+      nonlocal raising_calls
+      raising_calls += 1
+      raise RuntimeError("hook boom")
+
+    def noop_body(_c):
+      pass
+
+    with self.assertRaisesRegex(RuntimeError, "hook boom"):
+      query._run_write_transaction(real_conn, noop_body, on_commit=raising_hook)
+    self.assertEqual(raising_calls, 1)
+
+    def rollback_in_body(c):
+      c.execute("ROLLBACK")
+
+    proxy = _CommitProxy(real_conn, "interrupt_before_commit")
+    with self.assertRaises(_OperationInterrupt):
+      query._run_write_transaction(proxy, rollback_in_body, on_commit=bad_hook)
+    self.assertEqual(bad_calls, 0)
+
+    closable = sqlite3.connect(":memory:", isolation_level=None)
+    self.addCleanup(closable.close)
+    proxy = _CommitProxy(closable, "close_and_interrupt")
+    with self.assertRaises(_OperationInterrupt):
+      query._run_write_transaction(proxy, noop_body, on_commit=bad_hook)
+    self.assertEqual(bad_calls, 0)
+
+    # 5. Schema healing (_recreate_missing_schemas and _check_and_migrate_db's
+    #    existing-DB branch) runs atomically and never leaves an empty recreated
+    #    table marked populated if interrupted after CREATE TABLE.
+    query.close_tables()
+    rw = query._get_rw_conn()
+    orig_ensure = query._ensure_empty_schemas
+    with query._db_write_lock:
+      query._save_populated_tables(rw, ("names",))
+      rw.execute("DROP TABLE names")
+      query._populated_tables.add("names")
+
+    def boom_after_create(conn):
+      orig_ensure(conn)
+      raise RuntimeError("boom")
+
+    with mock.patch.object(
+        query, "_ensure_empty_schemas", side_effect=boom_after_create
+    ):
+      with self.assertRaisesRegex(RuntimeError, "boom"):
+        query._recreate_missing_schemas()
+    self.assertNotIn("names", query._populated_tables)
+    self.assertNotIn("names", query._existing_canonical_names(rw))
+
+    query._db_version_checked = False
+    with mock.patch.object(
+        query, "_ensure_empty_schemas", side_effect=boom_after_create
+    ):
+      with self.assertRaisesRegex(RuntimeError, "boom"):
+        query._get_rw_conn()
+    self.assertNotIn("names", query._populated_tables)
+    query._get_rw_conn()
+    self.assertNotIn("names", query._populated_tables)
+    self.assertIn("names", query._existing_canonical_names(rw))
 
   def test_migration_logs_exception_failures_but_not_interrupts(self):
     # pylint: disable=g-import-not-at-top
+    from ida_mcp.core.decorators import CancellationToken
     from ida_mcp.core.decorators import ToolTimeoutError
     from ida_mcp.core.decorators import cancellation_profile
+    from ida_mcp.core.decorators import cancellation_token_var
 
     # pylint: enable=g-import-not-at-top
 
@@ -2080,9 +2375,49 @@ class TestAuthorizerTableExtraction(unittest.TestCase):
         with self.assertRaises(asyncio.CancelledError):
           query._get_rw_conn()
 
+    # Also verify real CancellationToken -> conn.interrupt() ->
+    # OperationalError("interrupted") -> interruptible_sqlite translation does
+    # not emit a spurious ERROR log during migration.
+    token = CancellationToken()
+
+    def interrupt_sqlite_mid_migration(conn):
+      orig_ensure(conn)
+
+      def on_progress():
+        token.cancel()
+        return 0
+
+      conn.set_progress_handler(on_progress, 20)
+      try:
+        conn.execute(
+            "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c"
+            " WHERE x < 100) SELECT sum(x) FROM c"
+        ).fetchall()
+      finally:
+        conn.set_progress_handler(None, 0)
+
+    tok_reset = cancellation_token_var.set(token)
+    try:
+      with self.assertNoLogs(level=logging.ERROR):
+        with mock.patch.object(
+            query,
+            "_ensure_empty_schemas",
+            side_effect=interrupt_sqlite_mid_migration,
+        ):
+          with self.assertRaises(asyncio.CancelledError) as cm_cancel:
+            query._get_rw_conn()
+      self.assertIsInstance(
+          cm_cancel.exception.__cause__, sqlite3.OperationalError
+      )
+    finally:
+      cancellation_token_var.reset(tok_reset)
+
+    stop_hang = threading.Event()
+
     def hang_mid_migration(conn):
       orig_ensure(conn)
-      time.sleep(1.0)
+      while not stop_hang.is_set():
+        time.sleep(0.005)
 
     timeout_errs: list[BaseException] = []
 
@@ -2099,7 +2434,10 @@ class TestAuthorizerTableExtraction(unittest.TestCase):
     with self.assertNoLogs(level=logging.ERROR):
       t = threading.Thread(target=run_timed_out_migration, daemon=True)
       t.start()
-      t.join(timeout=2.0)
+      try:
+        t.join(timeout=2.0)
+      finally:
+        stop_hang.set()
     self.assertFalse(t.is_alive())
     self.assertEqual(len(timeout_errs), 1)
     self.assertIsInstance(timeout_errs[0], ToolTimeoutError)
