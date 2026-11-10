@@ -1,0 +1,73 @@
+# Copyright (c) 2026 Google LLC
+#
+# Permission is hereby granted, free of charge, to any person obtaining a copy
+# of this software and associated documentation files (the "Software"), to deal
+# in the Software without restriction, including without limitation the rights
+# to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+# copies of the Software, and to permit persons to whom the Software is
+# furnished to do so, subject to the following conditions:
+#
+# The above copyright notice and this permission notice shall be included in all
+# copies or substantial portions of the Software.
+#
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+# IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+# FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+# AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+# LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+# OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+# SOFTWARE.
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "idamcp"
+version = "0.1.0"
+description = "IDA Pro MCP Server with gateway proxy and embedded relational SQLite query engine"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+dependencies = [
+  "fastapi==0.143.3",
+  "fastmcp[code-mode]==4.1.2",
+  "keystone-engine==0.9.2",
+  "sqlglotc==30.23.0",
+  "tomli_w==1.2.0",
+  "watchdog==6.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pyink",
+  "pytest",
+]
+
+[project.scripts]
+idamcp-headless = "ida_mcp.headless:main"
+idamcp-dashboard = "frontend.security_dashboard:main"
+idamcp-generate-proxy = "generators.generate_proxy:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = [
+  "ida_mcp*",
+  "gateway*",
+  "shared*",
+  "frontend*",
+  "generators*",
+  "plugins*",
+]
+
+[tool.setuptools.package-data]
+frontend = ["index.html"]
+
+[tool.pyink]
+line-length = 80
+pyink-indentation = 2
+pyink-use-majority-quotes = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
