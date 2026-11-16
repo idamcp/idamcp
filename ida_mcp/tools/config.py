@@ -25,6 +25,7 @@
 import logging
 from typing import Any, Dict, List
 from ida_mcp.core import ida_thread
+from ida_mcp.core.decorators import allow_during_auto_analysis
 from ida_mcp.core.decorators import internal, jsonrpc
 from ida_mcp.core.rpc_registry import rpc_registry
 from ida_mcp.core.security import security_manager
@@ -32,6 +33,7 @@ from ida_mcp.core.security import security_manager
 
 @internal
 @jsonrpc
+@allow_during_auto_analysis
 def list_unsafe_tools() -> List[str]:
   """Returns a list of all unsafe tool names."""
   return sorted(list(rpc_registry.unsafe))
@@ -63,6 +65,7 @@ def configure_unsafe_tools(
 
 @internal
 @jsonrpc
+@allow_during_auto_analysis
 def get_security_config() -> Dict[str, Any]:
   """Returns the current security configuration."""
   return {
@@ -73,6 +76,7 @@ def get_security_config() -> Dict[str, Any]:
 
 @internal
 @jsonrpc
+@allow_during_auto_analysis
 async def close_database() -> None:
   """Closes the current database gracefully and exits the headless instance."""
   # Async, so that it runs on the RPC server's event loop: the server writes the

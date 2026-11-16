@@ -34,6 +34,7 @@ import tempfile
 import threading
 import time
 import types
+from typing import Any
 import unittest
 from unittest import mock
 
@@ -108,6 +109,7 @@ setattr(sys.modules["idaapi"], "PLUGIN_KEEP", 2)
 setattr(sys.modules["idaapi"], "idb_path", None)
 setattr(sys.modules["idaapi"], "is_main_thread", lambda: True)
 setattr(sys.modules["idaapi"], "auto_is_ok", lambda: True)
+setattr(sys.modules["idaapi"], "inf_is_auto_enabled", lambda: True)
 setattr(sys.modules["idaapi"], "is_idaq", lambda: True)
 setattr(sys.modules["idaapi"], "get_path", lambda *args: "/tmp/dummy.i64")
 setattr(sys.modules["idaapi"], "get_input_file_path", lambda: "/tmp/dummy.bin")
@@ -121,8 +123,12 @@ if str(repo_root) not in sys.path:
   sys.path.insert(0, str(repo_root))
 
 from ida_mcp import server as ida_mcp_server
+from ida_mcp.core import analysis_state
 from ida_mcp.core import ida_thread
+from ida_mcp.core import backend_registry
 from ida_mcp.core.backend_registry import RegistryManager
+from ida_mcp.core.decorators import CancellationToken
+from ida_mcp.core.decorators import cancellation_profile
 from ida_mcp.core.security import security_manager
 from ida_mcp.server import mcp_server_thread, stop_server
 from ida_mcp.tools import info
@@ -133,6 +139,7 @@ from plugins.ida_mcp_plugin import _is_batch_mode
 from plugins.ida_mcp_plugin import _is_headless
 from plugins.ida_mcp_plugin import MCP
 import idaapi
+from shared import registry
 from shared.config import load_config
 from shared.rpc import DEFAULT_SHUTDOWN_GRACE
 from shared.rpc import RPCClient
@@ -152,6 +159,32 @@ MOCK_METADATA = {
     "procname": "metapc",
     "is_headless": False,
 }
+
+
+# A well-formed instance ID for the tests that name a record themselves.
+_IID = "0123456789abcdef"
+
+
+def _wait_for_record(prefix: str = "") -> pathlib.Path | None:
+  """Returns the server's registry record once it exists, else None.
+
+  Records are named after the server's instance ID, which is new on every
+  start, so the tests look for the one record in their scratch registry.
+
+  Args:
+    prefix: The start of the record's name, e.g., the in-progress prefix.
+  """
+  registry_dir = pathlib.Path(load_config()["registry_dir"])
+  for _ in range(50):
+    records = [
+        f
+        for f in registry_dir.glob(f"{prefix}*.json")
+        if prefix or not f.name.startswith(registry._IN_PROGRESS_PREFIX)
+    ]
+    if records:
+      return records[0]
+    time.sleep(0.1)
+  return None
 
 
 def _is_connection_open(conn: sqlite3.Connection) -> bool:
@@ -190,11 +223,13 @@ class TestPluginLifecycle(unittest.TestCase):
     query.close_tables()
     info.clear_caches()
     security_manager.reset()
+    analysis_state.reset()
 
   def tearDown(self):
     query.close_tables()
     info.clear_caches()
     security_manager.reset()
+    analysis_state.reset()
     load_config.cache_clear()
 
   def test_clear_caches(self):
@@ -317,21 +352,28 @@ class TestPluginLifecycle(unittest.TestCase):
   def test_mcp_server_thread_start_and_stop(self, _mock_meta):
     """Verifies mcp_server_thread starts and cleanly shuts down via stop_server."""
     test_id = "test_lifecycle_id"
-    config = load_config()
-    registry_dir = pathlib.Path(config["registry_dir"])
-    reg_file = registry_dir / f"{test_id}.json"
 
     # Start server in thread
     t = threading.Thread(target=mcp_server_thread, args=(test_id,), daemon=True)
     t.start()
 
     # Wait for registry file to appear
-    for _ in range(50):
-      if reg_file.exists():
-        break
-      time.sleep(0.1)
-
-    self.assertTrue(reg_file.exists(), "Registry file should be created on start")
+    reg_file = _wait_for_record()
+    assert reg_file is not None, "Registry file should be created on start"
+    entry = json.loads(reg_file.read_text())
+    instance_id, in_progress = registry.parse_record_name(reg_file.name)
+    self.assertFalse(in_progress)
+    self.assertEqual(entry["database_id"], test_id)
+    self.assertAlmostEqual(entry["started_at"], time.time(), delta=60)
+    self.assertFalse(entry["auto_analysis_disabled"])
+    # The record's name carries the instance ID and the status, not its
+    # content.
+    self.assertNotIn("instance_id", entry["metadata"])
+    self.assertNotIn("auto_analysis_status", entry["metadata"])
+    if entry["channel"] == "uds":
+      self.assertEqual(
+          pathlib.Path(entry["address"]).name, f"{instance_id}.sock"
+      )
 
     # Stop the server
     stop_server(test_id)
@@ -345,7 +387,6 @@ class TestPluginLifecycle(unittest.TestCase):
   def test_mcp_server_thread_passes_shutdown_grace(self, _mock_meta):
     """Verifies the RPC server gets mcp_server_thread's shutdown grace."""
     test_id = "test_shutdown_grace_id"
-    reg_file = pathlib.Path(load_config()["registry_dir"]) / f"{test_id}.json"
     servers = []
 
     class RecordingServer(RPCServer):
@@ -369,10 +410,7 @@ class TestPluginLifecycle(unittest.TestCase):
               daemon=True,
           )
           t.start()
-          for _ in range(50):
-            if reg_file.exists():
-              break
-            time.sleep(0.1)
+          _wait_for_record()
           stop_server(test_id)
           t.join(timeout=5.0)
         self.assertFalse(t.is_alive(), "Server thread should terminate")
@@ -384,16 +422,11 @@ class TestPluginLifecycle(unittest.TestCase):
   def test_close_database_replies_before_the_server_stops(self, _mock_meta):
     """Verifies close_database replies even if the server stops right away."""
     test_id = "test_close_database_id"
-    config = load_config()
-    reg_file = pathlib.Path(config["registry_dir"]) / f"{test_id}.json"
 
     t = threading.Thread(target=mcp_server_thread, args=(test_id,), daemon=True)
     t.start()
-    for _ in range(50):
-      if reg_file.exists():
-        break
-      time.sleep(0.1)
-    self.assertTrue(reg_file.exists(), "Registry file should be created")
+    reg_file = _wait_for_record()
+    assert reg_file is not None, "Registry file should be created"
     entry = json.loads(reg_file.read_text())
 
     async def call_close_database():
@@ -438,8 +471,6 @@ class TestPluginLifecycle(unittest.TestCase):
 
     # Start a server thread
     test_id = "test_plugin_term_id"
-    config = load_config()
-    reg_file = pathlib.Path(config["registry_dir"]) / f"{test_id}.json"
 
     plugin.hash_str = test_id
     plugin.server_thread = threading.Thread(
@@ -449,12 +480,8 @@ class TestPluginLifecycle(unittest.TestCase):
     plugin.server_thread.start()
 
     # Wait for server to start
-    for _ in range(50):
-      if reg_file.exists():
-        break
-      time.sleep(0.1)
-
-    self.assertTrue(reg_file.exists())
+    reg_file = _wait_for_record()
+    assert reg_file is not None
     self.assertTrue(plugin._server_started)
 
     # Call term() as IDA would when user closes database
@@ -480,8 +507,10 @@ class TestPluginLifecycle(unittest.TestCase):
       if handler is not None:
         self.addCleanup(signal.signal, sig, handler)
     handlers_in_loop: dict[signal.Signals, object] = {}
+    loop_idle: list[object] = []
 
-    def on_loop():
+    def on_loop(idle=None):
+      loop_idle.append(idle)
       query._get_rw_conn()
       scratch_seen.append(query._scratch_dir)
       handlers_in_loop.update(
@@ -523,6 +552,12 @@ class TestPluginLifecycle(unittest.TestCase):
     self.assertIsNotNone(scratch_seen[0])
     self.assertFalse(scratch_seen[0].exists())
     self.assertEqual(order, ["close_tables", "close_database"])
+    # The analysis is left to the loop, which had nothing to run: the mocked
+    # database is fully analysed.
+    self.assertFalse(
+        fake_idapro.open_database.call_args.kwargs["run_auto_analysis"]
+    )
+    self.assertEqual(loop_idle, [None])
     # main() owned the signals while the loop ran and handed them back after.
     for sig in handled_signals:
       self.assertNotEqual(handlers_in_loop[sig], handlers_before[sig])
@@ -530,6 +565,626 @@ class TestPluginLifecycle(unittest.TestCase):
         {sig: signal.getsignal(sig) for sig in handled_signals},
         handlers_before,
     )
+
+  def _import_headless(self, fake_idapro):
+    """Imports ida_mcp.headless with a fake idapro; undone at cleanup."""
+    patcher = mock.patch.dict(sys.modules, {"idapro": fake_idapro})
+    patcher.start()
+    self.addCleanup(patcher.stop)
+    sys.modules.pop("ida_mcp.headless", None)
+    self.addCleanup(sys.modules.pop, "ida_mcp.headless", None)
+    return importlib.import_module("ida_mcp.headless")
+
+  def _run_headless_main(self, argv, auto_is_ok):
+    """Runs headless.main() with a mocked loop; returns the loop's idle."""
+    fake_idapro = mock.MagicMock()
+    fake_idapro.open_database.return_value = 0
+    headless = self._import_headless(fake_idapro)
+    for sig in (signal.SIGINT, signal.SIGTERM):
+      if (handler := signal.getsignal(sig)) is not None:
+        self.addCleanup(signal.signal, sig, handler)
+    loop = mock.Mock()
+    with tempfile.NamedTemporaryFile() as bin_file:
+      with (
+          mock.patch.object(sys, "argv", ["headless", bin_file.name, *argv]),
+          mock.patch.object(headless, "_server_thread"),
+          mock.patch.object(headless, "stop_server"),
+          mock.patch.object(headless, "clear_persistent_globals"),
+          mock.patch.object(headless.ida_thread, "loop", loop),
+          mock.patch.object(
+              headless.ida_auto, "auto_is_ok", return_value=auto_is_ok
+          ),
+          mock.patch.object(idaapi, "is_headless", None),
+          mock.patch.object(idaapi, "idb_path", None, create=True),
+      ):
+        headless.main()
+    loop.assert_called_once()
+    return headless, loop.call_args.args[0]
+
+  def test_headless_main_runs_analysis_in_the_loop(self):
+    """Verifies main() marks a pending analysis and gives it to the loop."""
+    headless, idle = self._run_headless_main([], auto_is_ok=False)
+    self.assertIsInstance(idle, headless._AnalysisIdle)
+    self.assertEqual(analysis_state.status(), analysis_state.IN_PROGRESS)
+
+  def test_headless_main_skips_analysis_of_an_analysed_database(self):
+    """Verifies main() has nothing to run for a database already analysed."""
+    for argv in ([], ["--disable-auto-analysis"]):
+      with self.subTest(argv=argv):
+        analysis_state.reset()
+        _, idle = self._run_headless_main(argv, auto_is_ok=True)
+        self.assertIsNone(idle)
+        self.assertEqual(analysis_state.status(), analysis_state.DONE)
+
+  def test_headless_main_with_disable_auto_analysis(self):
+    """Verifies --disable-auto-analysis runs no analysis and records it."""
+    _, idle = self._run_headless_main(
+        ["--disable-auto-analysis"], auto_is_ok=False
+    )
+    self.assertIsNone(idle)
+    self.assertEqual(analysis_state.status(), analysis_state.DISABLED)
+
+  def _reset_ida_thread(self):
+    """Undoes ida_thread.stop(): drops queued items and the cancelled token."""
+    while not ida_thread._ida_queue.empty():
+      ida_thread._ida_queue.get_nowait()
+      ida_thread._ida_queue.task_done()
+    ida_thread.stop_token = CancellationToken()
+
+  def test_analysis_slice(self):
+    """Verifies a slice steps until its time is up or the analysis ends."""
+    headless = self._import_headless(mock.MagicMock())
+    ida_auto = headless.ida_auto
+
+    # More to do: the slice ends when its time is up.
+    step = mock.Mock(return_value=True)
+    with (
+        mock.patch.object(ida_auto, "auto_make_step", step),
+        mock.patch.object(headless, "_ANALYSIS_SLICE_SECONDS", 0.01),
+    ):
+      self.assertTrue(headless._analysis_slice())
+      self.assertGreater(step.call_count, 0)
+
+    # Nothing left to step through, and the queues are final.
+    with (
+        mock.patch.object(ida_auto, "auto_make_step", return_value=False),
+        mock.patch.object(ida_auto, "auto_is_ok", return_value=True),
+        mock.patch.object(ida_auto, "auto_wait") as auto_wait,
+    ):
+      self.assertFalse(headless._analysis_slice())
+      auto_wait.assert_not_called()
+
+    # Nothing left to step through, but the queues aren't final: IDA finishes
+    # in one call, which is logged since nothing can interrupt it.
+    with (
+        mock.patch.object(ida_auto, "auto_make_step", return_value=False),
+        mock.patch.object(ida_auto, "auto_is_ok", return_value=False),
+        mock.patch.object(ida_auto, "auto_wait") as auto_wait,
+        self.assertLogs(headless.logger, level="WARNING") as logs,
+    ):
+      self.assertFalse(headless._analysis_slice())
+      auto_wait.assert_called_once_with()
+    self.assertIn("auto_wait() ran for", logs.output[0])
+
+  def test_analysis_idle_sets_up_tables_in_a_step_of_its_own(self):
+    """Verifies the loop gets to check its queue before the table setup."""
+    headless = self._import_headless(mock.MagicMock())
+    self.addCleanup(self._reset_ida_thread)
+    analysis_state.begin()
+    order = []
+    analysis_state.set_on_done(lambda: order.append("done"))
+    idle = headless._AnalysisIdle()
+    slices = mock.Mock(side_effect=[True, False])
+    with (
+        mock.patch.object(headless, "_analysis_slice", slices),
+        mock.patch.object(
+            headless,
+            "init_tables",
+            side_effect=lambda: order.append("init_tables"),
+        ),
+        mock.patch.dict(os.environ, POPULATE_TABLES_ON_STARTUP="true"),
+    ):
+      load_config.cache_clear()
+      self.assertTrue(idle())  # More analysis to do.
+      # The analysis has ended, but the idle work hasn't: the loop checks its
+      # queue once more before the tables are set up.
+      self.assertTrue(idle())
+      self.assertEqual(order, [])
+      self.assertTrue(analysis_state.is_in_progress())
+      # Tables first, then the tools are let through.
+      self.assertFalse(idle())
+    self.assertEqual(order, ["init_tables", "done"])
+    self.assertEqual(analysis_state.status(), analysis_state.DONE)
+
+  def test_analysis_slice_failure_unlocks_the_tools(self):
+    """Verifies a failing analysis step doesn't leave the tools locked."""
+    headless = self._import_headless(mock.MagicMock())
+    self.addCleanup(self._reset_ida_thread)
+    analysis_state.begin()
+    idle = headless._AnalysisIdle()
+    with mock.patch.object(
+        headless.ida_auto, "auto_make_step", side_effect=RuntimeError("boom")
+    ):
+      with self.assertLogs(headless.logger, level="ERROR"):
+        self.assertTrue(idle())
+    self.assertFalse(idle())
+    self.assertEqual(analysis_state.status(), analysis_state.DONE)
+
+  def test_stop_cancels_the_stop_token(self):
+    """Verifies stop() cancels stop_token, which loop() then replaces."""
+    self.addCleanup(self._reset_ida_thread)
+    self._reset_ida_thread()
+    token = ida_thread.stop_token
+    ida_thread.stop()
+    for _ in range(100):
+      if token.is_cancelled:
+        break
+      time.sleep(0.01)
+    self.assertTrue(token.is_cancelled)
+    # A scope entered after the stop doesn't start its work.
+    with self.assertRaises(asyncio.CancelledError):
+      with cancellation_profile(token):
+        self.fail("The scope should not be entered")
+    # The queued quit ends the next loop at once; the loop has a new token.
+    ida_thread.loop()
+    self.assertIsNot(ida_thread.stop_token, token)
+    self.assertFalse(ida_thread.stop_token.is_cancelled)
+
+  def test_table_setup_is_skipped_after_a_stop_request(self):
+    """Verifies a stop requested before the table setup leaves it out."""
+    headless = self._import_headless(mock.MagicMock())
+    self.addCleanup(self._reset_ida_thread)
+    self._reset_ida_thread()
+    analysis_state.begin()
+    done = mock.Mock()
+    analysis_state.set_on_done(done)
+    ida_thread.stop_token.cancel()
+    with (
+        mock.patch.object(headless, "init_tables") as init_tables,
+        mock.patch.dict(os.environ, POPULATE_TABLES_ON_STARTUP="true"),
+    ):
+      load_config.cache_clear()
+      headless._on_analysis_done()
+    init_tables.assert_not_called()
+    # The server is going away: the tools stay locked and the record keeps
+    # its in-progress name.
+    done.assert_not_called()
+    self.assertTrue(analysis_state.is_in_progress())
+
+  def test_table_setup_is_interrupted_by_a_stop_request(self):
+    """Verifies stop() interrupts a table setup that is already running."""
+    headless = self._import_headless(mock.MagicMock())
+    self.addCleanup(self._reset_ida_thread)
+    self._reset_ida_thread()
+    analysis_state.begin()
+    done = mock.Mock()
+    analysis_state.set_on_done(done)
+    rows = []
+
+    def populate_rows():
+      # Like a populator: a Python loop that checks nothing.
+      deadline = time.monotonic() + 10
+      while time.monotonic() < deadline:
+        rows.append(len(rows))
+
+    def slow_init_tables():
+      populate_rows()
+      self.fail("The table setup ran to its end")
+
+    threading.Timer(0.1, ida_thread.stop).start()
+    started = time.monotonic()
+    with (
+        mock.patch.object(headless, "init_tables", slow_init_tables),
+        mock.patch.dict(os.environ, POPULATE_TABLES_ON_STARTUP="true"),
+    ):
+      load_config.cache_clear()
+      headless._on_analysis_done()
+    self.assertLess(time.monotonic() - started, 5)
+    self.assertTrue(rows)
+    done.assert_not_called()
+    self.assertTrue(analysis_state.is_in_progress())
+
+  @mock.patch(
+      "ida_mcp.tools.info.get_metadata.sync_call", return_value=MOCK_METADATA
+  )
+  def test_startup_table_setup_gives_way_to_a_stop_request(self, _mock_meta):
+    """Verifies a stopping headless server doesn't populate or register."""
+    self.addCleanup(self._reset_ida_thread)
+    self._reset_ida_thread()
+    ida_thread.stop_token.cancel()
+    with (
+        mock.patch.dict(os.environ, POPULATE_TABLES_ON_STARTUP="true"),
+        mock.patch.object(idaapi, "is_headless", True),
+        mock.patch.object(query, "_populate_tables") as populate,
+    ):
+      load_config.cache_clear()
+      t = threading.Thread(
+          target=mcp_server_thread, args=("test_stop_id",), daemon=True
+      )
+      t.start()
+      t.join(timeout=5.0)
+      self.addCleanup(stop_server, "test_stop_id")
+      self.assertFalse(t.is_alive(), "The server thread should have ended")
+    populate.assert_not_called()
+    registry_dir = pathlib.Path(load_config()["registry_dir"])
+    self.assertEqual(list(registry_dir.glob("*.json")), [])
+
+  def test_ida_thread_loop_runs_idle_between_tasks(self):
+    """Verifies loop() serves the queue first and idles until told to stop."""
+    events = []
+    task_done = threading.Event()
+
+    def task():
+      events.append("task")
+      task_done.set()
+
+    def idle():
+      events.append("idle")
+      if len(events) == 2:
+        # Queued while idling: served before the next idle call.
+        ida_thread._ida_queue.put(ida_thread.IDATask(task, event=task_done))
+      if events.count("idle") == 3:
+        threading.Timer(0.2, ida_thread.stop).start()
+        return False
+      return True
+
+    ida_thread._ida_queue.put(ida_thread.IDATask(task))
+    ida_thread.loop(idle)
+    # After idle() returned False, the loop waited for the quit item rather
+    # than calling it again.
+    self.assertEqual(events, ["task", "idle", "task", "idle", "idle"])
+    self.assertFalse(ida_thread._loop_running.is_set())
+
+  def test_ida_thread_loop_stops_while_idle_work_remains(self):
+    """Verifies a stop request ends a loop whose idle work never finishes."""
+    # Adapted from test_quit_while_work_remains in PR #22.
+    calls = 0
+
+    def idle():
+      nonlocal calls
+      calls += 1
+      if calls == 3:
+        ida_thread.stop()
+      return True  # More to do, always.
+
+    ida_thread.loop(idle)
+    # The stop request was served before the next idle call.
+    self.assertEqual(calls, 3)
+    self.assertFalse(ida_thread._loop_running.is_set())
+
+  def test_instance_id_is_eight_random_bytes(self):
+    """Verifies an instance ID is 16 hex characters, new on every call."""
+    ids = {registry.new_instance_id() for _ in range(50)}
+    self.assertEqual(len(ids), 50)
+    for instance_id in ids:
+      self.assertRegex(instance_id, r"^[0-9a-f]{16}$")
+      # The names made from it are record names.
+      for in_progress in (False, True):
+        name = registry.record_name(instance_id, in_progress)
+        self.assertEqual(
+            registry.parse_record_name(name), (instance_id, in_progress)
+        )
+
+  def test_mcp_json_line_names_the_instance(self):
+    """Verifies [MCP_JSON] adds the instance ID to the metadata it prints."""
+    metadata: Any = dict(MOCK_METADATA, is_headless=True)
+    tty = mock.Mock(isatty=mock.Mock(return_value=True))
+    with (
+        mock.patch("builtins.print") as mock_print,
+        mock.patch.object(sys, "stdout", tty),
+        mock.patch.object(sys, "stderr", tty),
+    ):
+      ida_mcp_server._print_metadata(metadata, "db", _IID)
+
+    (line,) = [call.args[0] for call in mock_print.call_args_list]
+    self.assertTrue(line.startswith("[MCP_JSON] "), line)
+    self.assertEqual(
+        json.loads(line.removeprefix("[MCP_JSON] ")),
+        {**metadata, "database_id": "db", "instance_id": _IID},
+    )
+    # The metadata itself is left alone.
+    self.assertNotIn("instance_id", metadata)
+
+  @unittest.skipIf(sys.platform == "win32", "Windows uses TCP")
+  @mock.patch(
+      "ida_mcp.tools.info.get_metadata.sync_call", return_value=MOCK_METADATA
+  )
+  def test_server_rejects_a_uds_dir_too_long_for_a_socket(self, mock_meta):
+    """Verifies an over-long socket path is reported, and nothing registers."""
+    config = load_config()
+    registry_dir = pathlib.Path(config["registry_dir"])
+    # 21 characters go to "/<instance id>.sock"; the OS limit is ~100.
+    long_uds_dir = registry_dir.parent / ("u" * 110)
+    config_path = registry_dir.parent / "long_uds.json"
+    config_path.write_text(
+        json.dumps({
+            "registry_dir": str(registry_dir),
+            "uds_dir": str(long_uds_dir),
+            "communication_channel": "uds",
+        })
+    )
+    with mock.patch.dict(os.environ, IDAMCP_CONFIG=str(config_path)):
+      load_config.cache_clear()
+      with self.assertLogs(ida_mcp_server.logger, level="ERROR") as logs:
+        # Returns instead of serving: there is no thread to stop.
+        mcp_server_thread("test_long_uds_id")
+    load_config.cache_clear()
+    self.assertIn("uds_dir is too long for a Unix socket", logs.output[0])
+    self.assertIn(f"a socket in {long_uds_dir} takes", logs.output[0])
+    # The socket's file name is the instance ID, which stays internal.
+    self.assertNotIn(".sock", logs.output[0])
+    self.assertEqual(list(registry_dir.glob("*.json")), [])
+    self.assertEqual(os.listdir(long_uds_dir), [])
+    # Reported before the metadata is printed, i.e., before a headless
+    # server redirects its output away from the gateway.
+    mock_meta.assert_not_called()
+
+  def test_registry_manager_promote(self):
+    """Verifies promote() renames an in-progress record, and only that."""
+    with tempfile.TemporaryDirectory() as tmp:
+      manager = RegistryManager(tmp)
+      self.addCleanup(manager.cleanup)
+      path = manager.register(
+          "tcp",
+          1234,
+          database_id="db",
+          instance_id=_IID,
+          started_at=12.5,
+          in_progress=True,
+      )
+      assert path is not None
+      self.assertEqual(path.name, f"analyzing-{_IID}.json")
+      promoted = manager.promote()
+      assert promoted is not None
+      self.assertEqual(promoted.name, f"ida-{_IID}.json")
+      self.assertFalse(path.exists())
+      entry = json.loads(promoted.read_text())
+      self.assertEqual(entry["database_id"], "db")
+      self.assertEqual(entry["started_at"], 12.5)
+      self.assertIsNone(manager.promote())  # Already plain.
+      manager.cleanup()
+      self.assertEqual(os.listdir(tmp), [])
+      self.assertIsNone(manager.promote())  # Nothing registered.
+
+      path = manager.register(
+          "tcp",
+          1234,
+          database_id="db",
+          instance_id=_IID,
+          started_at=12.5,
+          auto_analysis_disabled=True,
+      )
+      assert path is not None
+      self.assertEqual(path.name, f"ida-{_IID}.json")
+      self.assertTrue(json.loads(path.read_text())["auto_analysis_disabled"])
+
+  def test_registry_manager_promote_retries_the_rename(self):
+    """Verifies promote() gets past a rename that fails for a moment."""
+    with tempfile.TemporaryDirectory() as tmp:
+      manager = RegistryManager(tmp)
+      self.addCleanup(manager.cleanup)
+      real_replace = os.replace
+      for failures, promoted_name in (
+          (2, f"ida-{_IID}.json"),
+          (backend_registry._PROMOTE_ATTEMPTS, None),
+      ):
+        with self.subTest(failures=failures):
+          path = manager.register(
+              "tcp",
+              1234,
+              database_id="db",
+              instance_id=_IID,
+              started_at=1.0,
+              in_progress=True,
+          )
+          assert path is not None
+          # E.g., on Windows while another process has the record open.
+          calls = []
+
+          def flaky_replace(src, dst, failures=failures, calls=calls):
+            calls.append(src)
+            if len(calls) <= failures:
+              raise PermissionError("in use")
+            real_replace(src, dst)
+
+          with (
+              mock.patch.object(backend_registry.os, "replace", flaky_replace),
+              mock.patch.object(backend_registry.time, "sleep") as sleep,
+              self.assertLogs(level="ERROR")
+              if promoted_name is None
+              else contextlib.nullcontext(),
+          ):
+            promoted = manager.promote()
+          if promoted_name is None:
+            self.assertIsNone(promoted)
+            self.assertTrue(path.exists())  # Still under its old name.
+          else:
+            assert promoted is not None
+            self.assertEqual(promoted.name, promoted_name)
+            self.assertEqual(sleep.call_count, failures)
+          manager.cleanup()
+
+  def test_registry_manager_cleanup_retries_transient_unlink_failure(self):
+    """Verifies cleanup() retries unlink() when another process holds file."""
+    with tempfile.TemporaryDirectory() as tmp:
+      manager = RegistryManager(tmp)
+      path = manager.register(
+          "tcp", 1234, database_id="db", instance_id=_IID, started_at=1.0
+      )
+      assert path is not None
+      real_unlink = pathlib.Path.unlink
+      calls = []
+
+      def flaky_unlink(self_path):
+        calls.append(self_path)
+        if len(calls) <= 2:
+          raise PermissionError("in use")
+        real_unlink(self_path)
+
+      with (
+          mock.patch.object(pathlib.Path, "unlink", flaky_unlink),
+          mock.patch.object(backend_registry.time, "sleep") as sleep,
+      ):
+        manager.cleanup()
+      self.assertFalse(path.exists())
+      self.assertEqual(sleep.call_count, 2)
+
+  def test_superseded_stop_token_pulser_exits_when_new_loop_starts(self):
+    """Verifies _cancel_stop_token exits if a new loop replaced stop_token."""
+    old_token = ida_mcp_server.ida_thread.CancellationToken()
+    old_token.pulse = mock.Mock()
+    ida_thread._loop_running.set()
+    try:
+      with mock.patch.object(ida_thread.time, "sleep"):
+        ida_thread._cancel_stop_token(old_token)
+      self.assertTrue(old_token.is_cancelled)
+      old_token.pulse.assert_not_called()
+    finally:
+      ida_thread._loop_running.clear()
+
+  def _call_tools(self, entry, *methods):
+    """Calls RPC methods on a running server; returns results or errors."""
+
+    async def call():
+      client = RPCClient()
+      if entry["channel"] == "tcp":
+        await client.connect_tcp("127.0.0.1", entry["address"])
+      else:
+        await client.connect_uds(entry["address"])
+      results = []
+      try:
+        for method in methods:
+          try:
+            results.append(await client.call(method, {}))
+          except RPCError as e:
+            results.append(e)
+      finally:
+        await client.close()
+      return results
+
+    return asyncio.run(call())
+
+  @mock.patch(
+      "ida_mcp.tools.info.get_metadata.sync_call", return_value=MOCK_METADATA
+  )
+  def test_tools_are_rejected_until_analysis_is_done(self, _mock_meta):
+    """Verifies only allowed tools run while auto-analysis is in progress."""
+    test_id = "test_analysis_gate_id"
+    analysis_state.begin()
+    t = threading.Thread(target=mcp_server_thread, args=(test_id,), daemon=True)
+    t.start()
+    self.addCleanup(t.join, 5.0)
+    self.addCleanup(stop_server, test_id)
+    reg_file = _wait_for_record(registry._IN_PROGRESS_PREFIX)
+    assert reg_file is not None, "An in-progress record should be created"
+    entry = json.loads(reg_file.read_text())
+
+    with mock.patch.object(ida_thread, "stop") as stop:
+      rejected, config, unsafe_tools, closed = self._call_tools(
+          entry,
+          "configure_unsafe_tools",
+          "get_security_config",
+          "list_unsafe_tools",
+          "close_database",
+      )
+    # The read-only security tools answer, e.g., for the dashboard.
+    self.assertIn("enabled_unsafe_tools", config)
+    self.assertIsInstance(unsafe_tools, list)
+    self.assertIsInstance(rejected, RPCError)
+    self.assertEqual(
+        str(rejected), "auto analysis is still in progress, please wait."
+    )
+    self.assertEqual(rejected.data, -32001)  # A tool error.
+    self.assertIsNone(closed)
+    stop.assert_called_once_with()
+
+    analysis_state.finish()
+    instance_id, _ = registry.parse_record_name(reg_file.name)
+    promoted = reg_file.with_name(registry.record_name(instance_id, False))
+    self.assertTrue(promoted.exists())
+    self.assertFalse(reg_file.exists())
+    (config,) = self._call_tools(entry, "get_security_config")
+    self.assertIn("enabled_unsafe_tools", config)
+
+    stop_server(test_id)
+    t.join(timeout=5.0)
+    self.assertFalse(promoted.exists(), "The record is removed on shutdown")
+
+  @mock.patch(
+      "ida_mcp.tools.info.get_metadata.sync_call", return_value=MOCK_METADATA
+  )
+  def test_server_registers_plain_record_after_analysis(self, _mock_meta):
+    """Verifies a server started after the analysis, or without, is plain."""
+    for prepare, disabled in (
+        (lambda: (analysis_state.begin(), analysis_state.finish()), False),
+        (analysis_state.disable, True),
+    ):
+      with self.subTest(disabled=disabled):
+        analysis_state.reset()
+        prepare()
+        test_id = "test_plain_record_id"
+        t = threading.Thread(
+            target=mcp_server_thread, args=(test_id,), daemon=True
+        )
+        t.start()
+        reg_file = _wait_for_record()
+        try:
+          assert reg_file is not None
+          entry = json.loads(reg_file.read_text())
+          self.assertEqual(entry["auto_analysis_disabled"], disabled)
+          (config,) = self._call_tools(entry, "get_security_config")
+          self.assertIn("enabled_unsafe_tools", config)
+        finally:
+          stop_server(test_id)
+          t.join(timeout=5.0)
+
+  def test_jsonrpc_copies_allow_during_auto_analysis(self):
+    """Verifies @jsonrpc copies allow_during_auto_analysis to wrappers."""
+    from ida_mcp.core.decorators import allow_during_auto_analysis
+    from ida_mcp.core.decorators import jsonrpc
+    from ida_mcp.core.rpc_registry import rpc_registry
+
+    @jsonrpc
+    @allow_during_auto_analysis
+    def sync_allowed(x: int) -> int:
+      return x
+
+    @jsonrpc
+    @allow_during_auto_analysis
+    async def async_allowed(x: int) -> int:
+      return x
+
+    try:
+      self.assertTrue(sync_allowed.allow_during_auto_analysis)
+      self.assertTrue(async_allowed.allow_during_auto_analysis)
+    finally:
+      rpc_registry.methods.discard(sync_allowed)
+      rpc_registry.methods.discard(async_allowed)
+
+  @mock.patch(
+      "ida_mcp.tools.info.get_metadata.sync_call", return_value=MOCK_METADATA
+  )
+  def test_server_continues_when_init_tables_fails_on_startup(self, _mock_meta):
+    """Verifies an init_tables() error on startup is logged, not fatal."""
+    test_id = "test_init_tables_error_id"
+    with (
+        mock.patch.dict(os.environ, POPULATE_TABLES_ON_STARTUP="true"),
+        mock.patch.object(
+            query, "init_tables", side_effect=RuntimeError("db error")
+        ),
+        self.assertLogs(ida_mcp_server.logger, level="ERROR"),
+    ):
+      load_config.cache_clear()
+      t = threading.Thread(
+          target=mcp_server_thread, args=(test_id,), daemon=True
+      )
+      t.start()
+      reg_file = _wait_for_record()
+      try:
+        self.assertIsNotNone(reg_file)
+      finally:
+        stop_server(test_id)
+        t.join(timeout=5.0)
 
   def test_plugin_server_waits_less_at_shutdown(self):
     """Verifies the plugin's server waits less at shutdown than the default.
@@ -581,9 +1236,7 @@ class TestPluginAutostart(unittest.TestCase):
         mock.patch.object(idaapi, "auto_is_ok", return_value=True)
     )
     self.auto_enabled = self._patch(
-        mock.patch.object(
-            idaapi, "inf_is_auto_enabled", return_value=True, create=True
-        )
+        mock.patch.object(idaapi, "inf_is_auto_enabled", return_value=True)
     )
     self.register_timer = self._patch(
         mock.patch.object(
@@ -724,6 +1377,23 @@ class TestPluginAutostart(unittest.TestCase):
     self.assertNotIn("auto-analysis", out.getvalue())
     plugin._start_server.assert_called_once_with()
     auto_wait.assert_not_called()
+
+  def test_plugin_records_disabled_analysis_and_resets_on_term(self):
+    """Verifies GUI disabled analysis sets DISABLED and term() resets it."""
+    self.auto_is_ok.return_value = False
+    self.auto_enabled.return_value = False
+    plugin, _ = self._init_plugin(mock_start=False)
+    with (
+        mock.patch.object(ida_mcp_plugin, "mcp_server_thread"),
+        mock.patch.object(idaapi, "is_headless", None),
+        mock.patch.object(idaapi, "idb_path", None, create=True),
+    ):
+      plugin._start_server()
+      assert plugin.server_thread is not None
+      plugin.server_thread.join(timeout=5.0)
+      self.assertEqual(analysis_state.status(), analysis_state.DISABLED)
+      plugin.term()
+      self.assertEqual(analysis_state.status(), analysis_state.DONE)
 
   def test_hotkey_during_a_pending_autostart(self):
     """Verifies the hotkey reports an autostart waiting for analysis only."""

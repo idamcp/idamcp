@@ -36,6 +36,7 @@ import unittest
 import mcp
 import mcp.client.stdio
 from shared.config import load_config
+from shared.process import is_process_running
 
 os.environ["IDAMCP_NO_USER_CONFIG"] = "1"
 load_config.cache_clear()
@@ -45,28 +46,6 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logging.getLogger("asyncio").setLevel(logging.WARNING)
-
-
-def _is_process_running(pid: int) -> bool:
-  if sys.platform == "win32":
-    try:
-      import ctypes  # pylint: disable=g-import-not-at-top
-
-      kernel32 = ctypes.windll.kernel32
-      # PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-      handle = kernel32.OpenProcess(0x1000, False, pid)
-      if handle:
-        kernel32.CloseHandle(handle)
-        return True
-      return False
-    except Exception:  # pylint: disable=broad-exception-caught
-      return False
-  else:
-    try:
-      os.kill(pid, 0)
-      return True
-    except OSError:
-      return False
 
 
 def _is_error(resp: typing.Any) -> bool:
@@ -264,7 +243,7 @@ class TestIDAMCP(unittest.IsolatedAsyncioTestCase):
       if pid:
         print(f"Waiting for backend process {pid} to exit...")
         for _ in range(100):
-          if not _is_process_running(pid):
+          if not is_process_running(pid):
             print("Process exited!")
             break
           await asyncio.sleep(0.1)
@@ -276,18 +255,6 @@ class TestIDAMCP(unittest.IsolatedAsyncioTestCase):
           except OSError:
             pass
           await asyncio.sleep(0.5)
-
-      # Manually delete registry file to trigger gateway unregister immediately
-      # and avoid any late exit deletion races.
-      registry_path = os.path.join(
-          tempfile.gettempdir(), "ida_mcp", f"{db_id_to_close}.json"
-      )
-      if os.path.exists(registry_path):
-        try:
-          os.remove(registry_path)
-          print(f"Manually removed registry file: {registry_path}")
-        except OSError as e:
-          print(f"Warning: failed to remove registry file {registry_path}: {e}")
 
       # Small extra sleep to ensure gateway has processed the deletion
       await asyncio.sleep(0.5)
@@ -441,6 +408,8 @@ class TestIDAMCP(unittest.IsolatedAsyncioTestCase):
     self.assertEqual(result["bitness"], golden["bitness"])
     self.assertEqual(result["procname"], golden["procname"])
     self.assertEqual(result["is_headless"], golden["is_headless"])
+    self.assertNotIn("instance_id", result)
+    self.assertEqual(result["auto_analysis_status"], "done")
 
   async def verify_get_function_by_address(self):
     result = await self.run_tool("get_function_by_address", address="0x1240")
@@ -2010,6 +1979,7 @@ for ea in (0x10d0, 0x10a0):
     """Opens a copy of the test binary as a raw binary at 0x10000."""
     import shutil  # pylint: disable=g-import-not-at-top
 
+    assert self.session is not None
     tmp_dir = tempfile.mkdtemp(prefix="lo.")
     fw = os.path.join(tmp_dir, "fw.bin")
     shutil.copy(os.path.abspath("tests/test_binary"), fw)
@@ -2061,13 +2031,45 @@ for ea in (0x10d0, 0x10a0):
       )
       self.assertTrue(_is_error(resp))
       self.assertIn("Invalid processor", resp.content[0].text)
+
+      # Opening a new binary with disable_auto_analysis=True skips analysis and
+      # reports "disabled".
+      await self.session.call_tool(
+          "idalib_headless_close", {"database_id": opened_id}
+      )
+      for _ in range(100):
+        if not pid or not is_process_running(pid):
+          break
+        await asyncio.sleep(0.1)
+      opened_id, pid = None, None
+      fw3 = os.path.join(tmp_dir, "fw3.bin")
+      shutil.copy(fw, fw3)
+      resp = await self.session.call_tool(
+          "idalib_headless_open",
+          {"path": fw3, "disable_auto_analysis": True},
+      )
+      self.assertFalse(_is_error(resp), resp)
+      sc = _structured_content(resp)
+      opened_id, pid = sc["database_id"], sc.get("pid")
+      self.assertEqual(sc["auto_analysis_status"], "disabled")
+      self.assertIs(sc["busy"], False)
+      self.assertNotIn("instance_id", sc)
+      meta_resp = await self.session.call_tool(
+          "get_metadata", {"database_id": opened_id}
+      )
+      self.assertFalse(_is_error(meta_resp), meta_resp)
+      meta_content = meta_resp.content[0]
+      assert isinstance(meta_content, mcp.types.TextContent)
+      self.assertEqual(
+          json.loads(meta_content.text)["auto_analysis_status"], "disabled"
+      )
     finally:
       if opened_id:
         await self.session.call_tool(
             "idalib_headless_close", {"database_id": opened_id}
         )
         for _ in range(100):
-          if not pid or not _is_process_running(pid):
+          if not pid or not is_process_running(pid):
             break
           await asyncio.sleep(0.1)
       shutil.rmtree(tmp_dir, ignore_errors=True)

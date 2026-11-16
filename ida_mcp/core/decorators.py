@@ -642,10 +642,12 @@ def _retrieve_exception(future: asyncio.Future[Any]) -> None:
 def jsonrpc(func: Callable[..., Any]) -> Callable[..., Any]:
   """Decorator to register a function as a JSON-RPC method."""
   func.unsafe = getattr(func, "unsafe", False)
+  allow_during_analysis = getattr(func, "allow_during_auto_analysis", False)
 
   if inspect.iscoroutinefunction(func):
     validated_func = adapt_arguments(func)
     validated_func.unsafe = func.unsafe
+    validated_func.allow_during_auto_analysis = allow_during_analysis
     # Coroutine functions can be canceled directly, we don't need to wrap it.
     return rpc_registry.register(validated_func)
   if getattr(func, "is_ida_tool", False):
@@ -708,6 +710,7 @@ def jsonrpc(func: Callable[..., Any]) -> Callable[..., Any]:
   wrapper.__signature__ = inspect.signature(func)  # type: ignore
   wrapper.__annotations__ = getattr(func, "__annotations__", {})
   wrapper.unsafe = func.unsafe  # type: ignore
+  wrapper.allow_during_auto_analysis = allow_during_analysis  # type: ignore
   wrapper.sync_call = getattr(func, "sync_call", func)  # type: ignore
 
   return rpc_registry.register(wrapper)
@@ -725,3 +728,12 @@ def internal(func: Callable[..., Any]) -> Callable[..., Any]:
 
 
 skip_proxy = internal
+
+
+def allow_during_auto_analysis(func: Callable[..., Any]) -> Callable[..., Any]:
+  """Marks a tool as callable while auto-analysis is still running.
+
+  Apply it below @jsonrpc, which copies the mark to the registered function.
+  """
+  func.allow_during_auto_analysis = True
+  return func

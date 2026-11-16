@@ -21,6 +21,7 @@
 """Headless IDA Pro MCP Server."""
 
 import argparse
+import asyncio
 import contextlib
 import hashlib
 import inspect
@@ -29,6 +30,7 @@ import pathlib
 import signal
 import sys
 import threading
+import time
 
 # fmt: off
 # idapro must go first to initialize idalib
@@ -37,17 +39,96 @@ try:
 except ImportError:
   sys.exit("[Error] Can't import idapro, please install idalib first.")
 
+import ida_auto
 import idaapi
+from ida_mcp.core import analysis_state
 from ida_mcp.core import ida_thread
+from ida_mcp.core.decorators import cancellation_profile
 from ida_mcp.server import mcp_server_thread
 from ida_mcp.server import stop_server
 from ida_mcp.tools.execution import clear_persistent_globals
 from ida_mcp.tools.query import close_tables
+from ida_mcp.tools.query import init_tables
 from shared import load_options
+from shared.config import load_config
 # fmt: on
 
 
 logger = logging.getLogger(__name__)
+
+# How long one slice of auto-analysis runs, in seconds, before the IDA thread
+# checks its queue again (e.g., for the request to close the database).
+# ida_auto.auto_wait() would run the whole analysis in one call, and it keeps
+# the GIL, so the RPC server could not answer until it returned.
+_ANALYSIS_SLICE_SECONDS = 0.05
+
+
+def _on_analysis_done() -> None:
+  """Sets up the query tables, then lets tool calls through.
+
+  The table setup gives way to a shutdown: if the IDA thread has been asked to
+  stop, before or during the setup, the tools stay locked and the record
+  keeps its in-progress name, since the server is about to go away.
+  """
+  try:
+    if load_config().get("populate_tables_on_startup"):
+      with cancellation_profile(ida_thread.stop_token, native_ida_cancel=True):
+        init_tables()
+  except asyncio.CancelledError:
+    logger.info("Query table setup interrupted: the server is stopping.")
+    return
+  except Exception as e:  # pylint: disable=broad-exception-caught
+    logger.exception("Error initializing query tables: %s", e)
+  analysis_state.finish()
+  logger.info("Auto-analysis finished.")
+
+
+def _analysis_slice() -> bool:
+  """Runs auto-analysis for one time slice on the IDA thread.
+
+  Returns:
+    False once the analysis has finished, True while there is more to do.
+  """
+  try:
+    deadline = time.monotonic() + _ANALYSIS_SLICE_SECONDS
+    while time.monotonic() < deadline:
+      if ida_auto.auto_make_step(0, idaapi.BADADDR):
+        continue
+      if not ida_auto.auto_is_ok():
+        # Nothing left to step through, but the queues aren't final yet. This
+        # call can't be interrupted, and the RPC server can't answer while it
+        # runs, so leave a trace of how long it took.
+        started = time.monotonic()
+        ida_auto.auto_wait()
+        logger.warning(
+            "Auto-analysis could not be finished in slices; auto_wait() ran"
+            " for %.1fs.",
+            time.monotonic() - started,
+        )
+      return False
+    return True
+  except Exception as e:  # pylint: disable=broad-exception-caught
+    # Don't leave the tools locked for good.
+    logger.exception("Auto-analysis failed: %s", e)
+    return False
+
+
+class _AnalysisIdle:
+  """The IDA thread's idle work: the analysis slices, then the table setup.
+
+  The table setup is a step of its own, so that the loop checks its queue
+  (e.g., for a close request) between the last slice and the setup.
+  """
+
+  def __init__(self) -> None:
+    self._analysed = False
+
+  def __call__(self) -> bool:
+    if not self._analysed:
+      self._analysed = not _analysis_slice()
+      return True
+    _on_analysis_done()
+    return False
 
 
 def _server_thread(hash_str: str) -> None:
@@ -69,6 +150,11 @@ def main():
   parser.add_argument("--loader", help="IDA file type name or prefix (-T)")
   parser.add_argument(
       "--base-address", help="Load address, 16-byte aligned (-b)"
+  )
+  parser.add_argument(
+      "--disable-auto-analysis",
+      action="store_true",
+      help="Don't run IDA's auto-analysis",
   )
   args = parser.parse_args()
 
@@ -110,8 +196,10 @@ def main():
   )
 
   try:
+    # The analysis runs later, in slices in ida_thread.loop(), so that the
+    # server can register and take a close request in the meantime.
     ret = idapro.open_database(
-        str(args.input_path), run_auto_analysis=True, **open_kwargs
+        str(args.input_path), run_auto_analysis=False, **open_kwargs
     )
     if ret != 0:
       logger.error(
@@ -136,6 +224,16 @@ def main():
   hash_str = hashlib.sha256(idb_path.encode()).hexdigest()[-8:]
 
   logger.info("Session identifier: %s", hash_str)
+
+  idle = None
+  if ida_auto.auto_is_ok():
+    pass
+  elif args.disable_auto_analysis:
+    analysis_state.disable()
+  else:
+    # Before the server thread starts, so that it registers as in progress.
+    analysis_state.begin()
+    idle = _AnalysisIdle()
   original_handlers = {}
 
   # Setup signal handlers for clean exit
@@ -160,7 +258,7 @@ def main():
   )
   server_thread.start()
   try:
-    ida_thread.loop()
+    ida_thread.loop(idle)
   finally:
     stop_server(hash_str)
     if server_thread.is_alive():

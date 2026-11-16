@@ -2207,6 +2207,14 @@
       "name": "get_metadata",
       "outputSchema": {
         "properties": {
+          "auto_analysis_status": {
+            "enum": [
+              "in_progress",
+              "done",
+              "disabled"
+            ],
+            "type": "string"
+          },
           "bitness": {
             "type": "integer"
           },
@@ -2260,7 +2268,8 @@
           "filetype",
           "bitness",
           "procname",
-          "is_headless"
+          "is_headless",
+          "auto_analysis_status"
         ],
         "type": "object"
       }
@@ -2752,7 +2761,7 @@
           "tags": []
         }
       },
-      "description": "Open a binary in a new headless IDA instance.\n\nIf the database is already open, this tool will raise an error containing\nthe existing session ID. It is recommended to call list_available_databases\nfirst to check for active sessions, or use the existing ID returned in the\nerror if you attempt to open an already-open database.\n\nprocessor/loader/base_address are for raw firmware or other files IDA can't\nidentify on its own; leave them unset to let IDA pick.",
+      "description": "Open a binary in a new headless IDA instance.\n\nReturns once the file is loaded. IDA's auto-analysis may still be running\nthen: check auto_analysis_status in the result. While it is \"in_progress\",\nevery tool call for this database fails with \"auto analysis is still in\nprogress, please wait.\"; call list_available_databases later to see when it\nis \"done\". The database can be closed at any time.\n\nIf the database is already open, this tool will raise an error containing\nthe existing session ID. It is recommended to call list_available_databases\nfirst to check for active sessions, or use the existing ID returned in the\nerror if you attempt to open an already-open database.\n\nprocessor/loader/base_address are for raw firmware or other files IDA can't\nidentify on its own; leave them unset to let IDA pick.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -2767,6 +2776,11 @@
             ],
             "default": null,
             "description": "Optional 16-byte aligned load address (IDA's -b), e.g. '0x10000'. Only for new binaries; needs IDA 9.1+"
+          },
+          "disable_auto_analysis": {
+            "default": false,
+            "description": "Skip IDA's auto-analysis, e.g., for a very large binary. The database then holds only what the loader created",
+            "type": "boolean"
           },
           "loader": {
             "anyOf": [
@@ -2806,6 +2820,14 @@
       "outputSchema": {
         "description": "Information about a connected IDA database.",
         "properties": {
+          "auto_analysis_status": {
+            "enum": [
+              "in_progress",
+              "done",
+              "disabled"
+            ],
+            "type": "string"
+          },
           "bitness": {
             "type": "integer"
           },
@@ -2869,6 +2891,7 @@
           "bitness",
           "procname",
           "is_headless",
+          "auto_analysis_status",
           "database_id",
           "pid"
         ],
@@ -2961,7 +2984,7 @@
           "tags": []
         }
       },
-      "description": "List all available IDA database connection IDs.\n\nActive databases returned by this tool do not need to be opened again; they\nare ready to accept queries using their database_id.",
+      "description": "List all available IDA database connection IDs.\n\nActive databases returned by this tool do not need to be opened again; they\nare ready to accept queries using their database_id, unless their\nauto_analysis_status is \"in_progress\": such a database rejects every tool\nuntil IDA's auto-analysis has finished, so check again later.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {},
@@ -2974,6 +2997,14 @@
             "items": {
               "description": "Information about a connected IDA database.",
               "properties": {
+                "auto_analysis_status": {
+                  "enum": [
+                    "in_progress",
+                    "done",
+                    "disabled"
+                  ],
+                  "type": "string"
+                },
                 "bitness": {
                   "type": "integer"
                 },
@@ -3037,6 +3068,7 @@
                 "bitness",
                 "procname",
                 "is_headless",
+                "auto_analysis_status",
                 "database_id",
                 "pid"
               ],

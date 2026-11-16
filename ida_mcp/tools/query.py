@@ -45,6 +45,7 @@ import ida_bytes
 import ida_entry
 import ida_funcs
 import ida_idp
+from ida_mcp.core import analysis_state
 from ida_mcp.core.decorators import get_cancellation_token
 from ida_mcp.core.decorators import jsonrpc
 from ida_mcp.core.decorators import register_cancel_callback
@@ -1917,7 +1918,13 @@ def _trigger_rebase_invalidation() -> None:
 def _complete_rebase_if_auto_ok() -> bool:
   """Completes rebase process if auto-analysis is finished."""
   global _is_rebasing, _image_min_ea
-  if _is_rebasing and (not ida_auto.is_auto_enabled() or ida_auto.auto_is_ok()):
+  # A database opened with auto-analysis disabled never drains its queues.
+  if _is_rebasing and (
+      not ida_auto.is_auto_enabled()
+      or not idaapi.inf_is_auto_enabled()
+      or ida_auto.auto_is_ok()
+      or analysis_state.status() == analysis_state.DISABLED
+  ):
     _image_min_ea = idaapi.inf_get_min_ea()
     _is_rebasing = False
     config = load_config()

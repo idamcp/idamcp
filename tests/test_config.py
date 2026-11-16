@@ -126,6 +126,16 @@ class TestConfig(unittest.TestCase):
         config = shared.config.load_config()
         self.assertTrue(config.get("populate_tables_on_startup"))
 
+  def test_headless_analysis_wait(self):
+    """Test the default, the environment, and 0 for headless_analysis_wait."""
+    config = shared.config.load_config(config_path="/nonexistent")
+    self.assertEqual(config["headless_analysis_wait"], 10.0)
+    for value, expected in (("2.5", 2.5), ("0", 0.0)):
+      shared.config.load_config.cache_clear()
+      with mock.patch.dict(os.environ, HEADLESS_ANALYSIS_WAIT=value):
+        config = shared.config.load_config(config_path="/nonexistent")
+      self.assertEqual(config["headless_analysis_wait"], expected)
+
   def test_json_regex_strings(self):
     """Test that JSON arrays of regex patterns are parsed properly."""
     json_content = r'{"disabled_tools": ["^dbg_.*", "\\w+\\d+"]}'

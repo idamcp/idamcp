@@ -293,13 +293,27 @@ The system uses a "Dead Drop" discovery mechanism.
 
 ### Workflow
 
-1.  **Registration**: When the IDA Plugin loads, it writes a JSON metadata file
-    (PID, Port, Auth Token) to the registry directory (default:
-    `~/.ida_mcp_registry`).
+1.  **Registration**: When the server starts, it writes a JSON record (PID,
+    channel, address, database ID, start time, metadata) to the registry
+    directory (default: `~/.ida_mcp_registry`). The record is named after the
+    server's `instance_id`, 8 random bytes in hex that are new on every
+    start: `ida-<instance_id>.json`. The instance ID is internal: the
+    backend, the Gateway, and the dashboard tell the instances of a database
+    apart by it, and no tool result or metadata carries it. MCP clients only
+    see the database ID.
 2.  **Discovery**: The Gateway runs a `watchdog` thread monitoring this
-    directory.
-3.  **Connection**: Upon seeing a new JSON file, the Gateway verifies the
-    process is alive and adds it to the routing table.
+    directory. A record is written to a temporary file and renamed into
+    place, renamed again when auto-analysis ends (see 4.3), and unlinked on
+    exit. The watcher therefore acts on "moved" events, by the name of the
+    destination, and on "deleted" events, by the name of the removed file,
+    and only if that name is a record's; the temporary file and anything
+    else in the directory are ignored. "Created" events are not handled: a
+    record never appears under its name before it is complete. Both inotify
+    on Linux and `ReadDirectoryChangesW` on Windows report the rename as a
+    "moved" event.
+3.  **Connection**: Upon seeing a new record, the Gateway verifies the
+    process is alive and adds it to the routing table under the database ID
+    in the record.
 4.  **Routing**: Incoming tool calls include a `database_id`. The Router
     inspects this ID and forwards the payload to the corresponding backend via
     SSE (Server-Sent Events).
@@ -312,9 +326,9 @@ sequenceDiagram
     participant IDA as IDA Backend
 
     Note over IDA: Plugin Loaded
-    IDA->>FS: Write session_id.json
-    FS->>Gateway: File Created Event
-    Gateway->>Gateway: Connect(session_id)
+    IDA->>FS: Write ida-IID.json
+    FS->>Gateway: File Moved Event
+    Gateway->>Gateway: Connect(database_id)
 
     Note over Agent: User asks: "Analyze main"
     Agent->>Gateway: list_available_databases()
@@ -367,6 +381,34 @@ ensure that every specific instance on the disk has a unique, stable identifier.
 This allows the Agent to distinguish between different analysis files even if
 they target the same executable.
 
+Records and Unix sockets are named after the instance rather than the
+database, so two processes that serve the same database one after the other
+(e.g., a crashed instance and its replacement) never share a file: the old
+process can't remove the new one's record or socket when it exits, and an
+event for a record names exactly one process. A deleted record disconnects
+only the instance it belongs to. The ID is kept to 16 characters because the
+operating system limits the path of a Unix socket (107 bytes on Linux, 103 on
+macOS), and `<uds_dir>/<instance_id>.sock` has to fit; a server whose
+`uds_dir` is too long for that says so and does not start.
+
+With one record per instance, the file system no longer says which instance
+of a database is the newer, so each record carries `started_at`, the time its
+server started. A record of another instance replaces a live connection only
+if it started later; an older one (e.g., a leftover whose PID was reused) is
+ignored. Likewise, the `HeadlessManager` remembers which instance it spawned
+for a database and unregisters or signals the process only on behalf of that
+instance, so cleaning up after some other instance can't kill it. The
+Security Dashboard reads the registry itself and applies the same rule: per
+database, it lists and calls the running instance that started last.
+
+The watcher is a shortcut, not a requirement. `idalib_headless_open` learns
+the new instance's ID from the process's output, so it looks for the two
+names that instance's record can have instead of only waiting for an event,
+both to connect and to see the end of the analysis. `list_available_databases`
+does the same for every backend that is still being analysed. Opening a
+database therefore works when the watcher can't start, and a missed event
+never leaves the reported status stale.
+
 ### 4.2 Headless Instance Lifecycle & Quota Policy
 
 When the MCP client opens a binary via `idalib_headless_open`, the Gateway's
@@ -386,6 +428,91 @@ enforces a strict quota based on `max_headless_instances`:
     immediately frees the capacity slot, gracefully requests the database to
     save and close (`close_database`), closes the RPC connection, and terminates
     the process asynchronously.
+
+### 4.3 Registering Before Auto-Analysis Finishes
+
+Analysing a large binary can take a long time. A headless instance therefore
+registers as soon as IDA has loaded the file, and analyses it
+afterwards:
+
+1.  **Open without analysis**: `ida_mcp/headless.py` always calls
+    `idapro.open_database(..., run_auto_analysis=False)`.
+2.  **Register as in progress**: The server starts and writes its record as
+    `analyzing-<instance_id>.json`. The name is the only place the state is
+    stored, so it can't go stale: the Gateway reports
+    `auto_analysis_status: "in_progress"` for an `analyzing-` record and
+    `"done"` for an `ida-` one.
+3.  **Analyse in slices**: The IDA thread's loop (`ida_thread.loop(idle)`)
+    calls `ida_auto.auto_make_step()` for 50 ms at a time and checks its task
+    queue in between. `ida_auto.auto_wait()` can't be used: it keeps the GIL
+    for the whole analysis, so the RPC server thread could not answer anything,
+    and `set_cancelled()` does not interrupt it. With slices, the analysis took
+    about 3% longer in our measurement.
+4.  **Reject tool calls**: Until the analysis is done, the server answers every
+    tool with "auto analysis is still in progress, please wait." before the
+    call reaches the IDA thread. Only tools marked `@allow_during_auto_analysis`
+    run: `close_database`, so the instance can always be closed, and the
+    read-only `get_security_config` and `list_unsafe_tools`, so the Security
+    Dashboard can show the settings. Closing the instance saves the partly
+    analysed database, as closing the GUI would; the analysis resumes when
+    the database is opened again.
+5.  **Finish**: The IDA thread sets up the SQL tables (if
+    `populate_tables_on_startup` is set), lifts the restriction, and renames
+    the record to `ida-<instance_id>.json`. The Gateway finds the renamed record
+    of an instance it is already connected to and only updates the status; it
+    does not reconnect.
+
+A close request (`close_database`, `SIGTERM`) only queues a "quit" for the IDA
+thread's loop, which saves the database on its way out. The loop sees it
+between analysis slices, and the table setup is a step of its own, so a
+request that arrives during the analysis is honoured before the tables are
+populated. A request that arrives during the population interrupts it:
+`ida_thread.stop()` cancels `ida_thread.stop_token`, and the population runs
+in a `cancellation_profile` scope on that token, the mechanism that stops
+cancelled tool calls. The populators contain no checks for it, so it costs
+nothing while they run, and each table is written in one transaction, which
+is rolled back. Otherwise a population that outlasts the Gateway's 20 s grace
+would end in `SIGKILL` with the database unsaved. The same token covers the
+population that an already analysed database runs before it registers.
+
+`idalib_headless_open` waits up to `headless_analysis_wait` seconds (default
+10) for step 5 before it returns, so opening a small binary still returns a
+database that is ready to use.
+
+With `disable_auto_analysis=true`, steps 2 to 5 are skipped: the record is
+`ida-<instance_id>.json` from the start and carries
+`"auto_analysis_disabled": true`, a fixed
+property of the process, which the Gateway reports as
+`auto_analysis_status: "disabled"`. No IDA setting keeps a later
+`ida_auto.auto_wait()` from running the pending analysis (`enable_auto(False)`,
+`inf_set_auto_enabled(False)` and `-a` don't), but no tool calls it; code
+passed to `idapython_eval` can, to analyse the database on demand. The status
+stays `"disabled"` if it does.
+
+```mermaid
+sequenceDiagram
+    participant Agent
+    participant Gateway as MCP Gateway
+    participant FS as Registry dir
+    participant IDA as Headless backend
+
+    Agent->>Gateway: idalib_headless_open(path)
+    Gateway->>IDA: spawn
+    IDA->>IDA: open_database(run_auto_analysis=False)
+    IDA->>FS: analyzing-IID.json
+    FS->>Gateway: moved event, connect
+    loop 50 ms slices
+        IDA->>IDA: auto_make_step, then check queue
+    end
+    Gateway-->>Agent: status in_progress (after headless_analysis_wait)
+    Agent->>Gateway: any tool
+    Gateway->>IDA: forward
+    IDA-->>Agent: error: auto analysis is still in progress
+    IDA->>IDA: analysis done, init tables, lift restriction
+    IDA->>FS: rename to ida-IID.json
+    FS->>Gateway: moved event, same instance
+    Gateway->>Gateway: status done
+```
 
 --------------------------------------------------------------------------------
 

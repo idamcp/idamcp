@@ -56,7 +56,9 @@ Key capabilities of this implementation include:
     databases without reconfiguring the client.
 *   **Headless Mode**: Perform analysis in the background without the IDA Pro
     GUI, suitable for automated workflows. Sessions can be managed directly by
-    the AI agent.
+    the AI agent. A headless instance registers as soon as the file is loaded
+    and runs IDA's auto-analysis afterwards, so a large binary can be listed
+    and closed while it is still being analysed.
 *   **Relational SQL Engine**: Integrates a read-only SQLite relational database
     populated on-demand and synchronized via IDA event hooks. Tables
     (`functions`, `strings`, `names`, `imports`, `segments`, `local_types`,
@@ -236,8 +238,9 @@ example of all available settings (showing defaults):
   "communication_channel": "uds",
   "registry_dir": "~/.ida_mcp_registry",
   "uds_dir": "/tmp/ida_mcp_uds",
-  "max_headless_instances": 1,
+  "max_headless_instances": 4,
   "headless_open_timeout": 600.0,
+  "headless_analysis_wait": 10.0,
   "python_path": "/usr/bin/python3",
   "enable_all_unsafe_tools": false,
   "enabled_unsafe_tools": ["idapython_eval", "dbg_step_over"],
@@ -274,12 +277,24 @@ example of all available settings (showing defaults):
 *   **communication_channel**: Use `"uds"` for secure, local-only communication
     (Linux/macOS) or `"tcp"` for networked setups. Windows environments will
     default to `"tcp"`.
+*   **uds_dir**: Directory for the Unix sockets, one `<16 characters>.sock`
+    per IDA instance. The operating system limits a socket path to 107 bytes
+    on Linux and 103 on macOS, which leaves 85 and 81 for this directory.
+    With a longer one, the server does not start and reports that `uds_dir`
+    is too long.
 *   **max_headless_instances**: Limits how many background IDA processes the MCP
     Client (e.g., Gemini CLI) can spawn. This limit does not apply to manually
     launched instances.
-*   **headless_open_timeout**: Timeout in seconds for opening a headless IDA
-    instance. Increase this value if you're experiencing timeout errors with
-    large binaries or on slower hardware.
+*   **headless_open_timeout**: Timeout in seconds for a headless IDA instance
+    to load the file. Auto-analysis runs afterwards and does not count, but
+    populating the query tables of a database that is already analysed
+    (`populate_tables_on_startup`) happens before the instance registers and
+    does count. Increase this value if you're experiencing timeout errors
+    with large binaries or on slower hardware.
+*   **headless_analysis_wait**: How long `idalib_headless_open` waits, in
+    seconds, for IDA's auto-analysis to finish before it returns a database
+    that is still being analysed. `0` returns as soon as the file is loaded.
+    Defaults to `10.0`. See *Headless Mode* under Usage.
 *   **opcode_bytes**: Specifies how many instruction/data bytes to display in
     the disassembly or listing view when bytes are requested (defaults to 8).
 *   **sqlite_persistent**: If `True`, the Sqlite database used by `sql_query`
@@ -384,6 +399,7 @@ example of all available settings (showing defaults):
     or test suites).
 *   **POPULATE_TABLES_ON_STARTUP**: Set to `true`, `1`, or `yes` to enable table
     population at startup.
+*   **HEADLESS_ANALYSIS_WAIT**: Overrides `headless_analysis_wait`, in seconds.
 *   **SQLITE_PERSISTENT**: Set to `true`, `1`, or `yes` to enable persistent
     Sqlite storage.
 *   **CHECK_ENTRIES_FRESHNESS**: Set to `true`, `1`, or `yes` to enable entry
@@ -425,6 +441,9 @@ default. To manage these permissions and view active sessions:
     automatically by default).
 3.  Use the interface to approve/deny tools.
 
+While a headless instance is still running its auto-analysis, the dashboard
+shows its settings, but saving changes fails until the analysis has finished.
+
 The dashboard supports the following CLI arguments:
 
 *   `--port <number>`: Specify the port to run on (default: 8080).
@@ -461,22 +480,41 @@ via the agent.
 PYTHONPATH=/path/to/project python3 -m ida_mcp.headless /path/to/binary_or_idb
 ```
 
+Add `--disable-auto-analysis` to skip IDA's auto-analysis.
+
 **Via LLM CLI / AI Agent:** You can ask the AI agent to open files for you:
 
 *   **Open**: "Open the file `/path/to/binary` in headless mode."
 
     *   *Tool used*: `idalib_headless_open`
-    *   Caveat: If the target binary is large, IDA Pro requires significant time
-        to complete its initial auto-analysis. Consequently, the tool call may
-        timeout and be cancelled. To resolve this, you may need to adjust both
-        the `timeout` setting in the client settings and the
-        `headless_open_timeout` in `~/.idamcp.json`. Alternatively, it is
-        recommended to open the target binary manually the first time to allow
-        the initial auto-analysis to finish.
 
 *   **Close**: "Close the headless session for `/path/to/binary`."
 
     *   *Tool used*: `idalib_headless_close`
+
+**Auto-analysis:** A headless instance registers as soon as IDA has loaded the
+file and runs the auto-analysis afterwards, so opening a large binary does not
+wait for the analysis. `idalib_headless_open` and `list_available_databases`
+report its state as `auto_analysis_status`:
+
+*   `"done"`: The database is ready. `idalib_headless_open` waits up to
+    `headless_analysis_wait` seconds (10 by default) for this, so a small
+    binary comes back ready to use.
+*   `"in_progress"`: IDA is still analysing. Every tool call for the database
+    fails with "auto analysis is still in progress, please wait." until
+    `list_available_databases` reports `"done"`; until then both tools
+    report the database as `busy`. The session can be closed at
+    any time: the partly analysed database is saved, and the analysis resumes
+    when it is opened again.
+*   `"disabled"`: The analysis was skipped because the file was opened with
+    `disable_auto_analysis=true`, e.g., for a very large binary. The database
+    then holds only what the loader created.
+
+Loading the file still happens before `idalib_headless_open` returns. So does
+populating the query tables when a database that is already analysed is opened
+with `populate_tables_on_startup` set. If that takes longer than your client
+allows a tool call to run, raise the client's `timeout` setting and
+`headless_open_timeout`.
 
 *Note: The `max_headless_instances` setting in `~/.idamcp.json` ensures the MCP
 client doesn't spawn too many resource-heavy IDA processes. If the limit is

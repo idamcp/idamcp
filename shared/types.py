@@ -145,6 +145,12 @@ class Metadata(TypedDict):
   is_headless: Annotated[
       bool, "Whether the instance is running in headless mode"
   ]
+  auto_analysis_status: Annotated[
+      Literal["in_progress", "done", "disabled"],
+      "State of IDA's auto-analysis. While it is in_progress, every tool"
+      " fails; wait and check list_available_databases again. disabled means"
+      " the database was opened with disable_auto_analysis",
+  ]
 
 
 T = TypeVar("T")

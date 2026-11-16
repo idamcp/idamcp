@@ -31,6 +31,7 @@ import ida_gdl
 import ida_hexrays
 import ida_ida
 import ida_kernwin
+from ida_mcp.core import analysis_state
 from ida_mcp.core.decorators import internal, jsonrpc
 from ida_mcp.core.synchronization import idaread
 from ida_mcp.utils import helper
@@ -171,6 +172,7 @@ def get_metadata() -> Metadata:
       bitness=idaapi.inf_get_app_bitness(),
       procname=idaapi.inf_get_procname() or "<unknown>",
       is_headless=bool(getattr(idaapi, "is_headless", False)),
+      auto_analysis_status=analysis_state.status(),
   )
 
 

@@ -51,6 +51,9 @@ _DEFAULT_CONFIG = {
     "uds_dir": _DEFAULT_UDS_DIR,
     "max_headless_instances": 4,
     "headless_open_timeout": 600.0,
+    # How long idalib_headless_open waits, in seconds, for auto-analysis to
+    # finish before it returns a database that is still being analysed.
+    "headless_analysis_wait": 10.0,
     "python_path": sys.executable,
     "enable_all_unsafe_tools": False,
     "enabled_unsafe_tools": [],
@@ -231,6 +234,7 @@ def load_config(config_path: str | None = None) -> dict[str, Any]:
 
   _set_option_from_env(config, "populate_tables_on_startup")
   _set_option_from_env(config, "headless_open_timeout")
+  _set_option_from_env(config, "headless_analysis_wait")
   _set_option_from_env(config, "enabled_unsafe_tools")
   _set_option_from_env(config, "enable_all_unsafe_tools")
   _set_option_from_env(config, "disabled_tools")

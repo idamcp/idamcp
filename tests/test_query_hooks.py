@@ -2489,7 +2489,40 @@ class TestAuthorizerTableExtraction(unittest.TestCase):
     self.assertNotIn("error", res[0])
     self.assertNotIn("error", res[1])
     self.assertIn("INTERSECT", captured[0]["sql"])
+    self.assertTrue(captured[0]["sql"])
     self.assertTrue(captured[1]["sql"].startswith("EXPLAIN QUERY PLAN SELECT"))
+
+  def test_complete_rebase_when_auto_analysis_disabled(self):
+    """Verifies rebase finishes immediately when auto-analysis is disabled."""
+    from ida_mcp.core import analysis_state
+
+    self.addCleanup(analysis_state.reset)
+    for disable_via_plugin_flag in (False, True):
+      with self.subTest(disable_via_plugin_flag=disable_via_plugin_flag):
+        _drain_queue()
+        analysis_state.reset()
+        query._is_rebasing = True
+        if not disable_via_plugin_flag:
+          analysis_state.disable()
+        with (
+            mock.patch.object(
+                query.ida_auto, "is_auto_enabled", return_value=True
+            ),
+            mock.patch.object(query.ida_auto, "auto_is_ok", return_value=False),
+            mock.patch.object(
+                query.idaapi,
+                "inf_is_auto_enabled",
+                return_value=not disable_via_plugin_flag,
+            ),
+            mock.patch.object(
+                query,
+                "load_config",
+                return_value={"populate_tables_on_startup": False},
+            ),
+        ):
+          self.assertTrue(query._complete_rebase_if_auto_ok())
+        self.assertFalse(query._is_rebasing)
+        _drain_queue()
 
 
 def tearDownModule():

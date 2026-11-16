@@ -22,9 +22,9 @@
 
 import argparse
 import asyncio
-import glob
+from collections.abc import Mapping
+import contextlib
 import json
-import os
 import pathlib
 import sys
 import threading
@@ -39,9 +39,13 @@ if str(root_dir) not in sys.path:
 
 import fastapi  # pylint: disable=g-import-not-at-top
 import fastapi.responses  # pylint: disable=g-import-not-at-top
-from shared.rpc import RPCClient, RPCError
 from pydantic import BaseModel  # pylint: disable=g-import-not-at-top
+from shared import registry  # pylint: disable=g-import-not-at-top
 from shared.config import load_config  # pylint: disable=g-import-not-at-top
+# pylint: disable-next=g-import-not-at-top
+from shared.process import is_process_running
+from shared.rpc import RPCClient  # pylint: disable=g-import-not-at-top
+from shared.rpc import RPCError  # pylint: disable=g-import-not-at-top
 import uvicorn  # pylint: disable=g-import-not-at-top
 
 app = fastapi.FastAPI()
@@ -80,12 +84,87 @@ async def check_backend_alive(info: typing.Dict[str, typing.Any]) -> bool:
       await client.close()
 
 
+def _read_record(record_path: pathlib.Path) -> dict[str, typing.Any] | None:
+  """Reads a registry record, following a concurrent promotion rename."""
+  candidates = [record_path]
+  instance_id, in_progress = registry.parse_record_name(record_path.name)
+  if in_progress:
+    # The only rename is from the in-progress name to the plain one.
+    candidates.append(
+        record_path.with_name(registry.record_name(instance_id, False))
+    )
+  for path in candidates:
+    try:
+      data = json.loads(path.read_text(encoding="utf-8"))
+      if isinstance(data, dict):
+        return data
+    except FileNotFoundError:
+      continue
+    except Exception as e:  # pylint: disable=broad-exception-caught
+      print(f"Error reading registry file {path}: {e}")
+      return None
+  return None
+
+
+def _cleanup_stale_record(
+    record_path: pathlib.Path, data: Mapping[str, typing.Any]
+) -> None:
+  """Removes a dead backend's registry file and any UDS socket it left."""
+  with contextlib.suppress(OSError):
+    record_path.unlink()
+    print(f"Removed stale registry file: {record_path}")
+  if data.get("channel") == "uds" and data.get("address"):
+    with contextlib.suppress(OSError):
+      uds_path = pathlib.Path(data["address"])
+      if uds_path.exists():
+        uds_path.unlink()
+        print(f"Removed stale UDS socket: {uds_path}")
+
+
+def _started_at(data: Mapping[str, typing.Any]) -> float:
+  """Returns a record's start time, or 0 if it has none."""
+  value = data.get("started_at")
+  if isinstance(value, bool) or not isinstance(value, (int, float)):
+    return 0.0
+  return float(value)
+
+
+def _newest_live_records() -> dict[str, dict[str, typing.Any]]:
+  """Returns, per database ID, the record of its newest running instance.
+
+  Removes the records of dead processes on the way. As in the gateway, the
+  latest `started_at` wins: a leftover record whose PID was reused must not
+  shadow the instance that replaced it.
+  """
+  newest: dict[str, dict[str, typing.Any]] = {}
+  for record_path in registry.list_records(pathlib.Path(REGISTRY_DIR)):
+    data = _read_record(record_path)
+    if data is None:
+      continue
+    pid = data.get("pid")
+    if pid and not is_process_running(pid):
+      _cleanup_stale_record(record_path, data)
+      continue
+    database_id = data.get("database_id")
+    if not isinstance(database_id, str):
+      continue
+    current = newest.get(database_id)
+    if current is None or _started_at(data) > _started_at(current):
+      newest[database_id] = data
+  return newest
+
+
+def _find_backend_info(backend_name: str) -> dict[str, typing.Any] | None:
+  """Finds the record of the newest running instance of `backend_name`."""
+  return _newest_live_records().get(backend_name)
+
+
 @app.get("/", response_class=fastapi.responses.HTMLResponse)
 async def read_root():
   """Serve the index HTML."""
   html_path = pathlib.Path(__file__).parent / "index.html"
   if html_path.exists():
-    with open(html_path) as f:
+    with open(html_path, encoding="utf-8") as f:
       return f.read()
   return "<h1>Frontend index.html not found</h1>"
 
@@ -93,42 +172,19 @@ async def read_root():
 @app.get("/api/backends")
 async def get_backends():
   """List all available backends."""
-  files = glob.glob(os.path.join(REGISTRY_DIR, "*.json"))
   backends = []
-  for f in files:
-    try:
-      with open(f) as fd:
-        data = json.load(fd)
-
-      if await check_backend_alive(data):
-        backends.append(data)
-      else:
-        # Backend is dead, try to clean up
-        try:
-          os.remove(f)
-          print(f"Removed stale registry file: {f}")
-        except OSError:
-          pass
-
-    except Exception as e:  # pylint: disable=broad-exception-caught
-      print(f"Error reading/checking registry file {f}: {e}")
+  for data in _newest_live_records().values():
+    if await check_backend_alive(data):
+      backends.append(data)
   return backends
 
 
 @app.post("/api/rpc/{backend_name}")
 async def call_rpc(backend_name: str, req: RpcRequest):
   """Forward an RPC call to a specific backend."""
-  path = os.path.join(REGISTRY_DIR, f"{backend_name}.json")
-  if not os.path.exists(path):
+  info = _find_backend_info(backend_name)
+  if info is None:
     raise fastapi.HTTPException(status_code=404, detail="Backend not found")
-
-  try:
-    with open(path) as f:
-      info = json.load(f)
-  except Exception as e:
-    raise fastapi.HTTPException(
-        status_code=500, detail="Failed to read backend info"
-    ) from e
 
   client = None
   try:

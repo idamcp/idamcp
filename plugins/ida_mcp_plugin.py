@@ -35,6 +35,8 @@ project_root = os.path.dirname(current_dir)
 if project_root not in sys.path:
   sys.path.insert(0, project_root)
 
+# pylint: disable-next=g-import-not-at-top,g-bad-import-order
+from ida_mcp.core import analysis_state
 from ida_mcp.core.security import security_manager  # pylint: disable=g-import-not-at-top,g-bad-import-order
 from ida_mcp.server import mcp_server_thread  # pylint: disable=g-import-not-at-top,g-bad-import-order
 from ida_mcp.server import stop_server  # pylint: disable=g-import-not-at-top,g-bad-import-order
@@ -206,6 +208,10 @@ class MCP(idaapi.plugin_t):
     # Tool calls reach the main thread through IDA's UI loop in the GUI and
     # idat, but through ida_mcp.headless's own loop under idalib.
     idaapi.is_headless = _is_headless()  # type: ignore
+    if not idaapi.auto_is_ok() and not idaapi.inf_is_auto_enabled():
+      analysis_state.disable()
+    else:
+      analysis_state.reset()
     hash_str = hashlib.sha256(
         idaapi.get_path(idaapi.PATH_TYPE_IDB).encode()
     ).hexdigest()[-8:]
@@ -262,9 +268,13 @@ class MCP(idaapi.plugin_t):
     except Exception:
       pass
 
-    # 5. Reset security settings
+    # 5. Reset security and analysis state
     try:
       security_manager.reset()
+    except Exception:
+      pass
+    try:
+      analysis_state.reset()
     except Exception:
       pass
 

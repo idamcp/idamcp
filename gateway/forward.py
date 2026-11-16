@@ -32,6 +32,7 @@ import re
 import signal
 import subprocess
 import sys
+import time
 from typing import Annotated, Any, Mapping, NotRequired, Sequence
 
 from fastmcp import FastMCP
@@ -58,7 +59,9 @@ from pydantic import BaseModel
 from pydantic import ConfigDict
 from pydantic import Field
 from shared import load_options
+from shared import registry
 from shared.config import load_config
+from shared.process import is_process_running
 from shared.rpc import RPCClient
 from shared.rpc import RPCError
 from shared.types import AddressValue
@@ -77,28 +80,7 @@ logging.basicConfig(level=logging.ERROR)
 # Load configuration
 CONFIG = load_config()
 REGISTRY_DIR = pathlib.Path(CONFIG["registry_dir"])
-
-
-def _is_process_running(pid: int) -> bool:
-  """Detect whether the process is still alive."""
-  if sys.platform == "win32":
-    with contextlib.suppress(Exception):
-      import ctypes  # pylint: disable=g-import-not-at-top
-
-      kernel32 = ctypes.windll.kernel32
-      # PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-      kernel32.OpenProcess.restype = ctypes.c_void_p
-      handle = kernel32.OpenProcess(0x1000, False, pid)
-      if handle:
-        kernel32.CloseHandle(handle)
-        return True
-    return False
-  else:
-    try:
-      os.kill(pid, 0)
-      return True
-    except OSError:
-      return False
+UDS_DIR = pathlib.Path(CONFIG["uds_dir"])
 
 
 def _cleanup_stale_registry_file(
@@ -124,12 +106,19 @@ def _cleanup_stale_registry_file(
         logging.info("Removed stale UDS socket: %s", uds_path)
 
 
-def _cleanup_stale_registry_by_id(
-    database_id: str,
-    data: Mapping[str, Any] | None = None,
-) -> None:
-  """Remove stale registry file by database ID and any associated UDS socket."""
-  _cleanup_stale_registry_file(REGISTRY_DIR / f"{database_id}.json", data)
+def _cleanup_stale_instance(instance_id: str | None) -> None:
+  """Remove an instance's stale registry file and any associated UDS socket."""
+  if not instance_id:
+    return
+  for in_progress in (True, False):
+    _cleanup_stale_registry_file(
+        REGISTRY_DIR / registry.record_name(instance_id, in_progress)
+    )
+  with contextlib.suppress(OSError):
+    uds_path = UDS_DIR / f"{instance_id}.sock"
+    if uds_path.exists():
+      uds_path.unlink()
+      logging.info("Removed stale UDS socket: %s", uds_path)
 
 
 class DatabaseInfo(Metadata):
@@ -138,7 +127,11 @@ class DatabaseInfo(Metadata):
   database_id: Annotated[str, "The unique ID of the target IDA database"]
   pid: Annotated[int, "Process ID of the IDA instance"]
   busy: NotRequired[
-      Annotated[bool, "Whether the database is currently busy executing a tool"]
+      Annotated[
+          bool,
+          "Whether the database is currently busy executing a tool or"
+          " running its auto-analysis",
+      ]
   ]
 
 
@@ -173,6 +166,12 @@ class ClientState(BaseModel):
 
 _global_clients: dict[str, RPCClient] = {}
 _global_metadata: dict[str, DatabaseInfo] = {}
+# The instance that is connected for each database, and the reverse. Both
+# change only together with _global_metadata. The instance ID stays out of
+# the metadata, which MCP clients get to see: only the gateway needs it, and
+# a client would confuse it with the database ID.
+_global_backend_id_to_instance_id: dict[str, str] = {}
+_global_instance_id_to_backend_id: dict[str, str] = {}
 _global_database_id_to_pid: dict[str, int] = {}
 _global_client_state: dict[str, ClientState] = collections.defaultdict(
     ClientState
@@ -180,6 +179,17 @@ _global_client_state: dict[str, ClientState] = collections.defaultdict(
 _backend_events: dict[str, asyncio.Event] = collections.defaultdict(
     asyncio.Event
 )
+# Set when a backend's auto-analysis is no longer in progress, or when the
+# backend is disconnected. An entry exists only while spawn() waits for it.
+_analysis_events: dict[str, asyncio.Event] = {}
+# When each connected instance started (its record's started_at): of two live
+# instances of a database, the gateway keeps the newer.
+_global_started_at: dict[str, float] = {}
+# How long spawn() waits, in seconds, for the new instance to register.
+_SPAWN_CONNECT_TIMEOUT = 15.0
+# How long a process gets to exit, in seconds, after it is asked to, before
+# it is killed.
+_KILL_GRACE_SECONDS = 20
 _background_tasks: set[asyncio.Task] = set()
 _watcher_active: bool = False
 _observer: Observer | None = None
@@ -231,8 +241,8 @@ async def _kill_process_gracefully(pid: int) -> None:
       os.kill(pid, sig)
 
     # Wait a bit for graceful shutdown
-    for _ in range(20):
-      if not _is_process_running(pid):
+    for _ in range(_KILL_GRACE_SECONDS):
+      if not is_process_running(pid):
         logging.info("[HeadlessManager] Process %d exited gracefully", pid)
         break
       await asyncio.sleep(1)
@@ -254,6 +264,25 @@ async def _kill_process_gracefully(pid: int) -> None:
     logging.warning("Failed to kill process %s: %s", pid, e)
 
 
+async def _kill_and_clean_up(pid: int, instance_id: str | None) -> None:
+  """Terminates a process, then removes the files it left if it was killed."""
+  await _kill_process_gracefully(pid)
+  # A process that exits by itself removes its record and socket; one that
+  # had to be killed doesn't, and nothing else would ever name them again.
+  # A killed process counts as running until it has been reaped, so it gets
+  # a moment to go.
+  for _ in range(100):
+    if not is_process_running(pid):
+      _cleanup_stale_instance(instance_id)
+      return
+    await asyncio.sleep(0.05)
+
+
+def _process_exited(process: Any) -> bool:
+  """Whether a spawned subprocess has exited."""
+  return isinstance(process.returncode, int)
+
+
 class HeadlessManager:
   """Manages headless IDA instances."""
 
@@ -261,19 +290,58 @@ class HeadlessManager:
     self.max_instances = max_instances
     self.spawned_instances: set[str] = set()
     self._pending_spawns: int = 0
+    # The instance spawned for each database, where known.
+    self._instance_ids: dict[str, str] = {}
 
-  def register(self, database_id: str, pid: int):
+  def register(
+      self, database_id: str, pid: int, instance_id: str | None = None
+  ):
     """Register a new active headless instance."""
     self.spawned_instances.add(database_id)
     _global_database_id_to_pid[database_id] = pid
+    if instance_id:
+      self._instance_ids[database_id] = instance_id
+    else:
+      self._instance_ids.pop(database_id, None)
 
-  async def unregister(self, database_id: str):
-    """Unregister a headless instance."""
+  def owns(self, database_id: str, instance_id: str | None) -> bool:
+    """Whether instance_id is, or may be, the one registered for database_id.
+
+    False only if another instance is known to be registered: cleaning up
+    after some other instance of the database (a leftover record, a replaced
+    connection) must not unregister or signal the spawned one.
+    """
+    registered = self._instance_ids.get(database_id)
+    return not (instance_id and registered and instance_id != registered)
+
+  async def unregister(self, database_id: str, instance_id: str | None = None):
+    """Unregister a headless instance.
+
+    Args:
+      database_id: The database that the instance serves.
+      instance_id: The instance's ID if known. Nothing happens if another
+        instance is registered for the database; otherwise it names the registry
+        record and socket to remove if the process has to be killed.
+    """
+    if not self.owns(database_id, instance_id):
+      logging.info(
+          "[HeadlessManager] not unregistering %s: instance %s isn't the"
+          " registered one",
+          database_id,
+          instance_id,
+      )
+      return
     logging.info("[HeadlessManager] unregister started for %s", database_id)
     self.spawned_instances.discard(database_id)
+    registered_id = self._instance_ids.pop(database_id, None)
     pid = _global_database_id_to_pid.pop(database_id, None)
-    if pid is not None and _is_process_running(pid):
-      _create_background_task(_kill_process_gracefully(pid))
+    if pid is not None:
+      if is_process_running(pid):
+        _create_background_task(
+            _kill_and_clean_up(pid, instance_id or registered_id)
+        )
+      else:
+        _cleanup_stale_instance(instance_id or registered_id)
 
   async def close(self, database_id: str) -> None:
     """Close a specific headless instance gracefully."""
@@ -284,8 +352,15 @@ class HeadlessManager:
       self,
       path: str,
       options: load_options.LoadOptions | None = None,
+      disable_auto_analysis: bool = False,
   ) -> DatabaseInfo:
-    """Spawn a headless instance, optionally with validated load options."""
+    """Spawn a headless instance, optionally with validated load options.
+
+    Returns once the instance has loaded the file and registered. If its
+    auto-analysis is still running then, waits up to `headless_analysis_wait`
+    seconds for it; the returned auto_analysis_status tells whether it
+    finished.
+    """
     path = os.path.abspath(path)
     if not os.path.exists(path):
       raise ToolError(f"{path} doesn't exist.")
@@ -302,17 +377,17 @@ class HeadlessManager:
           or metadata.get("filepath") == path
       ):
         pid = metadata.get("pid")
-        if pid and _is_process_running(pid):
+        if pid and is_process_running(pid):
           raise ToolError(
               f"Database {path} is already connected (ID: {db_id}). DO NOT"
               " attempt to open it again; use the existing ID to access it"
               " directly.",
           )
-        client = _global_clients.get(db_id)
-        if client is not None and client.is_closed:
-          # The instance died without cleaning up (crash, kill -9). Drop it
-          # now, so that it doesn't count against max_instances below, and
-          # so that its later cleanup can't pop the new process's PID entry.
+        if db_id in _global_clients:
+          # The instance died without cleaning up (crash, kill -9), possibly
+          # before the client's read loop noticed EOF. Drop it now, so that it
+          # doesn't count against max_instances below, and so that its later
+          # cleanup can't pop the new process's PID entry.
           await disconnect_backend(db_id)
 
     if len(self.spawned_instances) + self._pending_spawns >= self.max_instances:
@@ -349,6 +424,7 @@ class HeadlessManager:
           "ida_mcp.headless",
           path,
           *options.to_cli(),
+          *(["--disable-auto-analysis"] if disable_auto_analysis else []),
           stdin=asyncio.subprocess.DEVNULL,
           stdout=asyncio.subprocess.PIPE,
           stderr=asyncio.subprocess.PIPE,
@@ -405,6 +481,9 @@ class HeadlessManager:
         raise ToolError("metadata is None")
 
       db_id = metadata["database_id"]
+      # The line also names the instance, for the gateway only: it is not
+      # part of the result.
+      instance_id: str = metadata.pop("instance_id")  # type: ignore
       # Ensure pid matches what we spawned (for tracking)
       metadata["pid"] = process.pid
       # The check above may have missed a dead instance of this database if
@@ -413,31 +492,57 @@ class HeadlessManager:
       # registering the new process; otherwise connect_to_backend disconnects
       # it once the new record arrives, and that cleanup pops and signals the
       # new process's PID entry.
-      old_client = _global_clients.get(db_id)
-      if old_client is not None and old_client.is_closed:
+      if (
+          db_id in _global_clients
+          and _global_backend_id_to_instance_id.get(db_id) != instance_id
+      ):
         await disconnect_backend(db_id)
       async with _global_client_state[db_id].condition:
-        self.register(db_id, process.pid)
+        self.register(db_id, process.pid, instance_id)
     finally:
       self._pending_spawns -= 1
     try:
-      # connect_to_backend sets the event only if it exists, i.e. once this
-      # wait has started; it may have connected to the new instance earlier.
-      if db_id not in _global_clients:
-        await asyncio.wait_for(_backend_events[db_id].wait(), timeout=15.0)
-    except asyncio.TimeoutError:
+      # Look for the instance's record here too, rather than only wait for
+      # the watcher: the watcher may not be running, or may miss the event.
+      deadline = time.monotonic() + _SPAWN_CONNECT_TIMEOUT
+      while (
+          not _is_connected_to_instance(db_id, instance_id)
+          and db_id in self.spawned_instances
+      ):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+          raise TimeoutError
+        event = _backend_events[db_id]
+        event.clear()
+        await _connect_to_instance(instance_id)
+        if (
+            _is_connected_to_instance(db_id, instance_id)
+            or db_id not in self.spawned_instances
+            or _process_exited(process)
+        ):
+          break
+        with contextlib.suppress(asyncio.TimeoutError):
+          await asyncio.wait_for(event.wait(), timeout=min(0.1, remaining))
+    except TimeoutError as e:
       async with _global_client_state[db_id].condition:
-        await self.unregister(db_id)
+        await self.unregister(db_id, instance_id)
       raise ToolError(
-          "Backend process started, but registry event was never received"
-          " (timeout)."
-      )
+          "Backend process started, but it never registered (timeout)."
+      ) from e
     finally:
-      if db_id in _backend_events:
-        del _backend_events[db_id]
-    if db_id not in _global_clients:
-      async with _global_client_state[db_id].condition:
-        await self.unregister(db_id)
+      _backend_events.pop(db_id, None)
+    if (
+        not _is_connected_to_instance(db_id, instance_id)
+        # A connect_to_backend that failed meanwhile gave the instance up,
+        # and it is being killed, even if a later attempt then connected.
+        or db_id not in self.spawned_instances
+        or _process_exited(process)
+    ):
+      if _global_instance_id_to_backend_id.get(instance_id) == db_id:
+        await disconnect_backend(db_id)
+      else:
+        async with _global_client_state[db_id].condition:
+          await self.unregister(db_id, instance_id)
       stderr_str = ""
       if process.stderr:
         with contextlib.suppress(Exception):
@@ -445,20 +550,71 @@ class HeadlessManager:
               process.stderr.read(65535), timeout=0.2
           )
           stderr_str = stderr_bytes.decode("utf-8", errors="replace").strip()
-          if stderr_str:
-            raise ToolError(
-                f"Failed to connect to headless backend. stderr: {stderr_str}"
-            )
+      if stderr_str:
+        raise ToolError(
+            f"Failed to connect to headless backend. stderr: {stderr_str}"
+        )
       raise ToolError("Failed to connect to headless backend.")
 
+    await self._wait_for_analysis(db_id, instance_id, process)
+    info = _global_metadata.get(db_id)
+    if (
+        not _is_connected_to_instance(db_id, instance_id)
+        or _process_exited(process)
+        or info is None
+    ):
+      if _global_instance_id_to_backend_id.get(instance_id) == db_id:
+        await disconnect_backend(db_id)
+      else:
+        async with _global_client_state[db_id].condition:
+          await self.unregister(db_id, instance_id)
+      raise ToolError(
+          "The headless backend exited while its auto-analysis was running."
+      )
+    metadata["auto_analysis_status"] = info["auto_analysis_status"]
+    # As in list_available_databases: no tool call is under way yet, so the
+    # database is busy only while it is still being analysed.
+    metadata["busy"] = info["auto_analysis_status"] == "in_progress"
     return metadata
+
+  async def _wait_for_analysis(
+      self, db_id: str, instance_id: str, process: Any
+  ) -> None:
+    """Waits a while for a connected instance's auto-analysis to finish.
+
+    Returns when the analysis is no longer in progress, when the instance is
+    disconnected or exits, or after `headless_analysis_wait` seconds. Checks
+    for the renamed record itself, so it doesn't depend on a watcher event.
+    """
+    timeout = float(CONFIG.get("headless_analysis_wait") or 0)
+    deadline = time.monotonic() + timeout
+    event = _analysis_events.setdefault(db_id, asyncio.Event())
+    try:
+      while True:
+        info = _global_metadata.get(db_id)
+        if (
+            not _is_connected_to_instance(db_id, instance_id)
+            or _process_exited(process)
+            or info is None
+            or info.get("auto_analysis_status") != "in_progress"
+        ):
+          return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+          return
+        with contextlib.suppress(asyncio.TimeoutError):
+          await asyncio.wait_for(event.wait(), timeout=min(0.2, remaining))
+        if not event.is_set():
+          await _connect_to_instance(instance_id)
+    finally:
+      _analysis_events.pop(db_id, None)
 
 
 _headless_manager = HeadlessManager(CONFIG.get("max_headless_instances", 4))
 
 
-def _is_connected_to_pid(backend_id: str, pid: int | None) -> bool:
-  """Whether a live client for backend_id's process with this PID exists.
+def _is_connected_to_instance(backend_id: str, instance_id: str) -> bool:
+  """Whether a live client for this instance of backend_id exists.
 
   Call it under _global_client_state[backend_id].condition.
   """
@@ -467,72 +623,156 @@ def _is_connected_to_pid(backend_id: str, pid: int | None) -> bool:
       client is not None
       and not client.is_closed
       and not _global_client_state[backend_id].is_closed
-      and _global_metadata.get(backend_id, {}).get("pid") == pid
+      and _global_backend_id_to_instance_id.get(backend_id) == instance_id
   )
+
+
+async def _connect_to_instance(instance_id: str) -> None:
+  """Connects to an instance, or updates its status, from its own record.
+
+  Looks the record up by name instead of waiting for a watcher event. Does
+  nothing for a connected instance whose record still has its in-progress
+  name.
+  """
+  plain = REGISTRY_DIR / registry.record_name(instance_id, False)
+  if plain.exists():
+    await connect_to_backend(plain)
+    return
+  if instance_id not in _global_instance_id_to_backend_id:
+    in_progress = REGISTRY_DIR / registry.record_name(instance_id, True)
+    if in_progress.exists():
+      await connect_to_backend(in_progress)
+
+
+def _analysis_status(in_progress: bool, data: Mapping[str, Any]) -> str:
+  """Returns the auto_analysis_status that a registry record stands for.
+
+  Args:
+    in_progress: Whether the record's name has the in-progress prefix.
+    data: The record's content.
+  """
+  if in_progress:
+    return "in_progress"
+  return "disabled" if data.get("auto_analysis_disabled") else "done"
+
+
+def _update_analysis_status(backend_id: str, status: str) -> None:
+  """Records a connected instance's status from another of its records."""
+  info = _global_metadata[backend_id]
+  # The status only moves on: a late event for the in-progress record must
+  # not undo the rename that ended the analysis.
+  if status == "in_progress" or info.get("auto_analysis_status") == status:
+    return
+  info["auto_analysis_status"] = status  # type: ignore
+  logging.info("[Gateway] Backend %s auto-analysis: %s", backend_id, status)
+  if (event := _analysis_events.get(backend_id)) is not None:
+    event.set()
 
 
 async def connect_to_backend(registry_file: pathlib.Path) -> None:
   """Connect to a backend.
 
-  Idempotent for a record whose PID we are already connected to: concurrent
-  calls for the same record (watcher event, initial scan, fallback scan,
-  spawn) end up with a single connection. A record with a different PID
+  The record's name gives the instance ID and whether the instance's
+  auto-analysis is still running (see shared.registry); its content names the
+  database. Idempotent for a record of the instance we are already connected
+  to: concurrent calls for it (watcher event, initial scan, fallback scan,
+  spawn) end up with a single connection, and its renamed record only updates
+  the auto-analysis status. A record of another instance of the same database
   replaces the existing connection.
   """
-  backend_id = registry_file.stem
-  logging.info("[Gateway] connect_to_backend triggered for %s", backend_id)
+  instance_id, in_progress = registry.parse_record_name(registry_file.name)
+  logging.info("[Gateway] connect_to_backend triggered for %s", registry_file)
 
   data = None
-  try:
-    # Read registry file with retry logic (in case it's being written)
-    with contextlib.suppress(Exception):
-      if registry_file.exists():
-        with open(registry_file, "r", encoding="utf-8") as f:
-          content = f.read().strip()
-          if content:
-            data = json.loads(content)
-    if not data:
-      logging.error("[Gateway] Could not read registry file %s", registry_file)
-      if backend_id in _global_clients:
-        await disconnect_backend(backend_id)
-      return
+  # Read registry file with retry logic (in case it's being written)
+  with contextlib.suppress(Exception):
+    if registry_file.exists():
+      with open(registry_file, "r", encoding="utf-8") as f:
+        content = f.read().strip()
+        if content:
+          data = json.loads(content)
+  backend_id = data.get("database_id") if isinstance(data, dict) else None
+  started_at = data.get("started_at") if isinstance(data, dict) else None
+  if (
+      not data
+      or not isinstance(backend_id, str)
+      or isinstance(started_at, bool)
+      or not isinstance(started_at, (int, float))
+  ):
+    if in_progress:
+      # Nothing is lost if the instance has just renamed this record. The
+      # only rename is from the in-progress name to the plain one.
+      plain_record = registry_file.with_name(
+          registry.record_name(instance_id, False)
+      )
+      if plain_record.exists():
+        return
+    logging.error("[Gateway] Could not read registry file %s", registry_file)
+    connected_id = _global_instance_id_to_backend_id.get(instance_id)
+    if connected_id is not None:
+      await disconnect_backend(connected_id)
+    return
 
+  try:
     channel = data.get("channel")
     address = data.get("address")
     pid = data.get("pid")
-    if pid and not _is_process_running(pid):
+    status = _analysis_status(in_progress, data)
+    if pid and not is_process_running(pid):
       logging.info("Cleaning up stale registry file: %s", registry_file)
-      if backend_id in _global_clients:
+      if _global_instance_id_to_backend_id.get(instance_id) == backend_id:
         await disconnect_backend(backend_id)
       _cleanup_stale_registry_file(registry_file, data)
       return
 
     async with _global_client_state[backend_id].condition:
-      if _is_connected_to_pid(backend_id, pid):
+      if _is_connected_to_instance(backend_id, instance_id):
         logging.info(
-            "[Gateway] Already connected to backend %s (pid %s)",
+            "[Gateway] Already connected to backend %s (instance %s)",
             backend_id,
-            pid,
+            instance_id,
+        )
+        _update_analysis_status(backend_id, status)
+        return
+    current = _global_clients.get(backend_id)
+    if current is not None:
+      # Another instance of this database is connected. Records are named
+      # after the instance, so nothing says that this one is the newer: it
+      # may be a leftover of an earlier instance. Only a later start, or the
+      # death of the connected instance, replaces the connection.
+      current_pid = _global_metadata.get(backend_id, {}).get("pid")
+      if (
+          not current.is_closed
+          and (not current_pid or is_process_running(current_pid))
+          and started_at <= _global_started_at.get(backend_id, 0.0)
+      ):
+        logging.warning(
+            "[Gateway] Ignoring %s: a newer instance of %s is connected",
+            registry_file,
+            backend_id,
         )
         return
-    if backend_id in _global_clients:
       await disconnect_backend(backend_id)
 
     metadata = data.get("metadata", {})
     # Ensure database_id is present in the metadata
     metadata["database_id"] = backend_id
     metadata["pid"] = pid
+    metadata["auto_analysis_status"] = status
 
+    if address is None:
+      raise ValueError("the record has no address")
     client = RPCClient()
     async with _global_client_state[backend_id].condition:
-      # Another connect_to_backend for this record may have finished while
+      # Another connect_to_backend for this instance may have finished while
       # we were waiting for the lock.
-      if _is_connected_to_pid(backend_id, pid):
+      if _is_connected_to_instance(backend_id, instance_id):
         logging.info(
-            "[Gateway] Backend %s (pid %s) was connected concurrently",
+            "[Gateway] Backend %s (instance %s) was connected concurrently",
             backend_id,
-            pid,
+            instance_id,
         )
+        _update_analysis_status(backend_id, status)
         return
       # Retry connection logic
       for i in range(3):
@@ -566,8 +806,16 @@ async def connect_to_backend(registry_file: pathlib.Path) -> None:
           await asyncio.sleep(0.5)
 
       # Reset the closed state for new connections under the same ID
+      replaced = _global_backend_id_to_instance_id.get(backend_id)
+      if replaced is not None:
+        # A disconnect of the previous instance is still waiting for its
+        # calls: see "reopened during wait" in disconnect_backend.
+        _global_instance_id_to_backend_id.pop(replaced, None)
       _global_clients[backend_id] = client
       _global_metadata[backend_id] = metadata  # type: ignore
+      _global_backend_id_to_instance_id[backend_id] = instance_id
+      _global_instance_id_to_backend_id[instance_id] = backend_id
+      _global_started_at[backend_id] = started_at
       _global_client_state[backend_id].is_closed = False
       _global_client_state[backend_id].is_broken = False
       logging.info("[Gateway] Successfully connected to backend %s", backend_id)
@@ -578,11 +826,29 @@ async def connect_to_backend(registry_file: pathlib.Path) -> None:
     )
 
     async with _global_client_state[backend_id].condition:
-      await _headless_manager.unregister(backend_id)
-      _cleanup_stale_registry_by_id(backend_id, data)
+      await _headless_manager.unregister(backend_id, instance_id)
+      _cleanup_stale_registry_file(registry_file, data)
   finally:
     if _backend_events.get(backend_id) is not None:
       _backend_events.get(backend_id).set()  # type: ignore
+
+
+async def _on_record_deleted(registry_file: pathlib.Path) -> None:
+  """Disconnects the instance whose registry record was deleted."""
+  instance_id, in_progress = registry.parse_record_name(registry_file.name)
+  if in_progress:
+    # An in-progress record also goes away when the analysis ends: it was
+    # renamed, not removed, if the instance's plain record exists.
+    plain_record = registry_file.with_name(
+        registry.record_name(instance_id, False)
+    )
+    if plain_record.exists():
+      return
+  # A record of an instance we are not connected to, e.g., one that was
+  # replaced by a newer instance of the same database, changes nothing.
+  backend_id = _global_instance_id_to_backend_id.get(instance_id)
+  if backend_id is not None:
+    await disconnect_backend(backend_id)
 
 
 async def disconnect_backend(backend_id: str, unregister: bool = True) -> None:
@@ -593,6 +859,8 @@ async def disconnect_backend(backend_id: str, unregister: bool = True) -> None:
       unregister,
   )
   client = None
+  info: Mapping[str, Any] = {}
+  instance_id: str | None = None
   with contextlib.suppress(Exception):
     async with _global_client_state[backend_id].condition:
       if _global_client_state[backend_id].is_closed:
@@ -602,7 +870,12 @@ async def disconnect_backend(backend_id: str, unregister: bool = True) -> None:
         )
         return
       _global_client_state[backend_id].is_closed = True
-      if unregister:
+      # Whether the connected instance is the one spawned for this database,
+      # rather than, e.g., an earlier one that a newly spawned one replaces.
+      owned = _headless_manager.owns(
+          backend_id, _global_backend_id_to_instance_id.get(backend_id)
+      )
+      if unregister and owned:
         _headless_manager.spawned_instances.discard(backend_id)
       if _global_client_state[backend_id].number_of_ongoing_calls:
         logging.info(
@@ -624,13 +897,22 @@ async def disconnect_backend(backend_id: str, unregister: bool = True) -> None:
           )
           return
       client = _global_clients.pop(backend_id, None)
-      _global_metadata.pop(backend_id, None)
+      info = _global_metadata.pop(backend_id, None) or {}
+      instance_id = _global_backend_id_to_instance_id.pop(backend_id, None)
+      if instance_id is not None:
+        _global_instance_id_to_backend_id.pop(instance_id, None)
+      _global_started_at.pop(backend_id, None)
+      if (event := _analysis_events.get(backend_id)) is not None:
+        event.set()
     try:
       if client:
-        # If it is a headless instance opened by us and still connected,
+        # If it is a live headless instance opened by us and still connected,
         # request graceful shutdown first
+        spawned_pid = _global_database_id_to_pid.get(backend_id)
         if (
-            _global_database_id_to_pid.get(backend_id) is not None
+            owned
+            and spawned_pid is not None
+            and is_process_running(spawned_pid)
             and not client.is_closed
         ):
           try:
@@ -658,50 +940,57 @@ async def disconnect_backend(backend_id: str, unregister: bool = True) -> None:
     finally:
       if unregister and _global_client_state[backend_id].is_closed:
         logging.info("[Gateway] Calling unregister for %s", backend_id)
-        await _headless_manager.unregister(backend_id)
+        await _headless_manager.unregister(backend_id, instance_id)
+      # An instance that crashed or was killed left its record and socket
+      # behind. They are named after the instance, so no later instance
+      # overwrites them.
+      record_pid = info.get("pid")
+      if record_pid and not is_process_running(record_pid):
+        _cleanup_stale_instance(instance_id)
 
 
 # --- The Watchdog Handler ---
 
 
+def _event_path(path: str | bytes) -> pathlib.Path:
+  """Returns a watchdog event's path as a Path."""
+  return pathlib.Path(os.fsdecode(path))
+
+
 class RegistryEventHandler(FileSystemEventHandler):
-  """Handles registry file system events."""
+  """Handles registry file system events.
+
+  A backend registers and promotes its record with a rename and removes it
+  with an unlink, so only moved and deleted events matter, and only those
+  whose file is named like a record (see shared.registry): the directory also
+  sees the temporary file a record is written to before it is renamed.
+  Created events are not handled: a record never appears under its name
+  before it is complete.
+  """
 
   def __init__(self, loop):
     super().__init__()
     self.loop = loop
-
-  def _handle_event_by_path(self, path: str) -> None:
-    if path.endswith(".json") and os.path.isfile(path):
-      asyncio.run_coroutine_threadsafe(
-          connect_to_backend(pathlib.Path(path)), self.loop
-      )
 
   def on_moved(self, event: DirMovedEvent | FileMovedEvent) -> None:
     if event.is_directory:
       return
 
     logging.debug("on_moved: %s -> %s", event.src_path, event.dest_path)
-    if isinstance(event.dest_path, bytes):
-      path = event.dest_path.decode()
-    else:
-      path = event.dest_path
-
-    self._handle_event_by_path(path)
+    # The destination names the record. The source is the temporary file of
+    # a registration, or the in-progress name of a promotion.
+    path = _event_path(event.dest_path)
+    if registry.is_record_name(path.name) and path.is_file():
+      asyncio.run_coroutine_threadsafe(connect_to_backend(path), self.loop)
 
   def on_deleted(self, event: DirDeletedEvent | FileDeletedEvent):
     if event.is_directory:
       return
 
-    if isinstance(event.src_path, bytes):
-      src_path = event.src_path.decode()
-    else:
-      src_path = event.src_path
     logging.debug("on_deleted: %s", event.src_path)
-    if src_path.endswith(".json"):
-      asyncio.run_coroutine_threadsafe(
-          disconnect_backend(pathlib.Path(src_path).stem), self.loop
-      )
+    path = _event_path(event.src_path)
+    if registry.is_record_name(path.name):
+      asyncio.run_coroutine_threadsafe(_on_record_deleted(path), self.loop)
 
 
 async def forward_to(target: str, tool_name: str, args: dict[str, Any]) -> Any:
@@ -860,7 +1149,7 @@ async def lifespan(app):
 
     atexit.register(shutdown_clients)
     # Initial Scan
-    for registry_file in REGISTRY_DIR.glob("*.json"):
+    for registry_file in registry.list_records(REGISTRY_DIR):
       _ = asyncio.create_task(connect_to_backend(registry_file))
 
     yield
@@ -1090,9 +1379,10 @@ async def _connect_unconnected_backends() -> None:
       return
     async with _connect_lock:
       tasks = []
-      for registry_file in sorted(REGISTRY_DIR.glob("*.json")):
-        backend_id = registry_file.stem
-        client = _global_clients.get(backend_id)
+      for registry_file in registry.list_records(REGISTRY_DIR):
+        instance_id, _ = registry.parse_record_name(registry_file.name)
+        backend_id = _global_instance_id_to_backend_id.get(instance_id)
+        client = _global_clients.get(backend_id) if backend_id else None
         if client is None or client.is_closed:
           tasks.append(connect_to_backend(registry_file))
       if tasks:
@@ -1108,10 +1398,18 @@ async def list_available_databases() -> list[DatabaseInfo]:
   """List all available IDA database connection IDs.
 
   Active databases returned by this tool do not need to be opened again; they
-  are ready to accept queries using their database_id.
+  are ready to accept queries using their database_id, unless their
+  auto_analysis_status is "in_progress": such a database rejects every tool
+  until IDA's auto-analysis has finished, so check again later.
   """
   if not _is_watcher_active():
     await _connect_unconnected_backends()
+  # Whether or not the watcher runs: an agent polls this tool for the end of
+  # the analysis, so a missed rename event must not leave the status stale.
+  for db_id, instance_id in list(_global_backend_id_to_instance_id.items()):
+    info = _global_metadata.get(db_id)
+    if info and info.get("auto_analysis_status") == "in_progress":
+      await _connect_to_instance(instance_id)
 
   available = []
   stale_ids = []
@@ -1134,7 +1432,7 @@ async def list_available_databases() -> list[DatabaseInfo]:
             if db_id in _global_metadata
             else None
         )
-        if pid and _is_process_running(pid):
+        if pid and is_process_running(pid):
           info = dict(_global_metadata[db_id])
           info["busy"] = True
           available.append(info)  # type: ignore
@@ -1142,7 +1440,9 @@ async def list_available_databases() -> list[DatabaseInfo]:
           stale_ids.append(db_id)
       elif db_id in _global_metadata:
         info = dict(_global_metadata[db_id])
-        info["busy"] = False
+        # A backend that is still analysing answers the ping, but rejects
+        # tool calls.
+        info["busy"] = info.get("auto_analysis_status") == "in_progress"
         available.append(info)  # type: ignore
     except Exception as e:  # pylint: disable=broad-exception-caught
       # Ping timed out or raised exception (could be GIL starved or dead)
@@ -1151,7 +1451,7 @@ async def list_available_databases() -> list[DatabaseInfo]:
           if db_id in _global_metadata
           else None
       )
-      if pid and _is_process_running(pid):
+      if pid and is_process_running(pid):
         logging.info(
             "Backend %s is busy (ping failed but process is running)", db_id
         )
@@ -1164,9 +1464,9 @@ async def list_available_databases() -> list[DatabaseInfo]:
 
   # Clean up stale connections
   for db_id in stale_ids:
-    metadata = _global_metadata.get(db_id)
+    instance_id = _global_backend_id_to_instance_id.get(db_id)
     await disconnect_backend(db_id)
-    _cleanup_stale_registry_by_id(db_id, metadata)
+    _cleanup_stale_instance(instance_id)
   if not available:
     raise ToolError(
         "It looks like there are currently no available IDA databases. If"
@@ -1221,8 +1521,19 @@ async def idalib_headless_open(
         "Optional 16-byte aligned load address (IDA's -b), e.g. '0x10000'."
         " Only for new binaries; needs IDA 9.1+",
     ] = None,
+    disable_auto_analysis: Annotated[
+        bool,
+        "Skip IDA's auto-analysis, e.g., for a very large binary. The"
+        " database then holds only what the loader created",
+    ] = False,
 ) -> DatabaseInfo:
   """Open a binary in a new headless IDA instance.
+
+  Returns once the file is loaded. IDA's auto-analysis may still be running
+  then: check auto_analysis_status in the result. While it is "in_progress",
+  every tool call for this database fails with "auto analysis is still in
+  progress, please wait."; call list_available_databases later to see when it
+  is "done". The database can be closed at any time.
 
   If the database is already open, this tool will raise an error containing
   the existing session ID. It is recommended to call list_available_databases
@@ -1236,7 +1547,7 @@ async def idalib_headless_open(
     options = load_options.parse_load_options(processor, loader, base_address)
   except load_options.LoadOptionsError as e:
     raise ToolError(str(e)) from e
-  return await _headless_manager.spawn(path, options)
+  return await _headless_manager.spawn(path, options, disable_auto_analysis)
 
 
 @mcp_tool

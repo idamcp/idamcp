@@ -34,14 +34,19 @@ import fastmcp.exceptions
 from fastmcp.exceptions import ToolError
 import pydantic
 from gateway import forward
+from gateway.forward import _analysis_events
 from gateway.forward import _backend_events
 from gateway.forward import _background_tasks
+from gateway.forward import _global_backend_id_to_instance_id
 from gateway.forward import _global_client_state
 from gateway.forward import _global_clients
 from gateway.forward import _global_database_id_to_pid
+from gateway.forward import _global_instance_id_to_backend_id
 from gateway.forward import _global_metadata
+from gateway.forward import _global_started_at
 from gateway.forward import _headless_manager
 from gateway.forward import _is_watcher_active
+from gateway.forward import _on_record_deleted
 from gateway.forward import available_databases
 from gateway.forward import connect_to_backend
 from gateway.forward import forward_to
@@ -49,6 +54,7 @@ from gateway.forward import HeadlessManager
 from gateway.forward import idalib_headless_close
 from gateway.forward import lifespan
 from gateway.forward import list_available_databases
+from shared import registry
 from shared.rpc import RPCServer
 
 # FastMCP 4 wraps a rejected argument in its own ValidationError; FastMCP 3
@@ -82,7 +88,7 @@ class TestHeadlessManager(unittest.IsolatedAsyncioTestCase):
     self.manager.register("db1", 1001)
     self.assertIn("db1", self.manager.spawned_instances)
 
-    with mock.patch("gateway.forward._is_process_running", return_value=False):
+    with mock.patch("gateway.forward.is_process_running", return_value=False):
       await self.manager.unregister("db1")
 
     self.assertNotIn("db1", self.manager.spawned_instances)
@@ -121,7 +127,7 @@ class TestHeadlessManager(unittest.IsolatedAsyncioTestCase):
     self.assertEqual(len(self.manager.spawned_instances), 3)
 
     # Unregister db1 (simulate close)
-    with mock.patch("gateway.forward._is_process_running", return_value=False):
+    with mock.patch("gateway.forward.is_process_running", return_value=False):
       await self.manager.unregister("db1")
 
     self.assertEqual(len(self.manager.spawned_instances), 2)
@@ -203,7 +209,7 @@ class TestHeadlessManager(unittest.IsolatedAsyncioTestCase):
     self.manager.register("db1", 1001)
 
     with (
-        mock.patch("gateway.forward._is_process_running", return_value=True),
+        mock.patch("gateway.forward.is_process_running", return_value=True),
         mock.patch("gateway.forward._create_background_task") as mock_bg_task,
     ):
       mock_bg_task.side_effect = lambda coro: coro.close()
@@ -350,14 +356,19 @@ class TestHeadlessManager(unittest.IsolatedAsyncioTestCase):
 
 
 _DB = "c0ffee00"
-# Not real processes: the tests mock _is_process_running and
+# Not real processes: the tests mock is_process_running and
 # _kill_process_gracefully, so nothing is signalled.
 _OLD_PID = 4_999_991
 _NEW_PID = 4_999_993
 
 
-class TestSpawnWithBackends(unittest.IsolatedAsyncioTestCase):
-  """Tests HeadlessManager.spawn() against in-process RPC backends."""
+def _iid(label: str) -> str:
+  """Returns a well-formed instance ID that stands for a readable label."""
+  return label.encode().hex()[:16].ljust(16, "0")
+
+
+class _BackendTestCase(unittest.IsolatedAsyncioTestCase):
+  """Base of the tests that run against in-process RPC backends."""
 
   async def asyncSetUp(self):
     tmp = tempfile.TemporaryDirectory()
@@ -365,16 +376,24 @@ class TestSpawnWithBackends(unittest.IsolatedAsyncioTestCase):
     self.tmp = pathlib.Path(tmp.name)
     self.target = self.tmp / "target.bin"
     self.target.write_bytes(b"\0" * 16)
-    self.record = self.tmp / f"{_DB}.json"
+    # The record of the backend started last; records are named after the
+    # instance, so each backend has its own.
+    self.record = self.tmp / "none.json"
     self.manager = HeadlessManager(max_instances=4)
     self.alive: set[int] = set()
     self.servers: list[RPCServer] = []
-    self.kill = mock.AsyncMock(name="_kill_process_gracefully")
+    # The started_at of the backend started last; each one starts later.
+    self.started_at = 1000.0
+    # A kill ends the process, as the real one does.
+    self.kill = mock.AsyncMock(
+        name="_kill_process_gracefully", side_effect=self.alive.discard
+    )
     for patcher in (
         mock.patch("gateway.forward.REGISTRY_DIR", self.tmp),
+        mock.patch("gateway.forward.UDS_DIR", self.tmp),
         mock.patch("gateway.forward._headless_manager", self.manager),
         mock.patch(
-            "gateway.forward._is_process_running", self.alive.__contains__
+            "gateway.forward.is_process_running", self.alive.__contains__
         ),
         mock.patch("gateway.forward._kill_process_gracefully", self.kill),
     ):
@@ -388,18 +407,52 @@ class TestSpawnWithBackends(unittest.IsolatedAsyncioTestCase):
     for server in self.servers:
       await server.close()
     await asyncio.gather(*_background_tasks, return_exceptions=True)
-    self._clear_gateway_state()
+    try:
+      # The two instance maps mirror each other and cover the connections.
+      self.assertEqual(
+          _global_instance_id_to_backend_id,
+          {iid: db for db, iid in _global_backend_id_to_instance_id.items()},
+      )
+      self.assertEqual(
+          set(_global_backend_id_to_instance_id), set(_global_metadata)
+      )
+    finally:
+      self._clear_gateway_state()
 
   def _clear_gateway_state(self):
     _global_clients.clear()
     _global_metadata.clear()
+    _global_backend_id_to_instance_id.clear()
+    _global_instance_id_to_backend_id.clear()
     _global_database_id_to_pid.clear()
     _global_client_state.clear()
     _backend_events.clear()
+    _analysis_events.clear()
+    _global_started_at.clear()
 
-  async def _start_backend(self, name: str, pid: int) -> RPCServer:
-    """Starts a backend whose whoami returns name, and writes its record."""
-    server = RPCServer({"whoami": lambda: name})
+  async def _start_backend(
+      self,
+      name: str,
+      pid: int,
+      in_progress: bool = False,
+      disabled: bool = False,
+      started_at: float | None = None,
+  ) -> RPCServer:
+    """Starts a backend whose whoami returns name, and writes its record.
+
+    Args:
+      name: What whoami returns; the backend's instance ID is
+        _iid(name).
+      pid: The PID in the record.
+      in_progress: Whether the record says auto-analysis is still running.
+      disabled: Whether the record says auto-analysis was disabled.
+      started_at: The start time in the record; by default, later than that
+        of the backends started before.
+    """
+    if started_at is None:
+      self.started_at += 1.0
+      started_at = self.started_at
+    server = RPCServer({"whoami": lambda: name, "close_database": lambda: None})
     tcp_server = await server.start_tcp("127.0.0.1", 0)
     self.servers.append(server)
     self.alive.add(pid)
@@ -407,25 +460,43 @@ class TestSpawnWithBackends(unittest.IsolatedAsyncioTestCase):
         "pid": pid,
         "channel": "tcp",
         "address": tcp_server.sockets[0].getsockname()[1],
-        "name": _DB,
+        "database_id": _DB,
+        "started_at": started_at,
+        "auto_analysis_disabled": disabled,
         "metadata": {"filepath": str(self.target)},
     }
+    self.record = self.tmp / registry.record_name(
+        _iid(name), in_progress
+    )
     self.record.write_text(json.dumps(record), encoding="utf-8")
     return server
+
+  def _promote(self) -> pathlib.Path:
+    """Renames the in-progress record as a backend does after its analysis."""
+    instance_id, in_progress = registry.parse_record_name(self.record.name)
+    self.assertTrue(in_progress)
+    promoted = self.tmp / registry.record_name(instance_id, False)
+    os.replace(self.record, promoted)
+    self.record = promoted
+    return promoted
 
   async def _start_new_instance(self) -> None:
     """Starts the new backend, then connects as the watchdog would."""
     await self._start_backend("new", _NEW_PID)
     await connect_to_backend(self.record)
 
-  def _patch_exec(self, before_metadata=None):
+  def _patch_exec(
+      self, before_metadata=None, instance_id: str = _iid("new")
+  ):
     """Patches the process start; the process prints [MCP_JSON] for _DB.
 
     Args:
       before_metadata: An optional coroutine function, awaited before spawn()
         gets the [MCP_JSON] line.
+      instance_id: The instance_id emitted in [MCP_JSON].
     """
-    line = f"[MCP_JSON] {json.dumps({'database_id': _DB})}\n".encode()
+    payload = {"database_id": _DB, "instance_id": instance_id}
+    line = f"[MCP_JSON] {json.dumps(payload)}\n".encode()
 
     async def readline():
       if before_metadata is not None:
@@ -438,6 +509,27 @@ class TestSpawnWithBackends(unittest.IsolatedAsyncioTestCase):
     return mock.patch(
         "asyncio.create_subprocess_exec", mock.AsyncMock(return_value=process)
     )
+
+  def _patch_connect(self, hold: asyncio.Event, failures: int = 0):
+    """Patches the TCP connect: its first call waits, and some calls fail.
+
+    Args:
+      hold: The first call waits for it, so that a connect_to_backend stays
+        in the middle of connecting.
+      failures: How many of the first calls fail.
+    """
+    real_connect = forward.RPCClient.connect_tcp
+    self.connect_calls = 0
+
+    async def connect_tcp(client, host, port):
+      self.connect_calls += 1
+      if self.connect_calls == 1:
+        await hold.wait()
+      if self.connect_calls <= failures:
+        raise ConnectionRefusedError
+      await real_connect(client, host, port)
+
+    return mock.patch.object(forward.RPCClient, "connect_tcp", connect_tcp)
 
   async def _assert_new_instance_kept(self):
     self.kill.assert_not_called()
@@ -469,8 +561,8 @@ class TestSpawnWithBackends(unittest.IsolatedAsyncioTestCase):
     register = self.manager.register
     tasks = []
 
-    def register_then_start(database_id, pid):
-      register(database_id, pid)
+    def register_then_start(database_id, pid, instance_id=None):
+      register(database_id, pid, instance_id)
       tasks.append(asyncio.create_task(self._start_new_instance()))
 
     with (
@@ -483,6 +575,10 @@ class TestSpawnWithBackends(unittest.IsolatedAsyncioTestCase):
         await self.manager.spawn(path)
         await asyncio.gather(*tasks)
 
+
+class TestSpawnWithBackends(_BackendTestCase):
+  """Tests HeadlessManager.spawn() against in-process RPC backends."""
+
   async def test_reopen_after_crash_keeps_new_instance(self):
     """Test reopening a crashed instance without closing it first."""
     old_client = await self._crash_old_instance()
@@ -494,6 +590,18 @@ class TestSpawnWithBackends(unittest.IsolatedAsyncioTestCase):
     await self._assert_new_instance_kept()
     # No close_database request goes over the dead connection either.
     old_client_call.assert_not_called()
+
+  async def test_reopen_after_crash_removes_the_old_record(self):
+    """Test that the crashed instance's record doesn't stay behind."""
+    await self._crash_old_instance()
+    old_record = self.record
+    self.assertTrue(old_record.exists())
+    await self._reopen(str(self.target))
+
+    # Nothing overwrites it: the new instance's record has another name.
+    self.assertNotEqual(self.record, old_record)
+    self.assertEqual(list(self.tmp.glob("*.json")), [self.record])
+    await self._assert_new_instance_kept()
 
   async def test_reopen_after_crash_frees_quota(self):
     """Test that a crashed instance doesn't count against max_instances."""
@@ -541,8 +649,122 @@ class TestSpawnWithBackends(unittest.IsolatedAsyncioTestCase):
     self.assertEqual(client_cls.call_count, 1)
     await self._assert_new_instance_kept()
 
-  async def test_record_with_new_pid_replaces_connection(self):
-    """Test that a record rewritten by a new process replaces the client."""
+  async def test_lookup_waits_for_a_connect_in_progress(self):
+    """Test a second connect for an instance waits for the one under way."""
+    await self._start_backend("new", _NEW_PID)
+    self.manager.register(_DB, _NEW_PID, _iid("new"))
+    hold = asyncio.Event()
+    with self._patch_connect(hold):
+      # E.g., the watcher's call, then spawn()'s own look at the record.
+      first = asyncio.create_task(connect_to_backend(self.record))
+      async with asyncio.timeout(5):
+        while not self.connect_calls:
+          if first.done():
+            await first  # Shows why it ended without connecting.
+          await asyncio.sleep(0)
+      second = asyncio.create_task(forward._connect_to_instance(_iid("new")))
+      for _ in range(10):
+        await asyncio.sleep(0)
+      self.assertFalse(second.done())
+      self.assertNotIn(_DB, _global_clients)
+      hold.set()
+      await asyncio.gather(first, second)
+
+    self.assertEqual(self.connect_calls, 1)
+    await self._assert_new_instance_kept()
+
+  async def test_spawn_fails_when_a_failed_connect_gave_the_instance_up(self):
+    """Test spawn() doesn't return an instance that is being killed."""
+    hold = asyncio.Event()
+    register = self.manager.register
+    real_connect_to_backend = forward.connect_to_backend
+    real_sleep = asyncio.sleep
+    calls = 0
+    tasks = []
+
+    async def counted_connect_to_backend(record):
+      nonlocal calls
+      calls += 1
+      if calls == 2:
+        # spawn() has found the record too; it now waits for the first call.
+        hold.set()
+      await real_connect_to_backend(record)
+
+    async def watcher_event():
+      await self._start_backend("new", _NEW_PID)
+      await forward.connect_to_backend(self.record)
+
+    def register_then_start(database_id, pid, instance_id=None):
+      register(database_id, pid, instance_id)
+      tasks.append(asyncio.create_task(watcher_event()))
+
+    with (
+        # The first call's three attempts fail; spawn()'s then succeed.
+        self._patch_connect(hold, failures=3),
+        self._patch_exec(),
+        mock.patch.object(
+            self.manager, "register", side_effect=register_then_start
+        ),
+        mock.patch(
+            "gateway.forward.connect_to_backend", counted_connect_to_backend
+        ),
+        mock.patch(
+            "gateway.forward.asyncio.sleep", lambda delay: real_sleep(0)
+        ),
+    ):
+      async with asyncio.timeout(5):
+        with self.assertRaisesRegex(ToolError, "Failed to connect"):
+          await self.manager.spawn(str(self.target))
+        await asyncio.gather(*tasks)
+    await asyncio.gather(*_background_tasks, return_exceptions=True)
+
+    self.assertEqual(self.connect_calls, 4)
+    self.kill.assert_awaited_once_with(_NEW_PID)
+    self.assertNotIn(_DB, _global_clients)
+    self.assertEqual(self.manager.spawned_instances, set())
+
+  async def test_reopen_while_a_disconnect_waits_for_calls(self):
+    """Test the old instance is forgotten when a new one takes its place."""
+    await self._start_backend("old", _OLD_PID)
+    old_record = self.record
+    await connect_to_backend(old_record)
+    old_client = _global_clients[_DB]
+    self.addAsyncCleanup(old_client.close)
+    state = _global_client_state[_DB]
+    state.number_of_ongoing_calls = 1
+    disconnect = asyncio.create_task(forward.disconnect_backend(_DB))
+    async with asyncio.timeout(5):
+      while not state.is_closed:
+        await asyncio.sleep(0)
+
+    await self._start_new_instance()
+    self.assertEqual(_global_instance_id_to_backend_id, {_iid("new"): _DB})
+    async with state.condition:
+      state.number_of_ongoing_calls = 0
+      state.condition.notify_all()
+    await disconnect
+
+    # The old instance's record doesn't stand for the connection any more.
+    old_record.unlink()
+    await _on_record_deleted(old_record)
+    self.assertEqual(await forward_to(_DB, "whoami", {}), "new")
+
+  async def test_instance_id_is_not_shown_to_clients(self):
+    """Test neither the open result nor the listing names the instance."""
+    with self._patch_exec(before_metadata=self._start_new_instance):
+      async with asyncio.timeout(5):
+        info = await self.manager.spawn(str(self.target))
+    listed = await list_available_databases()
+    resource = json.loads(await available_databases())
+
+    self.assertEqual(_global_backend_id_to_instance_id, {_DB: _iid("new")})
+    self.assertEqual([entry["database_id"] for entry in listed], [_DB])
+    for shown in (info, *listed, *resource):
+      self.assertNotIn("instance_id", shown)
+      self.assertNotIn(_iid("new"), json.dumps(shown))
+
+  async def test_record_of_new_instance_replaces_connection(self):
+    """Test that the record of a new instance replaces the client."""
     await self._start_backend("old", _OLD_PID)
     await connect_to_backend(self.record)
     old_client = _global_clients[_DB]
@@ -552,6 +774,651 @@ class TestSpawnWithBackends(unittest.IsolatedAsyncioTestCase):
     self.assertIsNot(_global_clients[_DB], old_client)
     self.assertTrue(old_client.is_closed)
     self.assertEqual(await forward_to(_DB, "whoami", {}), "new")
+
+  async def test_stale_record_of_old_instance_keeps_new_connection(self):
+    """Test that a dead instance's record doesn't disconnect its successor."""
+    await self._start_backend("old", _OLD_PID)
+    old_record = self.record
+    self.alive.discard(_OLD_PID)
+    await self._start_new_instance()
+    new_client = _global_clients[_DB]
+
+    await connect_to_backend(old_record)  # E.g., the fallback scan.
+    self.assertFalse(old_record.exists())  # Cleaned up as stale.
+    await _on_record_deleted(old_record)
+
+    self.assertIs(_global_clients[_DB], new_client)
+    self.assertFalse(new_client.is_closed)
+    self.assertTrue(self.record.exists())
+    self.assertEqual(await forward_to(_DB, "whoami", {}), "new")
+
+  async def test_reopen_when_dead_old_client_not_yet_closed(self):
+    """Test reopening when the dead instance's client hasn't noticed EOF yet."""
+    await self._start_backend("old", _OLD_PID)
+    self.manager.register(_DB, _OLD_PID)
+    await connect_to_backend(self.record)
+    old_client = _global_clients[_DB]
+    # The old process died, but the TCP client has not seen EOF yet.
+    self.alive.discard(_OLD_PID)
+    self.assertFalse(old_client.is_closed)
+
+    with mock.patch.object(
+        old_client, "call", wraps=old_client.call
+    ) as old_client_call:
+      await self._reopen(str(self.target))
+
+    await self._assert_new_instance_kept()
+    self.assertTrue(old_client.is_closed)
+    old_client_call.assert_not_called()
+
+  async def test_failed_spawn_cleans_up_instance_record_and_socket(self):
+    """Test a failed spawn kills the process and removes its record and sock."""
+    iid = _iid("failed")
+    record_file = self.tmp / registry.record_name(iid, True)
+    sock_file = self.tmp / f"{iid}.sock"
+    record_file.write_text("{}", encoding="utf-8")
+    sock_file.write_text("", encoding="utf-8")
+    self.alive.add(_NEW_PID)
+
+    with (
+        self._patch_exec(instance_id=iid),
+        mock.patch("gateway.forward._SPAWN_CONNECT_TIMEOUT", 0.02),
+    ):
+      with self.assertRaisesRegex(ToolError, "timeout"):
+        await self.manager.spawn(str(self.target))
+      await asyncio.gather(*_background_tasks, return_exceptions=True)
+
+    self.kill.assert_awaited_once_with(_NEW_PID)
+    self.assertFalse(record_file.exists())
+    self.assertFalse(sock_file.exists())
+
+  async def test_older_record_does_not_replace_a_live_instance(self):
+    """Test a leftover record of an earlier instance changes nothing."""
+    await self._start_backend("new", _NEW_PID)
+    self.manager.register(_DB, _NEW_PID, _iid("new"))
+    await connect_to_backend(self.record)
+    new_client = _global_clients[_DB]
+    new_record = self.record
+    # Its process looks alive (e.g., the PID was reused), and it would even
+    # answer, but it started earlier.
+    await self._start_backend("ghost", _OLD_PID, started_at=1.0)
+
+    with mock.patch(
+        "gateway.forward.RPCClient", wraps=forward.RPCClient
+    ) as client_cls:
+      await connect_to_backend(self.record)
+      await asyncio.gather(*_background_tasks, return_exceptions=True)
+
+    client_cls.assert_not_called()
+    self.assertIs(_global_clients[_DB], new_client)
+    self.assertFalse(new_client.is_closed)
+    self.assertTrue(new_record.exists())
+    self.record = new_record
+    await self._assert_new_instance_kept()
+
+  async def test_newer_record_replaces_a_dead_or_older_instance(self):
+    """Test a later start, or a dead connected instance, is replaced."""
+    await self._start_backend("old", _OLD_PID, started_at=5.0)
+    await connect_to_backend(self.record)
+    # An earlier start replaces the connection once the old process is gone.
+    self.alive.discard(_OLD_PID)
+    await self._start_backend("new", _NEW_PID, started_at=1.0)
+    await connect_to_backend(self.record)
+    self.assertEqual(await forward_to(_DB, "whoami", {}), "new")
+    self.assertEqual(_global_started_at[_DB], 1.0)
+
+    await self._start_backend("newer", _OLD_PID, started_at=2.0)
+    await connect_to_backend(self.record)
+    self.assertEqual(await forward_to(_DB, "whoami", {}), "newer")
+
+  async def test_failing_record_of_another_instance_keeps_spawned_one(self):
+    """Test a record that can't be connected doesn't kill another instance."""
+    # The spawned instance has registered its PID but not connected yet.
+    self.alive.add(_NEW_PID)
+    self.manager.register(_DB, _NEW_PID, _iid("new"))
+    # A leftover record of the same database: its PID is alive, but nothing
+    # listens at its address.
+    server = await self._start_backend("ghost", _OLD_PID)
+    self.servers.remove(server)
+    await server.close()
+    ghost_record = self.record
+
+    with mock.patch("gateway.forward.asyncio.sleep", mock.AsyncMock()):
+      await connect_to_backend(ghost_record)
+    await asyncio.gather(*_background_tasks, return_exceptions=True)
+
+    self.kill.assert_not_called()
+    self.assertEqual(self.manager.spawned_instances, {_DB})
+    self.assertEqual(_global_database_id_to_pid, {_DB: _NEW_PID})
+    self.assertFalse(ghost_record.exists())  # Removed as unusable.
+
+  async def test_record_without_address_is_removed(self):
+    """Test a record that names no address is removed without connecting."""
+    await self._start_backend("new", _NEW_PID)
+    entry = json.loads(self.record.read_text(encoding="utf-8"))
+    del entry["address"]
+    self.record.write_text(json.dumps(entry), encoding="utf-8")
+
+    with (
+        mock.patch.object(forward.RPCClient, "connect_tcp") as connect_tcp,
+        self.assertLogs(level="ERROR") as logs,
+    ):
+      await connect_to_backend(self.record)
+
+    self.assertIn("the record has no address", "\n".join(logs.output))
+    connect_tcp.assert_not_called()
+    self.assertNotIn(_DB, _global_clients)
+    self.assertFalse(self.record.exists())
+
+  async def test_unregister_ignores_another_instance(self):
+    """Test unregister() acts only for the registered instance."""
+    self.alive.add(_NEW_PID)
+    self.manager.register(_DB, _NEW_PID, _iid("new"))
+    self.assertTrue(self.manager.owns(_DB, _iid("new")))
+    self.assertTrue(self.manager.owns(_DB, None))
+    self.assertFalse(self.manager.owns(_DB, _iid("other")))
+    self.assertTrue(self.manager.owns("unknown_db", _iid("other")))
+
+    await self.manager.unregister(_DB, _iid("other"))
+    self.assertEqual(self.manager.spawned_instances, {_DB})
+    self.assertEqual(_global_database_id_to_pid, {_DB: _NEW_PID})
+
+    await self.manager.unregister(_DB, _iid("new"))
+    await asyncio.gather(*_background_tasks, return_exceptions=True)
+    self.assertEqual(self.manager.spawned_instances, set())
+    self.kill.assert_awaited_once_with(_NEW_PID)
+    # Nothing is remembered: a later instance may register under the name.
+    self.assertTrue(self.manager.owns(_DB, _iid("other")))
+
+    # With instance_id omitted, unregister cleans up the registered instance.
+    sock_file = self.tmp / f"{_iid('unnamed')}.sock"
+    sock_file.write_text("", encoding="utf-8")
+    self.alive.add(_NEW_PID)
+    self.kill.reset_mock()
+    self.manager.register(_DB, _NEW_PID, _iid("unnamed"))
+    await self.manager.unregister(_DB)
+    await asyncio.gather(*_background_tasks, return_exceptions=True)
+    self.kill.assert_awaited_once_with(_NEW_PID)
+    self.assertFalse(sock_file.exists())
+
+  async def test_record_without_start_time_is_not_used(self):
+    """Test a record that lacks started_at is treated as unreadable."""
+    await self._start_backend("new", _NEW_PID)
+    data = json.loads(self.record.read_text())
+    del data["started_at"]
+    self.record.write_text(json.dumps(data), encoding="utf-8")
+    with self.assertLogs(level="ERROR"):
+      await connect_to_backend(self.record)
+    self.assertNotIn(_DB, _global_clients)
+
+  async def test_spawn_finds_the_record_without_a_watcher_event(self):
+    """Test spawn() connects by itself when no event announces the record."""
+
+    async def start():  # Writes the record; nobody calls connect_to_backend.
+      await self._start_backend("new", _NEW_PID)
+
+    with self._patch_exec(before_metadata=start):
+      async with asyncio.timeout(5):
+        info = await self.manager.spawn(str(self.target))
+
+    self.assertEqual(info["auto_analysis_status"], "done")
+    await self._assert_new_instance_kept()
+
+  async def test_spawn_reports_the_backend_stderr(self):
+    """Test a failed connection reports what the backend printed."""
+    self.alive.add(_NEW_PID)
+    stderr = mock.Mock(read=mock.AsyncMock(return_value=b"idalib: no license"))
+    payload = json.dumps({"database_id": _DB, "instance_id": _iid("new")})
+    line = f"[MCP_JSON] {payload}\n".encode()
+    process = mock.Mock(
+        pid=_NEW_PID,
+        stdout=mock.Mock(readline=mock.AsyncMock(return_value=line)),
+        stderr=stderr,
+    )
+
+    async def fail_to_connect(database_id, pid, instance_id=None):
+      # As connect_to_backend does when the record can't be used.
+      del pid
+      await self.manager.unregister(database_id, instance_id)
+
+    register = self.manager.register
+
+    def register_then_fail(database_id, pid, instance_id=None):
+      register(database_id, pid, instance_id)
+      asyncio.get_running_loop().create_task(
+          fail_to_connect(database_id, pid, instance_id)
+      )
+
+    with (
+        mock.patch(
+            "asyncio.create_subprocess_exec",
+            mock.AsyncMock(return_value=process),
+        ),
+        mock.patch.object(
+            self.manager, "register", side_effect=register_then_fail
+        ),
+    ):
+      with self.assertRaisesRegex(ToolError, "stderr: idalib: no license"):
+        async with asyncio.timeout(5):
+          await self.manager.spawn(str(self.target))
+
+  async def test_spawn_fails_fast_when_process_exits_before_registering(self):
+    """Test spawn() breaks early with stderr if the process exits right away."""
+    sock_file = self.tmp / f"{_iid('crashed')}.sock"
+    sock_file.write_text("", encoding="utf-8")
+    stderr = mock.Mock(read=mock.AsyncMock(return_value=b"AF_UNIX too long"))
+    payload = json.dumps(
+        {"database_id": _DB, "instance_id": _iid("crashed")}
+    )
+    line = f"[MCP_JSON] {payload}\n".encode()
+    process = mock.Mock(
+        pid=_NEW_PID,
+        returncode=1,
+        stdout=mock.Mock(readline=mock.AsyncMock(return_value=line)),
+        stderr=stderr,
+    )
+    with mock.patch(
+        "asyncio.create_subprocess_exec", mock.AsyncMock(return_value=process)
+    ):
+      with self.assertRaisesRegex(ToolError, "stderr: AF_UNIX too long"):
+        async with asyncio.timeout(2):
+          await self.manager.spawn(str(self.target))
+
+    self.assertEqual(self.manager.spawned_instances, set())
+    self.assertFalse(sock_file.exists())
+
+  def test_cleanup_stale_instance_removes_socket_without_record(self):
+    """Test _cleanup_stale_instance unlinks <iid>.sock without a record."""
+    sock_file = self.tmp / f"{_iid('orphan')}.sock"
+    sock_file.write_text("", encoding="utf-8")
+    forward._cleanup_stale_instance(_iid("orphan"))
+    self.assertFalse(sock_file.exists())
+
+
+class TestAutoAnalysisStatus(_BackendTestCase):
+  """Tests how the gateway tracks a backend's auto-analysis."""
+
+  def _status(self) -> str:
+    return _global_metadata[_DB]["auto_analysis_status"]
+
+  def test_record_names(self):
+    """Test record names round-trip, and what else is in the directory."""
+    iid = "0123456789abcdef"
+    self.assertEqual(registry.record_name(iid, False), f"ida-{iid}.json")
+    self.assertEqual(registry.record_name(iid, True), f"analyzing-{iid}.json")
+    for in_progress in (False, True):
+      name = registry.record_name(iid, in_progress)
+      self.assertTrue(registry.is_record_name(name))
+      self.assertEqual(registry.parse_record_name(name), (iid, in_progress))
+    # Other files in the registry directory, e.g., the temporary file that a
+    # record is written to, a record of an old naming, or an ID that no
+    # backend generates.
+    for name in (
+        "tmpk3_x9a",
+        f"{iid}.json",
+        f"ida_{iid}.json",
+        "notes.json",
+        "ida-.json",
+        "analyzing-.json",
+        f"ida-{iid}.json.bak",
+        f"ida-{iid}",
+        f"ida-{iid[:15]}.json",
+        f"ida-{iid}0.json",
+        "ida-0123456789abcdeg.json",
+        f"ida-{iid}.json\n",
+        f"ida-{iid.upper()}.json",
+        f"IDA-{iid}.json",
+        f"ANALYZING-{iid}.json",
+        f"other-{iid}.json",
+    ):
+      self.assertFalse(registry.is_record_name(name), name)
+      with self.assertRaises(ValueError):
+        registry.parse_record_name(name)
+    # Only records are listed, and only files.
+    listed = [registry.record_name(iid, True), registry.record_name(iid, False)]
+    for name in (*listed, "notes.json", "tmpk3_x9a"):
+      (self.tmp / name).write_text("{}", encoding="utf-8")
+    (self.tmp / registry.record_name("f" * 16, False)).mkdir()
+    self.assertEqual(
+        [p.name for p in registry.list_records(self.tmp)], sorted(listed)
+    )
+    self.assertEqual(registry.list_records(self.tmp / "missing"), [])
+
+  async def test_status_follows_the_record(self):
+    """Test the status for a plain, a prefixed, and a disabled record."""
+    for kwargs, expected in (
+        ({}, "done"),
+        ({"in_progress": True}, "in_progress"),
+        ({"disabled": True}, "disabled"),
+    ):
+      with self.subTest(kwargs=kwargs):
+        await self._start_backend(expected, _NEW_PID, **kwargs)
+        await connect_to_backend(self.record)
+        self.assertEqual(self._status(), expected)
+        self.assertEqual(
+            _global_backend_id_to_instance_id[_DB], _iid(expected)
+        )
+        self.assertEqual(await forward_to(_DB, "whoami", {}), expected)
+
+  async def test_promotion_updates_status_without_reconnecting(self):
+    """Test a renamed record ends the analysis on the same connection."""
+    await self._start_backend("new", _NEW_PID, in_progress=True)
+    with mock.patch(
+        "gateway.forward.RPCClient", wraps=forward.RPCClient
+    ) as client_cls:
+      await connect_to_backend(self.record)
+      client = _global_clients[_DB]
+      self.assertEqual(self._status(), "in_progress")
+      old_record = self.record
+
+      await connect_to_backend(self._promote())
+      self.assertEqual(self._status(), "done")
+      # A late event for the old name changes nothing.
+      await connect_to_backend(old_record)
+      await _on_record_deleted(old_record)
+
+    self.assertEqual(self._status(), "done")
+    self.assertIs(_global_clients[_DB], client)
+    self.assertFalse(client.is_closed)
+    self.assertEqual(client_cls.call_count, 1)
+
+  async def test_deleted_record_disconnects_its_instance_only(self):
+    """Test only the connected instance's last record disconnects it."""
+    await self._start_backend("new", _NEW_PID, in_progress=True)
+    await connect_to_backend(self.record)
+    client = _global_clients[_DB]
+
+    await _on_record_deleted(
+        self.tmp / registry.record_name(_iid("other"), False)
+    )
+    self.assertIs(_global_clients.get(_DB), client)
+
+    self.alive.discard(_NEW_PID)  # Nothing to signal.
+    self.record.unlink()
+    await _on_record_deleted(self.record)
+    self.assertNotIn(_DB, _global_clients)
+    self.assertTrue(client.is_closed)
+
+  async def test_database_is_listed_as_busy_while_in_progress(self):
+    """Test the listing shows a database as busy until its analysis ends."""
+    await self._start_backend("new", _NEW_PID, in_progress=True)
+    await connect_to_backend(self.record)
+
+    dbs = await list_available_databases()
+    self.assertEqual(
+        [(d["auto_analysis_status"], d.get("busy")) for d in dbs],
+        [("in_progress", True)],
+    )
+    (shown,) = json.loads(await available_databases())
+    self.assertIs(shown["busy"], True)
+
+    self._promote()
+    dbs = await list_available_databases()
+    self.assertEqual(
+        [(d["auto_analysis_status"], d.get("busy")) for d in dbs],
+        [("done", False)],
+    )
+
+  async def test_only_an_in_progress_record_counts_as_renamed(self):
+    """Test a plain record that is gone isn't taken for a renamed one."""
+    for name, gone in (
+        ("connect_to_backend", connect_to_backend),
+        ("_on_record_deleted", _on_record_deleted),
+    ):
+      with self.subTest(name):
+        await self._start_backend("new", _NEW_PID)
+        await connect_to_backend(self.record)
+        client = _global_clients[_DB]
+        # Not something a backend does: its record never goes back to the
+        # in-progress name.
+        stray = self.tmp / registry.record_name(_iid("new"), True)
+        stray.write_text("{}", encoding="utf-8")
+        self.alive.discard(_NEW_PID)  # Nothing to signal.
+        self.record.unlink()
+
+        await gone(self.record)
+
+        self.assertNotIn(_DB, _global_clients)
+        self.assertTrue(client.is_closed)
+        stray.unlink(missing_ok=True)
+
+  async def test_fallback_scan_picks_up_promotion(self):
+    """Test the scan visits a connected instance whose record was renamed."""
+    await self._start_backend("new", _NEW_PID, in_progress=True)
+    with (
+        mock.patch("gateway.forward._watcher_active", False),
+        mock.patch("gateway.forward._observer", None),
+    ):
+      dbs = await list_available_databases()
+      self.assertEqual(
+          [d["auto_analysis_status"] for d in dbs], ["in_progress"]
+      )
+      client = _global_clients[_DB]
+      self._promote()
+      dbs = await list_available_databases()
+    self.assertEqual([d["auto_analysis_status"] for d in dbs], ["done"])
+    self.assertIs(_global_clients[_DB], client)
+
+  async def _spawn(self, wait: float, **start_kwargs):
+    """Runs spawn() for a backend that registers before [MCP_JSON]."""
+
+    async def start():
+      await self._start_backend("new", _NEW_PID, **start_kwargs)
+      await connect_to_backend(self.record)
+
+    with (
+        self._patch_exec(before_metadata=start) as exec_mock,
+        mock.patch.dict(forward.CONFIG, {"headless_analysis_wait": wait}),
+    ):
+      async with asyncio.timeout(5):
+        info = await self.manager.spawn(
+            str(self.target),
+            disable_auto_analysis=start_kwargs.get("disabled", False),
+        )
+    await_args = exec_mock.await_args
+    assert await_args is not None
+    return info, await_args.args
+
+  async def test_spawn_passes_disable_auto_analysis(self):
+    """Test spawn() passes the option on and reports the status."""
+    info, argv = await self._spawn(5.0, disabled=True)
+    self.assertIn("--disable-auto-analysis", argv)
+    self.assertEqual(info["auto_analysis_status"], "disabled")
+    self.assertIs(info.get("busy"), False)
+
+    await self.manager.close(_DB)
+    info, argv = await self._spawn(5.0)
+    self.assertNotIn("--disable-auto-analysis", argv)
+    self.assertEqual(info["auto_analysis_status"], "done")
+
+  async def test_spawn_waits_for_a_short_analysis(self):
+    """Test spawn() returns "done" if the analysis ends within the wait."""
+
+    async def promote_later():
+      while _DB not in _analysis_events:
+        await asyncio.sleep(0.01)
+      await connect_to_backend(self._promote())
+
+    task = asyncio.create_task(promote_later())
+    info, _ = await self._spawn(5.0, in_progress=True)
+    await task
+    self.assertEqual(info["auto_analysis_status"], "done")
+    self.assertIs(info.get("busy"), False)
+    self.assertNotIn(_DB, _analysis_events)
+
+  async def test_spawn_sees_the_rename_without_a_watcher_event(self):
+    """Test spawn() notices the end of the analysis with no event for it."""
+
+    async def promote_later():
+      while _DB not in _analysis_events:
+        await asyncio.sleep(0.01)
+      self._promote()  # Only the rename: nobody calls connect_to_backend.
+
+    task = asyncio.create_task(promote_later())
+    info, _ = await self._spawn(5.0, in_progress=True)
+    await task
+    self.assertEqual(info["auto_analysis_status"], "done")
+
+  async def test_list_sees_the_rename_while_the_watcher_runs(self):
+    """Test listing re-checks in-progress backends even with a watcher."""
+    await self._start_backend("new", _NEW_PID, in_progress=True)
+    await connect_to_backend(self.record)
+    client = _global_clients[_DB]
+    self._promote()  # The watcher missed this event.
+    with (
+        mock.patch("gateway.forward._watcher_active", True),
+        mock.patch("gateway.forward._observer", mock.Mock()),
+        mock.patch(
+            "gateway.forward._connect_unconnected_backends"
+        ) as fallback_scan,
+    ):
+      dbs = await list_available_databases()
+    fallback_scan.assert_not_called()
+    self.assertEqual([d["auto_analysis_status"] for d in dbs], ["done"])
+    self.assertIs(_global_clients[_DB], client)
+
+  async def test_spawn_returns_during_a_long_analysis(self):
+    """Test spawn() returns "in_progress" after the wait, or with no wait."""
+    for wait in (0.05, 0):
+      with self.subTest(wait=wait):
+        info, _ = await self._spawn(wait, in_progress=True)
+        self.assertEqual(info["auto_analysis_status"], "in_progress")
+        # Busy, as in the listing, until the analysis ends.
+        self.assertIs(info.get("busy"), True)
+        self.assertNotIn(_DB, _analysis_events)
+        self.assertEqual(await forward_to(_DB, "whoami", {}), "new")
+        await self.manager.close(_DB)
+        self.record.unlink()
+
+  async def test_spawn_fails_if_the_backend_exits_while_waiting(self):
+    """Test spawn() doesn't return a database that has gone away."""
+
+    async def disconnect_later():
+      while _DB not in _analysis_events:
+        await asyncio.sleep(0.01)
+      await forward.disconnect_backend(_DB)
+
+    task = asyncio.create_task(disconnect_later())
+    with self.assertRaisesRegex(ToolError, "exited while"):
+      await self._spawn(5.0, in_progress=True)
+    await task
+
+  async def test_spawn_fails_if_the_backend_crashes_during_analysis(self):
+    """Test spawn() detects a crash during analysis with no delete event."""
+
+    async def crash_later():
+      while _DB not in _analysis_events:
+        await asyncio.sleep(0.01)
+      server = self.servers.pop()
+      await server.close()
+      self.alive.discard(_NEW_PID)
+
+    task = asyncio.create_task(crash_later())
+    with self.assertRaisesRegex(ToolError, "exited while"):
+      await self._spawn(10.0, in_progress=True)
+    await task
+    self.assertNotIn(_DB, _global_clients)
+    self.assertNotIn(_DB, _global_metadata)
+    self.assertEqual(self.manager.spawned_instances, set())
+    self.assertFalse(self.record.exists())
+
+  async def test_watcher_events_are_filtered_by_record_name(self):
+    """Test only moved and deleted events of record names are acted on."""
+    # pylint: disable=g-import-not-at-top
+    from watchdog.events import FileCreatedEvent
+    from watchdog.events import FileDeletedEvent
+    from watchdog.events import FileMovedEvent
+    from watchdog.events import FileSystemEventHandler
+
+    # pylint: enable=g-import-not-at-top
+
+    handler = forward.RegistryEventHandler(asyncio.get_running_loop())
+    connects: list[pathlib.Path] = []
+    deletes: list[pathlib.Path] = []
+
+    async def record_connect(path):
+      connects.append(path)
+
+    async def record_delete(path):
+      deletes.append(path)
+
+    async def settle():
+      for _ in range(5):
+        await asyncio.sleep(0.01)
+
+    await self._start_backend("new", _NEW_PID, in_progress=True)
+    in_progress_record = self.record
+    tmp_file = self.tmp / "tmpk3_x9a"
+    other_json = self.tmp / "notes.json"
+    other_json.write_text("{}", encoding="utf-8")
+    with (
+        mock.patch("gateway.forward.connect_to_backend", record_connect),
+        mock.patch("gateway.forward._on_record_deleted", record_delete),
+    ):
+      # A registration: the temporary file is renamed to the record.
+      handler.on_moved(FileMovedEvent(str(tmp_file), str(in_progress_record)))
+      # A promotion: the record is renamed to its plain name.
+      promoted = self._promote()
+      handler.on_moved(FileMovedEvent(str(in_progress_record), str(promoted)))
+      # Not records: ignored whatever the event.
+      handler.on_moved(FileMovedEvent(str(tmp_file), str(other_json)))
+      handler.on_moved(FileMovedEvent(str(promoted), str(tmp_file)))
+      handler.on_deleted(FileDeletedEvent(str(other_json)))
+      handler.on_deleted(FileDeletedEvent(str(tmp_file)))
+      # A record that no longer exists when the event is handled.
+      gone = self.tmp / registry.record_name(_iid("gone"), False)
+      handler.on_moved(FileMovedEvent(str(tmp_file), str(gone)))
+      # Created events aren't handled at all, even for a record's name.
+      self.assertIs(
+          type(handler).on_created, FileSystemEventHandler.on_created
+      )
+      handler.dispatch(FileCreatedEvent(str(promoted)))
+      handler.on_deleted(FileDeletedEvent(str(promoted)))
+      await settle()
+
+    self.assertEqual(connects, [in_progress_record, promoted])
+    self.assertEqual(deletes, [promoted])
+
+
+class TestKillAndCleanUp(unittest.IsolatedAsyncioTestCase):
+  """Tests the cleanup after a real process had to be killed."""
+
+  async def test_force_killed_instance_files_are_removed(self):
+    """Test the record and socket of a process that ignores SIGTERM go."""
+    if sys.platform == "win32":
+      self.skipTest("needs a process that ignores SIGTERM")
+    tmp = tempfile.TemporaryDirectory()
+    self.addCleanup(tmp.cleanup)
+    tmp_path = pathlib.Path(tmp.name)
+    child = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN);"
+        " print('ready', flush=True); time.sleep(600)",
+        stdout=asyncio.subprocess.PIPE,
+    )
+    self.addAsyncCleanup(child.wait)
+    self.addCleanup(lambda: child.returncode is None and child.kill())
+    assert child.stdout is not None
+    await child.stdout.readline()
+    record = tmp_path / registry.record_name(_iid("killed"), True)
+    sock = tmp_path / f"{_iid('killed')}.sock"
+    record.write_text("{}", encoding="utf-8")
+    sock.write_text("", encoding="utf-8")
+
+    with (
+        mock.patch("gateway.forward.REGISTRY_DIR", tmp_path),
+        mock.patch("gateway.forward.UDS_DIR", tmp_path),
+        mock.patch("gateway.forward._KILL_GRACE_SECONDS", 1),
+    ):
+      async with asyncio.timeout(10):
+        await forward._kill_and_clean_up(child.pid, _iid("killed"))
+
+    # The process was still listed right after the kill; the cleanup waited
+    # for it to go.
+    self.assertFalse(forward.is_process_running(child.pid))
+    self.assertFalse(record.exists())
+    self.assertFalse(sock.exists())
 
 
 class TestWatcherFallback(unittest.IsolatedAsyncioTestCase):
@@ -563,6 +1430,8 @@ class TestWatcherFallback(unittest.IsolatedAsyncioTestCase):
     self.servers: list[RPCServer] = []
     _global_clients.clear()
     _global_metadata.clear()
+    _global_backend_id_to_instance_id.clear()
+    _global_instance_id_to_backend_id.clear()
     _global_database_id_to_pid.clear()
     _global_client_state.clear()
     _backend_events.clear()
@@ -575,6 +1444,8 @@ class TestWatcherFallback(unittest.IsolatedAsyncioTestCase):
     await asyncio.gather(*_background_tasks, return_exceptions=True)
     _global_clients.clear()
     _global_metadata.clear()
+    _global_backend_id_to_instance_id.clear()
+    _global_instance_id_to_backend_id.clear()
     _global_database_id_to_pid.clear()
     _global_client_state.clear()
     _backend_events.clear()
@@ -585,14 +1456,17 @@ class TestWatcherFallback(unittest.IsolatedAsyncioTestCase):
     tcp_server = await server.start_tcp("127.0.0.1", 0)
     self.servers.append(server)
     port = tcp_server.sockets[0].getsockname()[1]
+    instance_id = _iid(db_id)
     record = {
         "pid": pid,
         "channel": "tcp",
         "address": port,
-        "name": db_id,
+        "database_id": db_id,
+        "started_at": 1000.0,
+        "auto_analysis_disabled": False,
         "metadata": {"filepath": f"/fake/{db_id}.i64"},
     }
-    reg_file = self.registry_dir / f"{db_id}.json"
+    reg_file = self.registry_dir / registry.record_name(instance_id, False)
     reg_file.write_text(json.dumps(record), encoding="utf-8")
     return server
 
@@ -613,7 +1487,7 @@ class TestWatcherFallback(unittest.IsolatedAsyncioTestCase):
     await self._create_test_backend("db_fallback_1")
     with (
         mock.patch("gateway.forward.REGISTRY_DIR", self.registry_dir),
-        mock.patch("gateway.forward._is_process_running", return_value=True),
+        mock.patch("gateway.forward.is_process_running", return_value=True),
         mock.patch("gateway.forward._watcher_active", False),
         mock.patch("gateway.forward._observer", None),
     ):
@@ -628,7 +1502,7 @@ class TestWatcherFallback(unittest.IsolatedAsyncioTestCase):
     await self._create_test_backend("db_fallback_2")
     with (
         mock.patch("gateway.forward.REGISTRY_DIR", self.registry_dir),
-        mock.patch("gateway.forward._is_process_running", return_value=True),
+        mock.patch("gateway.forward.is_process_running", return_value=True),
         mock.patch("gateway.forward._watcher_active", False),
         mock.patch("gateway.forward._observer", None),
     ):
@@ -644,7 +1518,7 @@ class TestWatcherFallback(unittest.IsolatedAsyncioTestCase):
     await self._create_test_backend("db_watcher_active")
     with (
         mock.patch("gateway.forward.REGISTRY_DIR", self.registry_dir),
-        mock.patch("gateway.forward._is_process_running", return_value=True),
+        mock.patch("gateway.forward.is_process_running", return_value=True),
         mock.patch("gateway.forward._watcher_active", True),
         mock.patch(
             "gateway.forward._connect_unconnected_backends"
@@ -1317,9 +2191,13 @@ class TestResponseSizeLimitMiddleware(unittest.IsolatedAsyncioTestCase):
           "from gateway import forward\n"
           "print([type(m).__name__ for m in forward.mcp_server.middleware])\n"
       )
+      # Not IDAMCP_NO_USER_CONFIG, which tests/test_tools.py sets when it is
+      # imported: with it, the gateway would ignore IDAMCP_CONFIG.
+      env = dict(os.environ, IDAMCP_CONFIG=str(config_path))
+      env.pop("IDAMCP_NO_USER_CONFIG", None)
       proc = subprocess.run(
           [sys.executable, "-c", code],
-          env=dict(os.environ, IDAMCP_CONFIG=str(config_path)),
+          env=env,
           cwd=pathlib.Path(__file__).resolve().parent.parent,
           capture_output=True,
           text=True,

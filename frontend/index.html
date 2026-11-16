@@ -85,7 +85,7 @@ SOFTWARE.
         list.innerHTML = '';
 
         // Check if the current backend is still in the list
-        const backendExists = backends.some(b => b.name === currentBackend);
+        const backendExists = backends.some(b => b.database_id === currentBackend);
         if (!backendExists && currentBackend !== null) {
             currentBackend = null;
             document.getElementById('content').style.display = 'none';
@@ -99,11 +99,12 @@ SOFTWARE.
         backends.forEach(b => {
             const div = document.createElement('div');
             div.className = 'backend-item';
+            div.dataset.name = b.database_id;
             const basename = b.metadata && b.metadata.module ? b.metadata.module : 'Unknown';
-            div.textContent = `${basename} (${b.name})`;
+            div.textContent = `${basename} (${b.database_id})`;
             div.title = b.metadata && b.metadata.filepath ? b.metadata.filepath : '';
-            if (currentBackend === b.name) div.classList.add('active');
-            div.onclick = () => selectBackend(b.name);
+            if (currentBackend === b.database_id) div.classList.add('active');
+            div.onclick = () => selectBackend(b.database_id);
             list.appendChild(div);
         });
     }
@@ -112,7 +113,7 @@ SOFTWARE.
         currentBackend = name;
         document.querySelectorAll('.backend-item').forEach(el => {
             el.classList.remove('active');
-            if (el.textContent.startsWith(name)) el.classList.add('active');
+            if (el.dataset.name === name) el.classList.add('active');
         });
 
         document.getElementById('selected-backend-name').textContent = name;
@@ -143,13 +144,23 @@ SOFTWARE.
         }
     }
 
+    function isDisconnectError(e) {
+        return (
+            e.message.includes("Backend not found") ||
+            e.message.includes("Failed to connect") ||
+            e.message.includes("No such file") ||
+            e.message.includes("Connection failed") ||
+            e.message.includes("Connection refused")
+        );
+    }
+
     function handleError(e) {
-        if (e.message.includes("Failed to connect") || e.message.includes("No such file") || e.message.includes("Connection failed")) {
+        if (isDisconnectError(e)) {
             alert(`Backend ${currentBackend} disconnected.`);
             // Remove from list
             const list = document.getElementById('backend-list');
             for (let i = 0; i < list.children.length; i++) {
-                if (list.children[i].textContent.includes(`(${currentBackend})`)) {
+                if (list.children[i].dataset.name === currentBackend) {
                     list.removeChild(list.children[i]);
                     break;
                 }
@@ -159,7 +170,12 @@ SOFTWARE.
             document.getElementById('content').style.display = 'none';
             document.getElementById('selected-backend-name').textContent = "Select a backend";
         } else {
-            document.getElementById('tool-list').innerHTML = `<div class="error">Error: ${e.message}</div>`;
+            const list = document.getElementById('tool-list');
+            list.innerHTML = '';
+            const errDiv = document.createElement('div');
+            errDiv.className = 'error';
+            errDiv.textContent = `Error: ${e.message}`;
+            list.appendChild(errDiv);
         }
     }
 
@@ -193,6 +209,10 @@ SOFTWARE.
     async function updateConfig() {
         if (!currentBackend) return;
 
+        const prevConfig = {
+            enable_all_unsafe_tools: currentConfig.enable_all_unsafe_tools,
+            enabled_unsafe_tools: [...(currentConfig.enabled_unsafe_tools || [])],
+        };
         const enableAll = document.getElementById('enable-all').checked;
         const persistent = document.getElementById('persistent').checked;
         const enabledTools = [];
@@ -213,9 +233,12 @@ SOFTWARE.
                 enabled_unsafe_tools: enabledTools
             });
         } catch (e) {
-            handleError(e);
-            if (!e.message.includes("disconnected") && !e.message.includes("Failed to connect")) {
-                 alert('Failed to save config: ' + e.message);
+            if (isDisconnectError(e)) {
+                handleError(e);
+            } else {
+                currentConfig = prevConfig;
+                renderTools();
+                alert('Failed to save config: ' + e.message);
             }
         }
     }
@@ -228,6 +251,10 @@ SOFTWARE.
         });
         const data = await res.json();
         if (!res.ok) throw new Error(data.detail || 'RPC failed');
+        if (data.isError) {
+            const msg = data.content && data.content[0] && data.content[0].text;
+            throw new Error(msg || 'RPC failed');
+        }
         return data;
     }
 
