@@ -1147,7 +1147,7 @@
         "address": "0x1256",
         "type": "code",
         "function": {
-          "address": "0x1256",
+          "address": "0x1240",
           "name": "_Z11caller_funci",
           "size": "0x28"
         }
@@ -1169,7 +1169,7 @@
         "address": "0x1251",
         "type": "code",
         "function": {
-          "address": "0x1251",
+          "address": "0x1240",
           "name": "_Z11caller_funci",
           "size": "0x28"
         }
@@ -1185,7 +1185,7 @@
         "address": "0x1732",
         "type": "data",
         "function": {
-          "address": "0x1732",
+          "address": "0x1710",
           "name": "main",
           "size": "0x185"
         }
@@ -1194,7 +1194,7 @@
         "address": "0x1755",
         "type": "data",
         "function": {
-          "address": "0x1755",
+          "address": "0x1710",
           "name": "main",
           "size": "0x185"
         }

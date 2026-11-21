@@ -37,7 +37,6 @@ import sqlite3
 import tempfile
 import threading
 import time
-import traceback
 from typing import Any, Callable, Iterable, Iterator
 import weakref
 import ida_auto
@@ -1194,8 +1193,11 @@ def _is_entries_dirty() -> bool:
 @idaread
 def populate_entries():
   """Populates the entries table from idautils.Entries()."""
-  global _entries_fingerprint
+  global _entries_fingerprint, _entries_dirty
 
+  # Cleared before reading the entries: one that is added while this runs
+  # sets it again.
+  _entries_dirty = False
   fingerprint_items: list[tuple[int, int]] = []
 
   def _gen():
@@ -1251,6 +1253,23 @@ _strings_dirty = False
 # Set when IDA reports a local type change without saying which type changed;
 # sql_query then calls refresh_local_types before it reads local_types.
 _local_types_dirty = False
+# Set by mark_entries_stale(); the next query that reads the entries table
+# populates it again.
+_entries_dirty = False
+
+
+def mark_entries_stale() -> None:
+  """Makes the next query of the entries table populate it again.
+
+  IDA sends no event when an entry point is added, so a tool that adds one
+  calls this. The worker also drops the table's stored "populated" mark, so
+  that a persistent database isn't trusted by the next session if this one
+  ends before the table is queried.
+  """
+  global _entries_dirty
+  _entries_dirty = True
+  if _db_initialized:
+    _db_update_queue.put(("entries_changed",))
 
 
 def _execute_ro(
@@ -1281,10 +1300,8 @@ def _refresh_table(
       POPULATORS[table_name]()
     elif table_name == "local_types" and _local_types_dirty:
       refresh_local_types()
-    elif (
-        table_name == "entries"
-        and entries_check_enabled()
-        and _is_entries_dirty()
+    elif table_name == "entries" and (
+        _entries_dirty or (entries_check_enabled() and _is_entries_dirty())
     ):
       populate_entries()
 
@@ -1381,7 +1398,10 @@ def _fetch_ro(
         table_name not in _populated_tables
         or (table_name == "strings" and _strings_dirty)
         or (table_name == "local_types" and _local_types_dirty)
-        or (table_name == "entries" and _entries_check_enabled())
+        or (
+            table_name == "entries"
+            and (_entries_dirty or _entries_check_enabled())
+        )
     ):
       pending.add(table_name)
       return sqlite3.SQLITE_DENY
@@ -1458,11 +1478,9 @@ def sql_query(
         res.append(row_dict)
       results.append(QueryResult(rows=res))
     except Exception as e:
-      results.append(
-          QueryResult(
-              error=f"Error executing SQL: {str(e)}\n{traceback.format_exc()}"
-          )
-      )
+      # Only the message goes to the client; the traceback goes to the log.
+      logging.debug("sql_query failed: %s", q, exc_info=True)
+      results.append(QueryResult(error=f"Error executing SQL: {e}"))
 
   return results
 
@@ -1529,6 +1547,16 @@ def _db_worker():
         logging.info(
             "Table repopulation complete after rebase. Database is ready."
         )
+        continue
+
+      if action == "entries_changed":
+        with _db_write_lock:
+          remaining = _populated_tables - {"entries"}
+          _run_write_transaction(
+              conn,
+              lambda rw_conn: _save_populated_tables(rw_conn, remaining),
+              on_commit=lambda: _populated_tables.discard("entries"),
+          )
         continue
 
       with _db_write_lock:
@@ -2232,6 +2260,7 @@ def close_tables() -> None:
   global _db_initialized, _db_hooks, _db_idp_hooks, _worker_thread, _db_local
   global _db_version_checked, _populated_tables, _strings_dirty, _comments_dirty
   global _entries_fingerprint, _image_min_ea, _is_rebasing, _local_types_dirty
+  global _entries_dirty
 
   # 1. Unhook IDA IDB/IDP hooks
   if _db_hooks is not None:
@@ -2278,6 +2307,7 @@ def close_tables() -> None:
     _strings_dirty = False
     _comments_dirty = False
     _local_types_dirty = False
+    _entries_dirty = False
     _entries_fingerprint = None
     _image_min_ea = 0
     _is_rebasing = False

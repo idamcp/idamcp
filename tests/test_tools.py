@@ -19,6 +19,7 @@
 # SOFTWARE.
 
 
+import ast
 import asyncio
 import contextlib
 import json
@@ -351,6 +352,19 @@ class TestIDAMCP(unittest.IsolatedAsyncioTestCase):
         self.verify_sql_entries_table,
         self.verify_local_types_sync,
         self.verify_safe_eval,
+        self.verify_function_address_is_function_start,
+        self.verify_declare_type_natural_layout,
+        self.verify_set_types_reports_failures,
+        self.verify_failed_make_code_keeps_data,
+        self.verify_decompiler_sees_frame_edits,
+        self.verify_rename_local_variable_name_clash,
+        self.verify_bad_type_changes_nothing,
+        self.verify_add_entry_points_default_ordinal,
+        self.verify_uninitialized_reads,
+        self.verify_rename_addresses_delete_and_stored_name,
+        self.verify_patch_bounds_and_reanalysis,
+        self.verify_error_messages,
+        self.verify_stack_frame_fp_offset,
         self.verify_safe_eval_via_patch_assembly,
         self.verify_timeout_busy_handling,
         self.verify_timeout_gil_starvation_handling,
@@ -799,8 +813,9 @@ class TestIDAMCP(unittest.IsolatedAsyncioTestCase):
     test_struct = next((s for s in after if s["name"] == "TestStructNew"), None)
     self.assertIsNotNone(test_struct)
     self.assertEqual(test_struct["member_count"], 2)
-    # size is 6 in this environment (int is 4, char is 1, padded to 6 due to alignment)
-    self.assertEqual(test_struct["size"], 6)
+    # int is 4 bytes and char is 1; the struct is padded to the alignment of
+    # int.
+    self.assertEqual(test_struct["size"], 8)
     self.assertEqual(test_struct["udt_type"], "Struct")
 
     self.assertIn("members", test_struct)
@@ -2307,6 +2322,380 @@ for ea in (0x10d0, 0x10a0):
     else:
       print(
           "\n--- Skipping sql_query test (sqlglot not installed on gateway) ---"
+      )
+
+  # --- Regression tests for fixed bugs ---
+
+  async def _eval(self, code: str) -> typing.Any:
+    """Runs code in IDA and returns the value of its last expression.
+
+    The last statement of code must be an expression. It may follow other
+    statements on its line, separated by "; ".
+    """
+    setup, _, expr = code.rpartition("\n")
+    if "; " in expr:
+      more_setup, _, expr = expr.rpartition("; ")
+      setup = f"{setup}\n{more_setup}"
+    result = await self.run_tool(
+        "idapython_eval", code=f"{setup}\nrepr({expr})"
+    )
+    try:
+      return ast.literal_eval(result["result"])
+    except (ValueError, SyntaxError):
+      self.fail(f"idapython_eval failed: {result}")
+
+  async def verify_function_address_is_function_start(self):
+    func = await self.run_tool("get_function_by_address", address="0x1255")
+    start = await self.run_tool("get_function_by_address", address="0x1240")
+    self.assertEqual(func["address"], "0x1240")
+    self.assertEqual(func, start)
+
+    xrefs = await self.run_tool("get_xrefs_to", address="0x11e0")
+    calls = [x for x in xrefs if x["address"] == "0x1251"]
+    self.assertEqual(len(calls), 1, xrefs)
+    self.assertEqual(calls[0]["function"]["address"], "0x1240")
+
+  async def verify_declare_type_natural_layout(self):
+    result = await self.run_tool(
+        "declare_type",
+        c_decl="struct LayoutProbe { int a; char b; long c; };",
+    )
+    self.assertEqual(result, "success")
+    structs = await self.run_tool("list_structs", name_pattern="LayoutProbe")
+    self.assertEqual(len(structs), 1, structs)
+    # Packed to 2 bytes, the struct would be 14 bytes with c at offset 6.
+    self.assertEqual(structs[0]["size"], 16)
+    offsets = {m["name"]: m["offset"] for m in structs[0]["members"]}
+    self.assertEqual(offsets, {"a": 0, "b": 4, "c": 8})
+
+    result = await self.run_tool(
+        "declare_type",
+        c_decl="typedef int RegressTd_t; enum RegressEnum { RE_ONE = 1 };",
+    )
+    self.assertEqual(result, "success")
+    listing = await self.run_tool(
+        "list_local_types", name_pattern="RegressTd_t"
+    )
+    self.assertIn("typedef int RegressTd_t;", listing)
+    self.assertNotIn("forward", listing)
+    listing = await self.run_tool(
+        "list_local_types", name_pattern="RegressEnum"
+    )
+    self.assertIn("RE_ONE", listing)
+    self.assertNotIn("forward", listing)
+
+  async def verify_set_types_reports_failures(self):
+    get_type = "import idc; idc.get_type(0x405e)"
+    original = await self._eval(get_type)
+    self.assertTrue(original)
+    try:
+      result = await self.run_tool(
+          "set_types", reqs=[{"address": "0x405e", "new_type": "NoSuchType_t"}]
+      )
+      self.assertIn("is invalid", result)
+      self.assertEqual(await self._eval(get_type), original)
+
+      result = await self.run_tool(
+          "set_types", reqs=[{"address": "0x405e", "new_type": ""}]
+      )
+      self.assertEqual(result, "success")
+      self.assertIsNone(await self._eval(get_type))
+    finally:
+      result = await self.run_tool(
+          "set_types", reqs=[{"address": "0x405e", "new_type": original}]
+      )
+    self.assertEqual(result, "success")
+    self.assertEqual(await self._eval(get_type), original)
+
+  async def verify_failed_make_code_keeps_data(self):
+    # global_double: its first byte is an instruction, but no function can
+    # start there.
+    before = await self.run_tool("get_ida_view", address="0x4060", count=1)
+    self.assertIn("dq", before)
+    result = await self.run_tool("make_function", address="0x4060")
+    self.assertIn("Failed", result)
+    after = await self.run_tool("get_ida_view", address="0x4060", count=1)
+    self.assertEqual(after, before)
+
+    # bss_double: bytes without a value can't be an instruction.
+    item_size = "import ida_bytes; ida_bytes.get_item_size(0x41e0)"
+    self.assertEqual(await self._eval(item_size), 8)
+    for tool in ("make_code", "make_function"):
+      result = await self.run_tool(tool, address="0x41e0")
+      self.assertIn("Failed", result)
+      self.assertEqual(await self._eval(item_size), 8)
+
+  async def verify_decompiler_sees_frame_edits(self):
+    # Make sure the decompiler has a cached result to go stale.
+    await self.run_tool("decompile_function", address="0x1270")
+    renames = [{"old_name": "x", "new_name": "regress_sum"}]
+    try:
+      # 0x1284 is inside the function, not its start.
+      result = await self.run_tool(
+          "rename_stack_frame_variables", address="0x1284", renames=renames
+      )
+      self.assertEqual(result, "success")
+      code = await self.run_tool("decompile_function", address="0x1270")
+      self.assertIn("regress_sum", code)
+    finally:
+      await self.run_tool(
+          "rename_stack_frame_variables",
+          address="0x1270",
+          renames=[{"old_name": "regress_sum", "new_name": "x"}],
+      )
+    code = await self.run_tool("decompile_function", address="0x1270")
+    self.assertNotIn("regress_sum", code)
+
+  async def verify_rename_local_variable_name_clash(self):
+    lvar_names = (
+        "import ida_hexrays\n"
+        "[v.name for v in ida_hexrays.decompile(0x1550).get_lvars() if v.name]"
+    )
+    names = await self._eval(lvar_names)
+    self.assertGreaterEqual(len(names), 2, names)
+    result = await self.run_tool(
+        "rename_local_variables",
+        address="0x1550",
+        renames=[{"old_name": names[0], "new_name": names[1]}],
+    )
+    self.assertIn("already used", result)
+    self.assertEqual(await self._eval(lvar_names), names)
+
+  async def verify_bad_type_changes_nothing(self):
+    lvar_types = (
+        "import ida_hexrays\n"
+        "[(v.name, v.type().dstr())"
+        " for v in ida_hexrays.decompile(0x1550).get_lvars() if v.name]"
+    )
+    before = await self._eval(lvar_types)
+    self.assertGreaterEqual(len(before), 2, before)
+    with self.assertRaises(RuntimeError) as ctx:
+      await self.run_tool(
+          "set_local_variable_types",
+          address="0x1550",
+          type_changes=[
+              {"variable_name": before[0][0], "new_type": "unsigned char"},
+              {"variable_name": before[1][0], "new_type": "bad_type_abc!!!"},
+          ],
+      )
+    self.assertIn("parse type", str(ctx.exception).lower())
+    # The valid change that came first wasn't applied either.
+    self.assertEqual(await self._eval(lvar_types), before)
+
+  async def verify_add_entry_points_default_ordinal(self):
+    heads = await self._eval(
+        "import idautils\n"
+        "[hex(h) for h in list(idautils.FuncItems(0x1170))[1:3]]"
+    )
+    self.assertEqual(len(heads), 2, heads)
+    result = await self.run_tool(
+        "add_entry_points",
+        reqs=[
+            {"address": heads[0], "name": "regress_entry_a", "makecode": False},
+            {"address": heads[1], "name": "regress_entry_b", "makecode": False},
+        ],
+    )
+    self.assertEqual(result, "success")
+
+    # Both entries exist, each at its own address, and the entries table has
+    # them.
+    query = await self.run_tool(
+        "sql_query",
+        sql=(
+            "SELECT name, address FROM entries WHERE name LIKE"
+            " 'regress_entry_%' ORDER BY name"
+        ),
+    )
+    self.assertEqual(
+        query["rows"],
+        [
+            {"name": "regress_entry_a", "address": heads[0]},
+            {"name": "regress_entry_b", "address": heads[1]},
+        ],
+    )
+
+    # An ordinal that another entry point has is rejected.
+    result = await self.run_tool(
+        "add_entry_points",
+        reqs=[{
+            "address": "0x11b0",
+            "name": "regress_entry_c",
+            "ordinal": int(heads[0], 16),
+            "makecode": False,
+        }],
+    )
+    self.assertIn("already belongs", result)
+
+  async def verify_uninitialized_reads(self):
+    max_ea = await self._eval("import idaapi; idaapi.inf_get_max_ea()")
+    results = await self.run_tool(
+        "read_data",
+        reqs=[
+            # Runs past the end of the database.
+            {"address": hex(max_ea - 8), "data_type": "bytes", "size": 64},
+            {"address": hex(max_ea - 4), "data_type": "qword"},
+            {"address": "0x4058", "data_type": "bytes", "size": -1},
+            {"address": "0x4058", "data_type": "dword"},
+        ],
+    )
+    self.assertFalse(results[0]["success"])
+    self.assertIn("not initialized", results[0]["error"])
+    self.assertFalse(results[1]["success"])
+    self.assertIn("not initialized", results[1]["error"])
+    self.assertFalse(results[2]["success"])
+    self.assertIn("size must be positive", results[2]["error"])
+    self.assertTrue(results[3]["success"])
+
+    # bss_buffer has no bytes in the file.
+    result = await self.run_tool(
+        "get_struct_at_address", address="0x4160", struct_name="TestStruct"
+    )
+    self.assertEqual(
+        [m["value"] for m in result["members"]], ["<uninitialized>"] * 3
+    )
+
+    # A function isn't a variable.
+    results = await self.run_tool(
+        "get_global_variable_value_at_address", reqs=["0x11e0"]
+    )
+    self.assertFalse(results[0]["success"])
+    self.assertIn("not a data variable", results[0]["error"])
+    self.assertNotIn("overloaded", results[0]["error"])
+
+    with self.assertRaises(RuntimeError) as ctx:
+      await self.run_tool("get_operand", address="0x4058", op_index=0)
+    self.assertIn("not an instruction", str(ctx.exception))
+
+  async def verify_rename_addresses_delete_and_stored_name(self):
+    get_names = "import idc; [idc.get_name(0x4058), idc.get_name(0x405c)]"
+    original = await self._eval(get_names)
+    try:
+      # An empty name deletes the name.
+      result = await self.run_tool(
+          "rename_addresses", reqs=[{"address": "0x4058", "new_name": ""}]
+      )
+      self.assertEqual(result, "success")
+      deleted = (await self._eval(get_names))[0]
+      self.assertNotEqual(deleted, original[0])
+      self.assertTrue(deleted.endswith("_4058"), deleted)
+
+      # IDA replaces invalid characters; the result says what was stored.
+      result = await self.run_tool(
+          "rename_addresses",
+          reqs=[{"address": "0x405c", "new_name": "1 bad name!"}],
+      )
+      self.assertIn("_1_bad_name_", result)
+      self.assertEqual((await self._eval(get_names))[1], "_1_bad_name_")
+    finally:
+      result = await self.run_tool(
+          "rename_addresses",
+          reqs=[
+              {"address": "0x4058", "new_name": original[0]},
+              {"address": "0x405c", "new_name": original[1]},
+          ],
+      )
+    self.assertEqual(result, "success")
+    self.assertEqual(await self._eval(get_names), original)
+
+  async def verify_patch_bounds_and_reanalysis(self):
+    max_ea = await self._eval("import idaapi; idaapi.inf_get_max_ea()")
+    tail = f"import ida_bytes; ida_bytes.get_bytes({max_ea - 2}, 2).hex()"
+    before = await self._eval(tail)
+    result = await self.run_tool(
+        "patch_bytes",
+        reqs=[{"address": hex(max_ea - 2), "hex_string": "AABBCCDD"}],
+    )
+    self.assertIn("past the end", result)
+    self.assertEqual(await self._eval(tail), before)
+
+    # A patched call gets its cross-reference from the new target.
+    async def call_targets():
+      xrefs = await self.run_tool("get_xrefs_from", address="0x1251")
+      return {x["address"] for x in xrefs}
+
+    original = await self._eval(
+        "import ida_bytes; ida_bytes.get_bytes(0x1251, 5).hex()"
+    )
+    self.assertIn("0x11e0", await call_targets())
+    try:
+      result = await self.run_tool(
+          "patch_assembly",
+          reqs=[{
+              "address": "0x1251",
+              "instructions": "call _Z14another_calleev",
+          }],
+      )
+      self.assertEqual(result, "success")
+      targets = await call_targets()
+      self.assertIn("0x1210", targets)
+      self.assertNotIn("0x11e0", targets)
+    finally:
+      await self.run_tool(
+          "patch_bytes", reqs=[{"address": "0x1251", "hex_string": original}]
+      )
+    targets = await call_targets()
+    self.assertIn("0x11e0", targets)
+    self.assertNotIn("0x1210", targets)
+
+    result = await self.run_tool(
+        "convert_to_offsets", reqs=[{"address": "0x1271", "op_index": 5}]
+    )
+    self.assertIn("has no operand 5", result)
+
+  async def verify_error_messages(self):
+    result = await self.run_tool(
+        "sql_query", sql="SELECT * FROM nonexistent_table"
+    )
+    self.assertEqual(
+        result["error"], "Error executing SQL: no such table: nonexistent_table"
+    )
+    result = await self.run_tool("sql_query", sql="SELEC broken syntax")
+    self.assertTrue(result["error"].startswith("Error executing SQL: "))
+    self.assertNotIn("Traceback", result["error"])
+    self.assertNotIn("\x1b", result["error"])
+
+    with self.assertRaises(RuntimeError) as ctx:
+      await self.run_tool(
+          "export_file",
+          file_type="map",
+          output_path="/nonexistent_dir_regress/out.map",
+      )
+    self.assertIn("doesn't exist", str(ctx.exception))
+
+    result = await self.run_tool("undefine", address="0x41e8", size=-1)
+    self.assertIn("size must be at least 1", result)
+
+    with self.assertRaises(RuntimeError) as ctx:
+      await self.run_tool("get_stack_frame_variables", address="0x4058")
+    self.assertIn("0x4058", str(ctx.exception))
+
+    # A failed decompilation says why.
+    set_max_size = (
+        "import ida_hexrays\n"
+        "ida_hexrays.mark_cfunc_dirty(0x1310)\n"
+        "ida_hexrays.change_hexrays_config('MAX_FUNCSIZE = %d')"
+    )
+    await self.run_tool("idapython_eval", code=set_max_size % 0)
+    try:
+      with self.assertRaises(RuntimeError) as ctx:
+        await self.run_tool("decompile_function", address="0x1310")
+      self.assertIn("too big function", str(ctx.exception))
+    finally:
+      await self.run_tool("idapython_eval", code=set_max_size % 64)
+    code = await self.run_tool("decompile_function", address="0x1310")
+    self.assertIn("handle_switch", code)
+
+  async def verify_stack_frame_fp_offset(self):
+    frsize = await self._eval(
+        "import ida_funcs; ida_funcs.get_func(0x1270).frsize"
+    )
+    variables = await self.run_tool(
+        "get_stack_frame_variables", address="0x1270"
+    )
+    self.assertTrue(variables)
+    for var in variables:
+      self.assertEqual(
+          int(var["fp_offset"], 16), int(var["offset"], 16) - frsize, var
       )
 
   async def verify_invalid_addresses_corner_cases(self):

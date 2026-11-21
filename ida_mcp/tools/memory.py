@@ -41,6 +41,9 @@ from shared.types import (
     ReadDataRequest,
 )
 
+# Number of bytes that read_data reads for each fixed-size data type.
+_READ_SIZES = {"byte": 1, "word": 2, "dword": 4, "qword": 8}
+
 
 def get_global_variable_value_internal(ea: int) -> str:
   """Internal helper to get the value of a global variable.
@@ -52,7 +55,9 @@ def get_global_variable_value_internal(ea: int) -> str:
     The string representation of the variable's value.
   """
   if not idaapi.is_loaded(ea):
-    raise ToolError(f"The specified address {ea} is not initialized.")
+    raise ToolError(f"The specified address {ea:#x} is not initialized.")
+  if idaapi.is_code(idaapi.get_flags(ea)):
+    raise ToolError(f"{ea:#x} is code, not a data variable")
 
   # Get the type information for the variable
   tif = ida_typeinf.tinfo_t()
@@ -73,6 +78,12 @@ def get_global_variable_value_internal(ea: int) -> str:
   else:
     # Determine the size of the variable
     size = tif.get_size()
+    if size == ida_typeinf.BADSIZE:
+      raise ToolError(f"The type of the variable at {ea:#x} has no size: {tif}")
+  if size > 0:
+    # Every byte must have a value: the get_*() calls below report 0xff for
+    # one that has none.
+    helper.read_defined_bytes(ea, size)
   # Read the value based on the size
   match size:
     case 0:
@@ -81,6 +92,7 @@ def get_global_variable_value_internal(ea: int) -> str:
             idaapi.get_strlit_contents(ea, -1, 0).decode("utf-8").strip()
         )
         return f'"{return_string}"'
+      raise ToolError(f"The variable at {ea:#x} has size 0")
     case 1:
       return hex(ida_bytes.get_byte(ea))
     case 2:
@@ -186,6 +198,15 @@ def read_data(
       continue
 
     try:
+      size = _READ_SIZES.get(req.data_type, 0)
+      if req.data_type == "bytes":
+        size = req.size
+        if size <= 0:
+          raise ToolError(f"size must be positive, got {size}")
+      if size:
+        # Every byte must have a value: the get_*() calls below report 0xff
+        # for one that has none.
+        helper.read_defined_bytes(ea, size)
       match req.data_type:
         case "byte":
           val = hex(ida_bytes.get_wide_byte(ea))

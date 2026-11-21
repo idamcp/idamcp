@@ -55,18 +55,29 @@
             "items": {
               "properties": {
                 "address": {
+                  "description": "Linear address of the entry point",
                   "type": "string"
                 },
                 "makecode": {
                   "default": true,
+                  "description": "Should the kernel convert bytes to instructions",
                   "type": "boolean"
                 },
                 "name": {
+                  "description": "name of entry point. If the specified location already has a name, the old name will be appended to the regular comment.",
                   "type": "string"
                 },
                 "ordinal": {
-                  "default": 0,
-                  "type": "integer"
+                  "anyOf": [
+                    {
+                      "type": "integer"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ],
+                  "default": null,
+                  "description": "Ordinal number of the entry point. Defaults to the entry point's address, which is what IDA uses when the file format has no export ordinals. An ordinal that another entry point already has is rejected."
                 }
               },
               "required": [
@@ -166,14 +177,17 @@
             "items": {
               "properties": {
                 "address": {
+                  "description": "Address of the instruction or global variable",
                   "type": "string"
                 },
                 "base": {
                   "default": "0",
+                  "description": "Base address for the offset (default '0')",
                   "type": "string"
                 },
                 "op_index": {
                   "default": 0,
+                  "description": "Operand index (0-based). Use 0 (default) for data items/global variables.",
                   "type": "integer"
                 }
               },
@@ -224,12 +238,15 @@
             "items": {
               "properties": {
                 "offset": {
+                  "description": "Offset of the stack frame variable relative to the frame pointer (e.g. '-0x68'): the fp_offset that get_stack_frame_variables reports, not its offset",
                   "type": "string"
                 },
                 "type_name": {
+                  "description": "Type of the stack variable",
                   "type": "string"
                 },
                 "variable_name": {
+                  "description": "Name of the stack variable",
                   "type": "string"
                 }
               },
@@ -2359,6 +2376,9 @@
           "result": {
             "items": {
               "properties": {
+                "fp_offset": {
+                  "type": "string"
+                },
                 "name": {
                   "type": "string"
                 },
@@ -3821,7 +3841,7 @@
           "tags": []
         }
       },
-      "description": "Convert raw bytes to instructions at an address (GUI: 'C').\n\nThis operation automatically undefines (GUI: 'U') any existing item at the\nspecified address to allow for the creation of a new instruction.",
+      "description": "Convert raw bytes to instructions at an address (GUI: 'C').\n\nThis operation automatically undefines (GUI: 'U') any existing item at the\nspecified address to allow for the creation of a new instruction. If no\ninstruction can be created there, the existing item is kept.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -3873,9 +3893,11 @@
             "items": {
               "properties": {
                 "address": {
+                  "description": "Address to create data at",
                   "type": "string"
                 },
                 "data_type": {
+                  "description": "Type of data to create ('byte', 'word', 'dword', 'qword', 'oword', 'yword', 'float', 'double', 'tbyte', 'pack_real')",
                   "type": "string"
                 }
               },
@@ -3914,7 +3936,7 @@
           "tags": []
         }
       },
-      "description": "Define a function at a code location (GUI: 'P').\n\nTo ensure success, this operation first undefines (GUI: 'U') any existing\nitem at the address and converts it to code before establishing the function\ndefinition.",
+      "description": "Define a function at a code location (GUI: 'P').\n\nTo ensure success, this operation first undefines (GUI: 'U') any existing\nitem at the address and converts it to code before establishing the function\ndefinition. If no function can be created there, the existing item is kept.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -4059,9 +4081,11 @@
             "items": {
               "properties": {
                 "address": {
+                  "description": "Starting Address to apply patch",
                   "type": "string"
                 },
                 "instructions": {
+                  "description": "Assembly instructions separated by ';'",
                   "type": "string"
                 },
                 "syntax": {
@@ -4078,7 +4102,8 @@
                       "type": "null"
                     }
                   ],
-                  "default": null
+                  "default": null,
+                  "description": "Syntax (e.g. 'intel', 'nasm', 'att')"
                 }
               },
               "required": [
@@ -4129,9 +4154,11 @@
             "items": {
               "properties": {
                 "address": {
+                  "description": "Address to patch bytes at",
                   "type": "string"
                 },
                 "hex_string": {
+                  "description": "Hex string of bytes to patch (e.g. '90 90' or '9090'), max 0x1000 bytes per call",
                   "type": "string"
                 }
               },
@@ -4183,9 +4210,11 @@
             "items": {
               "properties": {
                 "address": {
+                  "description": "Address (hex string) of the memory value to be read",
                   "type": "string"
                 },
                 "data_type": {
+                  "description": "The type of data to read ('byte', 'word', 'dword', 'qword', 'string', 'bytes')",
                   "enum": [
                     "byte",
                     "word",
@@ -4198,6 +4227,7 @@
                 },
                 "size": {
                   "default": 1,
+                  "description": "Number of bytes to read (only used when data_type is 'bytes')",
                   "type": "integer"
                 }
               },
@@ -4264,9 +4294,11 @@
             "items": {
               "properties": {
                 "address": {
+                  "description": "Linear address. do nothing if address is not valid. tail bytes can't have names.",
                   "type": "string"
                 },
                 "new_name": {
+                  "description": "New name for the address",
                   "type": "string"
                 }
               },
@@ -4322,9 +4354,11 @@
             "items": {
               "properties": {
                 "new_name": {
+                  "description": "New name for the variable (empty for a default name)",
                   "type": "string"
                 },
                 "old_name": {
+                  "description": "Current name of the variable",
                   "type": "string"
                 }
               },
@@ -4381,9 +4415,11 @@
             "items": {
               "properties": {
                 "new_name": {
+                  "description": "New name for the variable (empty for a default name)",
                   "type": "string"
                 },
                 "old_name": {
+                  "description": "Current name of the variable",
                   "type": "string"
                 }
               },
@@ -4601,6 +4637,7 @@
             "items": {
               "properties": {
                 "address": {
+                  "description": "The address of the item to color",
                   "type": "string"
                 },
                 "color": {
@@ -4611,10 +4648,12 @@
                     {
                       "type": "integer"
                     }
-                  ]
+                  ],
+                  "description": "new color code in RGB (hex 0xBBGGRR) (hex string or integer)"
                 },
                 "item_type": {
                   "default": "CIC_ITEM",
+                  "description": "type of the item, can only be CIC_ITEM, CIC_FUNC, or CIC_SEGM, default is CIC_ITEM",
                   "type": "string"
                 }
               },
@@ -4776,9 +4815,11 @@
             "items": {
               "properties": {
                 "new_type": {
+                  "description": "New type for the variable",
                   "type": "string"
                 },
                 "variable_name": {
+                  "description": "Name of the variable",
                   "type": "string"
                 }
               },
@@ -4835,9 +4876,11 @@
             "items": {
               "properties": {
                 "type_name": {
+                  "description": "Type of the stack variable",
                   "type": "string"
                 },
                 "variable_name": {
+                  "description": "Name of the stack variable",
                   "type": "string"
                 }
               },
@@ -4890,9 +4933,11 @@
             "items": {
               "properties": {
                 "address": {
+                  "description": "Address or name of object to set type",
                   "type": "string"
                 },
                 "new_type": {
+                  "description": "The type string in C declaration form (e.g. 'int x;', 'char *'). If empty, the type is removed.",
                   "type": "string"
                 }
               },

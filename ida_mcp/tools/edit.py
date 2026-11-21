@@ -22,6 +22,7 @@
 
 """Tools for editing the IDA database."""
 
+import contextlib
 from typing import Annotated, List
 import ida_bytes
 import ida_entry
@@ -32,9 +33,11 @@ import ida_idp
 import ida_kernwin
 from ida_mcp.core.decorators import jsonrpc
 from ida_mcp.core.synchronization import idawrite
+from ida_mcp.tools.query import mark_entries_stale
 from ida_mcp.utils import helper
 import ida_typeinf
 import idaapi
+import idautils
 import idc
 from shared.rpc import ToolError
 from shared.types import (
@@ -72,6 +75,8 @@ def jump_to_address(
 
   if ida_kernwin.jumpto(ea):
     return "success"
+  if getattr(idaapi, "is_headless", False):
+    return f"Failed to jump to {address}: not available in headless mode"
   return f"Failed to jump to {address}"
 
 
@@ -224,15 +229,40 @@ def rename_local_variables(
   if start_ea == idaapi.BADADDR:
     return f"No function found at address {address}"
 
+  # ida_hexrays.rename_lvar() accepts a name that another variable already
+  # has and returns True; what the two variables are called afterwards depends
+  # on the IDA version. So check the names here. Without a decompilation the
+  # names aren't known, and the check is skipped.
+  taken: set[str] | None = None
+  with contextlib.suppress(ToolError):
+    taken = {
+        lvar.name for lvar in helper.decompile_checked(start_ea).get_lvars()
+    }
+
   errors = []
   successes = []
   for rename in renames:
+    if (
+        taken is not None
+        and rename.new_name
+        and rename.new_name != rename.old_name
+        and rename.new_name in taken
+    ):
+      errors.append(
+          f"Failed to rename local variable {rename.old_name} in function"
+          f" {start_ea:#x}: the name {rename.new_name} is already used"
+      )
+      continue
     if not ida_hexrays.rename_lvar(start_ea, rename.old_name, rename.new_name):
       errors.append(
           f"Failed to rename local variable {rename.old_name} in function"
           f" {start_ea:#x}"
       )
     else:
+      if taken is not None:
+        taken.discard(rename.old_name)
+        if rename.new_name:
+          taken.add(rename.new_name)
       successes.append(
           f"Successfully renamed local variable {rename.old_name} to"
           f" {rename.new_name} in function {start_ea:#x}"
@@ -255,6 +285,9 @@ def rename_addresses(
   errors = []
   successes = []
   refresh_eas = set()
+  # Set when IDA stored another name than the one asked for, so that the
+  # result says so instead of a bare "success".
+  name_changed = False
   for req in reqs:
     try:
       ea = helper.parse_and_check_ea(req.address)
@@ -262,11 +295,16 @@ def rename_addresses(
       errors.append(f"Failed to parse address '{req.address}': {e}")
       continue
 
-    flags = (
-        idaapi.SN_FORCE
-        | getattr(idaapi, "SN_MULTI", 0)
-        | getattr(idaapi, "SN_MULTI_FORCE", 0)
-    )
+    if req.new_name:
+      flags = (
+          idaapi.SN_FORCE
+          | getattr(idaapi, "SN_MULTI", 0)
+          | getattr(idaapi, "SN_MULTI_FORCE", 0)
+      )
+    else:
+      # An empty name deletes the name, which set_name() refuses to do when
+      # SN_FORCE is given.
+      flags = idaapi.SN_NOWARN
     if not idaapi.set_name(
         ea,
         req.new_name,
@@ -275,12 +313,23 @@ def rename_addresses(
       errors.append(f"Failed to rename address {req.address} to {req.new_name}")
     else:
       refresh_eas.add(ea)
-      successes.append(
-          f"Successfully renamed address {req.address} to {req.new_name}"
-      )
+      # With SN_FORCE, IDA replaces invalid characters and appends a suffix to
+      # a name that is already in use.
+      stored_name = idaapi.get_name(ea)
+      if req.new_name and stored_name != req.new_name:
+        name_changed = True
+        successes.append(
+            f"Successfully renamed address {req.address} to {stored_name}"
+            f" (the requested name {req.new_name} is invalid or already in"
+            " use)"
+        )
+      else:
+        successes.append(
+            f"Successfully renamed address {req.address} to {req.new_name}"
+        )
   for ea in refresh_eas:
     helper.refresh_decompiler(ea)
-  if not errors:
+  if not errors and not name_changed:
     return "success"
   return "\n".join(errors + successes)
 
@@ -320,10 +369,16 @@ def set_local_variable_types(
   if start_ea == idaapi.BADADDR:
     return f"No function found at address {address}"
 
+  # Parse every type before changing anything, so that an invalid type fails
+  # the call while the database is still untouched.
+  new_tifs = [
+      helper.get_type_by_name(type_change.new_type)
+      for type_change in type_changes
+  ]
+
   errors = []
   successes = []
-  for type_change in type_changes:
-    new_tif = helper.get_type_by_name(type_change.new_type)
+  for type_change, new_tif in zip(type_changes, new_tifs):
     if not ida_hexrays.rename_lvar(
         start_ea, type_change.variable_name, type_change.variable_name
     ):
@@ -435,9 +490,13 @@ def create_stack_frame_variables(
   if not helper.get_func_frame(frame_tif, ea):
     return f"No frame returned for function {address}."
 
+  # Parse every type before changing anything, so that an invalid type fails
+  # the call while the database is still untouched.
+  tifs = [helper.get_type_by_name(creation.type_name) for creation in creations]
+
   errors = []
   successes = []
-  for creation in creations:
+  for creation, tif in zip(creations, tifs):
     try:
       offset_ea = helper.parse_int(creation.offset)
     except Exception as e:
@@ -447,11 +506,13 @@ def create_stack_frame_variables(
       )
       continue
 
-    tif = helper.get_type_by_name(creation.type_name)
     if not helper.define_stkvar(ea, creation.variable_name, offset_ea, tif):
       errors.append(
           f"Failed to define stack frame variable {creation.variable_name} in"
-          f" function {address}"
+          f" function {address}: the offset {creation.offset} must be"
+          " relative to the frame pointer (fp_offset in"
+          " get_stack_frame_variables) and must not overlap a special frame"
+          " member"
       )
     else:
       successes.append(
@@ -489,9 +550,16 @@ def set_stack_frame_variable_types(
   if not helper.get_func_frame(frame_tif, ea):
     return f"No frame returned for function {address}."
 
+  # Parse every type before changing anything, so that an invalid type fails
+  # the call while the database is still untouched.
+  tifs = [
+      helper.get_type_by_name(type_change.type_name)
+      for type_change in type_changes
+  ]
+
   errors = []
   successes = []
-  for type_change in type_changes:
+  for type_change, tif in zip(type_changes, tifs):
     idx, udm = frame_tif.get_udm(type_change.variable_name)  # type: ignore
     if not udm or idx == -1:
       errors.append(
@@ -504,7 +572,6 @@ def set_stack_frame_variable_types(
     frame_tif.get_udm_by_tid(udm, tid)
     offset = udm.offset // 8
 
-    tif = helper.get_type_by_name(type_change.type_name)
     if not helper.set_frame_member_type(ea, offset, tif):
       errors.append(
           "Failed to set stack frame variable type for"
@@ -626,7 +693,16 @@ def set_types(
         errors.append(f"Failed to parse address '{req.address}': {e}")
         continue
 
-    if idc.SetType(ea, req.new_type.strip().rstrip(";") + ";") is None:
+    decl = req.new_type.strip().rstrip(";")
+    if decl:
+      # idc.SetType() returns None or 0, depending on the IDA version, for a
+      # type that doesn't parse, and False for one that can't be applied.
+      applied = bool(idc.SetType(ea, f"{decl};"))
+    else:
+      # An empty string removes the type.
+      idc.SetType(ea, "")
+      applied = not idc.get_type(ea)
+    if not applied:
       errors.append(f"new_type `{req.new_type}` is invalid at {req.address}")
     else:
       successes.append(
@@ -654,15 +730,45 @@ def add_entry_points(
       errors.append(f"Failed to parse address '{req.address}': {e}")
       continue
 
-    if not ida_entry.add_entry(req.ordinal, ea, req.name, req.makecode, 0):
+    # IDA identifies an entry point by its ordinal: adding a second entry
+    # with an ordinal that is in use renames the first one instead.
+    ordinal = ea if req.ordinal is None else req.ordinal
+    owner = ida_entry.get_entry(ordinal)
+    if owner not in (idaapi.BADADDR, ea):
+      errors.append(
+          f"Failed to add entry point {req.name} at {req.address}: ordinal"
+          f" {ordinal:#x} already belongs to the entry point at {owner:#x}"
+      )
+      continue
+
+    if not ida_entry.add_entry(ordinal, ea, req.name, req.makecode, 0):
       errors.append(f"Failed to add entry point {req.name} at {req.address}")
     else:
       successes.append(
           f"Successfully added entry point {req.name} at {req.address}"
       )
+  if successes:
+    mark_entries_stale()
   if not errors:
     return "success"
   return "\n".join(errors + successes)
+
+
+def _reanalyze_code(start_ea: int, end_ea: int) -> None:
+  """Re-analyses the instructions in [start_ea, end_ea) after a change.
+
+  IDA doesn't update the cross-references of an instruction when its bytes or
+  the type of its operands change. Does nothing if the range holds no code.
+  """
+  if end_ea <= start_ea:
+    return
+  start_ea = ida_bytes.get_item_head(start_ea)
+  if not any(
+      ida_bytes.is_code(ida_bytes.get_flags(head))
+      for head in (start_ea, *idautils.Heads(start_ea, end_ea))
+  ):
+    return
+  helper.reanalyze_range(start_ea, ida_bytes.get_item_end(end_ea - 1))
 
 
 @jsonrpc
@@ -687,10 +793,24 @@ def patch_bytes(
       errors.append(f"Invalid hex string format for {req.address}")
       continue
 
-    length = min(0x1000, len(patch_data))
-    length = min(length, idaapi.inf_get_max_ea() - ea)
-    patch_data = patch_data[:length]
+    # A patch that doesn't fit is rejected as a whole: writing only a part of
+    # it would leave the database in a state that nobody asked for.
+    length = len(patch_data)
+    if length > 0x1000:
+      errors.append(
+          f"The patch at {req.address} is {length:#x} bytes long; the limit is"
+          " 0x1000 bytes per request"
+      )
+      continue
+    max_ea = idaapi.inf_get_max_ea()
+    if ea + length > max_ea:
+      errors.append(
+          f"The patch at {req.address} is {length:#x} bytes long and would"
+          f" run past the end of the database ({max_ea:#x})"
+      )
+      continue
     ida_bytes.patch_bytes(ea, patch_data)
+    _reanalyze_code(ea, ea + length)
     refresh_eas.add(ea)
     successes.append(f"Successfully patched {length:#x} bytes at {req.address}")
   for ea in refresh_eas:
@@ -751,10 +871,28 @@ def convert_to_offsets(
       continue
 
     if base_ea != 0 and not helper.is_address_valid(base_ea):
-      errors.append(f"Invalid base {base_ea} for {req.address}")
+      errors.append(f"Invalid base {base_ea:#x} for {req.address}")
+      continue
+
+    # op_plain_offset() doesn't check that the instruction has the operand:
+    # it returns True and changes nothing that can be seen. -1 and OPND_ALL
+    # stand for every operand.
+    is_code = ida_bytes.is_code(ida_bytes.get_flags(ea))
+    if (
+        is_code
+        and req.op_index not in (-1, getattr(ida_bytes, "OPND_ALL", 15))
+        and not 0 <= req.op_index < helper.get_operand_count(ea)
+    ):
+      errors.append(
+          f"The instruction at {ea:#x} has no operand {req.op_index}"
+      )
       continue
 
     if idaapi.op_plain_offset(ea, req.op_index, base_ea):
+      if is_code:
+        # The cross-reference to the target only appears when the instruction
+        # is analysed again.
+        _reanalyze_code(ea, ea + 1)
       refresh_eas.add(ea)
       successes.append(
           f"Successfully converted item to offset at {req.address}"

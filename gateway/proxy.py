@@ -394,7 +394,8 @@ async def make_code(
   """Convert raw bytes to instructions at an address (GUI: 'C').
 
   This operation automatically undefines (GUI: 'U') any existing item at the
-  specified address to allow for the creation of a new instruction.
+  specified address to allow for the creation of a new instruction. If no
+  instruction can be created there, the existing item is kept.
   """
   return await forward_to(database_id, "make_code", locals())
 
@@ -410,7 +411,7 @@ async def make_function(
 
   To ensure success, this operation first undefines (GUI: 'U') any existing
   item at the address and converts it to code before establishing the function
-  definition.
+  definition. If no function can be created there, the existing item is kept.
   """
   return await forward_to(database_id, "make_function", locals())
 

@@ -285,6 +285,29 @@ class TestHeadlessManager(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.startswith(f"{first_line}\n"))
         self.assertTrue(result.endswith(f"\n\n{_SEARCH_RESULTS_NOTE}"))
 
+  def test_serialize_search_results_lists_object_fields(self):
+    """Test the fields of a request object are listed with descriptions."""
+    from gateway.forward import _serialize_search_results
+    from fastmcp.tools import Tool
+    from shared.types import ReadDataRequest
+
+    def read_data(reqs: list[ReadDataRequest], limit: int = 1) -> None:
+      """Reads data."""
+      del reqs, limit
+
+    result = _serialize_search_results([Tool.from_function(read_data)])
+    self.assertIn("- `reqs` (object[], required)", result)
+    self.assertIn("**Fields of each `reqs` item**", result)
+    self.assertIn(
+        "- `address` (string, required): Address (hex string) of the memory"
+        " value to be read",
+        result,
+    )
+    self.assertIn('- `data_type` ("byte" | "word" | "dword"', result)
+    self.assertIn("- `size` (integer, default 1): Number of bytes", result)
+    # A parameter that isn't an object gets no section.
+    self.assertNotIn("`limit` item", result)
+
   def test_build_mcp_transforms_hybrid_custom_always_visible(self):
     """Test _build_mcp_transforms respects custom always_visible_tools."""
     from gateway.forward import _build_mcp_transforms

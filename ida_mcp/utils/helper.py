@@ -53,6 +53,9 @@ get_type_by_name = _helper_common.get_type_by_name
 ida_segment_perm2str = _helper_common.ida_segment_perm2str
 is_window_active = _helper_common.is_window_active
 parse_and_check_ea = _helper_common.parse_and_check_ea
+read_defined_bytes = _helper_common.read_defined_bytes
+reanalyze_range = _helper_common.reanalyze_range
+get_operand_count = _helper_common.get_operand_count
 refresh_decompiler_ctext = _helper_common.refresh_decompiler_ctext
 refresh_decompiler_widget = _helper_common.refresh_decompiler_widget
 is_address_valid = _helper_common.is_address_valid
@@ -116,7 +119,8 @@ def get_function(address, *, raise_error=True):
     raise_error: Whether to raise an error if the function is not found.
 
   Returns:
-    The function object or None if the function is not found and raise_error is
+    The function that contains the address, described by its start address,
+    name and size; or None if the function is not found and raise_error is
     False.
   """
   address = check_address(address, raise_error)
@@ -131,7 +135,7 @@ def get_function(address, *, raise_error=True):
 
   name = ida_funcs.get_func_name(bounds.start_ea) or f"sub_{bounds.start_ea:x}"
   return Function(
-      address=hex(address),
+      address=hex(bounds.start_ea),
       name=name,
       size=hex(bounds.end_ea - bounds.start_ea),
   )
@@ -178,6 +182,9 @@ __all__ = [
     "get_image_size",
     "get_prototype",
     "parse_and_check_ea",
+    "read_defined_bytes",
+    "reanalyze_range",
+    "get_operand_count",
     "get_type_by_name",
     "compile_regex",
     "convert_regex_flags",

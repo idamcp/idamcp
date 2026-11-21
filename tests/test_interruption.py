@@ -631,7 +631,8 @@ class TestCancellationProfileReuse(unittest.TestCase):
     kernwin.clr_cancelled.reset_mock()
     kernwin.execute_sync.reset_mock()
 
-    # 1. Headless mode: calls ida_kernwin.set_cancelled() directly
+    # 1. Headless mode on IDA 9.4 or later: calls ida_kernwin.set_cancelled()
+    # directly
     token1 = CancellationToken()
     started1 = threading.Event()
 
@@ -644,7 +645,10 @@ class TestCancellationProfileReuse(unittest.TestCase):
 
     import contextlib  # pylint: disable=g-import-not-at-top
 
-    with mock.patch.object(sys.modules["idaapi"], "is_headless", True):
+    with (
+        mock.patch.object(sys.modules["idaapi"], "is_headless", True),
+        mock.patch.object(sys.modules["idaapi"], "IDA_SDK_VERSION", 940),
+    ):
       t1 = threading.Thread(target=headless_worker)
       t1.start()
       self.assertTrue(started1.wait(timeout=2.0))
@@ -695,6 +699,91 @@ class TestCancellationProfileReuse(unittest.TestCase):
       kernwin.set_cancelled.assert_not_called()
     finally:
       kernwin.execute_sync.side_effect = None
+
+  def test_native_ida_cancel_headless_before_ida_94(self):
+    """Before IDA 9.4, a headless interrupt leaves IDA's cancel flag alone.
+
+    There ida_kernwin.set_cancelled() never returns when a thread other than
+    IDA's main thread calls it, so the interrupt must not call it.
+    """
+    kernwin = sys.modules["ida_kernwin"]
+    kernwin.set_cancelled.reset_mock()
+    kernwin.clr_cancelled.reset_mock()
+    token = CancellationToken()
+    started = threading.Event()
+
+    def spin():
+      while True:
+        pass
+
+    def worker():
+      try:
+        with cancellation_profile(token, native_ida_cancel=True):
+          started.set()
+          spin()
+      except asyncio.CancelledError:
+        pass
+
+    with (
+        mock.patch.object(sys.modules["idaapi"], "is_headless", True),
+        mock.patch.object(sys.modules["idaapi"], "IDA_SDK_VERSION", 930),
+    ):
+      t = threading.Thread(target=worker, daemon=True)
+      t.start()
+      self.assertTrue(started.wait(timeout=2.0))
+      token.cancel()
+      t.join(timeout=2.0)
+
+    self.assertFalse(t.is_alive(), "The loop was not interrupted")
+    kernwin.set_cancelled.assert_not_called()
+    kernwin.clr_cancelled.assert_called_once()
+
+  def test_python_interrupt_does_not_wait_for_native_cancel(self):
+    """The loop is interrupted while set_cancelled() hasn't returned yet."""
+    kernwin = sys.modules["ida_kernwin"]
+    token = CancellationToken()
+    started = threading.Event()
+    interrupted = threading.Event()
+    release = threading.Event()
+
+    def spin():
+      while True:
+        pass
+
+    def worker():
+      try:
+        with cancellation_profile(token, native_ida_cancel=True):
+          started.set()
+          try:
+            spin()
+          finally:
+            interrupted.set()
+      except asyncio.CancelledError:
+        pass
+
+    kernwin.set_cancelled.side_effect = lambda: release.wait(timeout=5.0)
+    try:
+      with (
+          mock.patch.object(sys.modules["idaapi"], "is_headless", True),
+          mock.patch.object(sys.modules["idaapi"], "IDA_SDK_VERSION", 940),
+      ):
+        t = threading.Thread(target=worker, daemon=True)
+        t.start()
+        self.assertTrue(started.wait(timeout=2.0))
+        # cancel() doesn't return until set_cancelled() does.
+        canceller = threading.Thread(target=token.cancel, daemon=True)
+        canceller.start()
+        self.assertTrue(
+            interrupted.wait(timeout=2.0),
+            "The loop wasn't interrupted while set_cancelled() was blocked",
+        )
+        release.set()
+        canceller.join(timeout=2.0)
+        t.join(timeout=2.0)
+      self.assertFalse(t.is_alive())
+    finally:
+      release.set()
+      kernwin.set_cancelled.side_effect = None
 
   def test_deadline_timeout_interrupts_tight_loop(self):
     """Verifies cancellation_profile(timeout=...) interrupts runaway loops with TimeoutError."""

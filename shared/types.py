@@ -90,9 +90,16 @@ class Argument(TypedDict):
 
 class StackFrameVariable(TypedDict):
   name: str
-  offset: str
+  offset: Annotated[str, "Offset from the start of the stack frame"]
   size: str
   type: str
+  fp_offset: NotRequired[
+      Annotated[
+          str,
+          "Offset relative to the frame pointer, as"
+          " create_stack_frame_variables takes it (e.g. '-0x68')",
+      ]
+  ]
 
 
 class ConvertedNumber(TypedDict):
@@ -323,44 +330,64 @@ class SetCommentResult(TypedDict):
 class RenameAddressRequest:
   address: Annotated[
       AddressValue,
-      "Linear address. do nothing if address is not valid. tail bytes can't"
-      " have names.",
+      Field(
+          description=(
+              "Linear address. do nothing if address is not valid. tail"
+              " bytes can't have names."
+          )
+      ),
   ]
-  new_name: Annotated[str, "New name for the address"]
+  new_name: Annotated[str, Field(description="New name for the address")]
 
 
 @dataclass
 class SetColorRequest:
-  address: Annotated[AddressValue, "The address of the item to color"]
+  address: Annotated[
+      AddressValue, Field(description="The address of the item to color")
+  ]
   color: Annotated[
       str | int,
-      "new color code in RGB (hex 0xBBGGRR) (hex string or integer)",
+      Field(
+          description=(
+              "new color code in RGB (hex 0xBBGGRR) (hex string or"
+              " integer)"
+          )
+      ),
   ]
   item_type: Annotated[
       str,
-      "type of the item, can only be CIC_ITEM, CIC_FUNC, or CIC_SEGM, default"
-      " is CIC_ITEM",
+      Field(
+          description=(
+              "type of the item, can only be CIC_ITEM, CIC_FUNC, or"
+              " CIC_SEGM, default is CIC_ITEM"
+          )
+      ),
   ] = "CIC_ITEM"
 
 
 @dataclass
 class PatchAssemblyRequest:
-  address: Annotated[AddressValue, "Starting Address to apply patch"]
-  instructions: Annotated[str, "Assembly instructions separated by ';'"]
+  address: Annotated[
+      AddressValue, Field(description="Starting Address to apply patch")
+  ]
+  instructions: Annotated[
+      str, Field(description="Assembly instructions separated by ';'")
+  ]
   syntax: Annotated[
       Literal["intel", "nasm", "att"] | None,
-      "Syntax (e.g. 'intel', 'nasm', 'att')",
+      Field(description="Syntax (e.g. 'intel', 'nasm', 'att')"),
   ] = None
 
 
 @dataclass
 class AssemblyContextRequest:
   address: Annotated[
-      AddressValue, "Address to check segment registers and validate"
+      AddressValue,
+      Field(description="Address to check segment registers and validate"),
   ]
-  symbols: Annotated[List[str], "List of symbol names to resolve"] = field(
-      default_factory=list
-  )
+  symbols: Annotated[
+      List[str], Field(description="List of symbol names to resolve")
+  ] = field(default_factory=list)
 
 
 class AssemblyContextItem(TypedDict):
@@ -375,102 +402,145 @@ class AssemblyContextItem(TypedDict):
 
 @dataclass
 class LocalVariableRename:
-  old_name: Annotated[str, "Current name of the variable"]
+  old_name: Annotated[str, Field(description="Current name of the variable")]
   new_name: Annotated[
-      str, "New name for the variable (empty for a default name)"
+      str,
+      Field(description="New name for the variable (empty for a default name)"),
   ]
 
 
 @dataclass
 class LocalVariableTypeChange:
-  variable_name: Annotated[str, "Name of the variable"]
-  new_type: Annotated[str, "New type for the variable"]
+  variable_name: Annotated[str, Field(description="Name of the variable")]
+  new_type: Annotated[str, Field(description="New type for the variable")]
 
 
 @dataclass
 class StackFrameVariableRename:
-  old_name: Annotated[str, "Current name of the variable"]
+  old_name: Annotated[str, Field(description="Current name of the variable")]
   new_name: Annotated[
-      str, "New name for the variable (empty for a default name)"
+      str,
+      Field(description="New name for the variable (empty for a default name)"),
   ]
 
 
 @dataclass
 class StackFrameVariableCreate:
-  offset: Annotated[str, "Offset of the stack frame variable"]
-  variable_name: Annotated[str, "Name of the stack variable"]
-  type_name: Annotated[str, "Type of the stack variable"]
+  offset: Annotated[
+      str,
+      Field(
+          description=(
+              "Offset of the stack frame variable relative to the frame"
+              " pointer (e.g. '-0x68'): the fp_offset that"
+              " get_stack_frame_variables reports, not its offset"
+          )
+      ),
+  ]
+  variable_name: Annotated[str, Field(description="Name of the stack variable")]
+  type_name: Annotated[str, Field(description="Type of the stack variable")]
 
 
 @dataclass
 class StackFrameVariableTypeChange:
-  variable_name: Annotated[str, "Name of the stack variable"]
-  type_name: Annotated[str, "Type of the stack variable"]
+  variable_name: Annotated[str, Field(description="Name of the stack variable")]
+  type_name: Annotated[str, Field(description="Type of the stack variable")]
 
 
 @dataclass
 class SetTypeRequest:
-  address: Annotated[AddressValue, "Address or name of object to set type"]
+  address: Annotated[
+      AddressValue, Field(description="Address or name of object to set type")
+  ]
   new_type: Annotated[
       str,
-      (
-          "The type string in C declaration form (e.g. 'int x;', 'char *'). "
-          "If empty, the type is removed."
+      Field(
+          description=(
+              "The type string in C declaration form (e.g. 'int x;', 'char"
+              " *'). If empty, the type is removed."
+          )
       ),
   ]
 
 
 @dataclass
 class AddEntryPointRequest:
-  address: Annotated[AddressValue, "Linear address of the entry point"]
+  address: Annotated[
+      AddressValue, Field(description="Linear address of the entry point")
+  ]
   name: Annotated[
       str,
-      "name of entry point. If the specified location already has a name, the"
-      " old name will be appended to the regular comment.",
+      Field(
+          description=(
+              "name of entry point. If the specified location already has a"
+              " name, the old name will be appended to the regular comment."
+          )
+      ),
   ]
   ordinal: Annotated[
-      int,
-      "ordinal number if ordinal number is equal to 'address' then ordinal is"
-      " not used",
-  ] = 0
+      int | None,
+      Field(
+          description=(
+              "Ordinal number of the entry point. Defaults to the entry"
+              " point's address, which is what IDA uses when the file"
+              " format has no export ordinals. An ordinal that another"
+              " entry point already has is rejected."
+          )
+      ),
+  ] = None
   makecode: Annotated[
-      bool, "Should the kernel convert bytes to instructions"
+      bool, Field(description="Should the kernel convert bytes to instructions")
   ] = True
 
 
 @dataclass
 class PatchBytesRequest:
-  address: Annotated[AddressValue, "Address to patch bytes at"]
+  address: Annotated[
+      AddressValue, Field(description="Address to patch bytes at")
+  ]
   hex_string: Annotated[
       str,
-      "Hex string of bytes to patch (e.g. '90 90' or '9090'), max 0x1000"
-      " bytes per call",
+      Field(
+          description=(
+              "Hex string of bytes to patch (e.g. '90 90' or '9090'), max"
+              " 0x1000 bytes per call"
+          )
+      ),
   ]
 
 
 @dataclass
 class ConvertToOffsetRequest:
   address: Annotated[
-      AddressValue, "Address of the instruction or global variable"
+      AddressValue,
+      Field(description="Address of the instruction or global variable"),
   ]
   op_index: Annotated[
       int,
-      "Operand index (0-based). Use 0 (default) for data items/global"
-      " variables.",
+      Field(
+          description=(
+              "Operand index (0-based). Use 0 (default) for data"
+              " items/global variables."
+          )
+      ),
   ] = 0
   base: Annotated[
-      AddressValue, "Base address for the offset (default '0')"
+      AddressValue,
+      Field(description="Base address for the offset (default '0')"),
   ] = "0"
 
 
 @dataclass
 class MakeDataRequest:
-  address: Annotated[AddressValue, "Address to create data at"]
+  address: Annotated[
+      AddressValue, Field(description="Address to create data at")
+  ]
   data_type: Annotated[
       str,
-      (
-          "Type of data to create ('byte', 'word', 'dword', 'qword', 'oword',"
-          " 'yword', 'float', 'double', 'tbyte', 'pack_real')"
+      Field(
+          description=(
+              "Type of data to create ('byte', 'word', 'dword', 'qword',"
+              " 'oword', 'yword', 'float', 'double', 'tbyte', 'pack_real')"
+          )
       ),
   ]
 
@@ -478,15 +548,25 @@ class MakeDataRequest:
 @dataclass
 class ReadDataRequest:
   address: Annotated[
-      AddressValue, "Address (hex string) of the memory value to be read"
+      AddressValue,
+      Field(description="Address (hex string) of the memory value to be read"),
   ]
   data_type: Annotated[
       Literal["byte", "word", "dword", "qword", "string", "bytes"],
-      "The type of data to read ('byte', 'word', 'dword', 'qword', 'string',"
-      " 'bytes')",
+      Field(
+          description=(
+              "The type of data to read ('byte', 'word', 'dword', 'qword',"
+              " 'string', 'bytes')"
+          )
+      ),
   ]
   size: Annotated[
-      int, "Number of bytes to read (only used when data_type is 'bytes')"
+      int,
+      Field(
+          description=(
+              "Number of bytes to read (only used when data_type is" " 'bytes')"
+          )
+      ),
   ] = 1
 
 

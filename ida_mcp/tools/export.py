@@ -21,6 +21,7 @@
 
 """Module for exporting IDA Pro data to files."""
 
+import contextlib
 import os
 from typing import Annotated, Literal
 
@@ -75,7 +76,20 @@ def export_file(
       raise ToolError("Could not determine IDB path")
     output_path = f"{idb_path}.{file_type}"
 
-  if not always_regenerate and os.path.exists(output_path):
+  # A path in a directory that doesn't exist can't be written.
+  output_dir = os.path.dirname(os.path.abspath(output_path))
+  if not os.path.isdir(output_dir):
+    raise ToolError(
+        f"Failed to generate {file_type} file at {output_path}: the directory"
+        f" {output_dir} doesn't exist"
+    )
+
+  # An empty file is what a failed run leaves behind, so it isn't reused.
+  if (
+      not always_regenerate
+      and os.path.exists(output_path)
+      and os.path.getsize(output_path) > 0
+  ):
     return output_path
 
   if file_type == "c":
@@ -103,14 +117,28 @@ def export_file(
         )
       case _:
         flags = 0
-    # idc.gen_file returns 1 on success, 0 on failure
-    if not idc.gen_file(
+    # idc.gen_file returns the number of lines it wrote, 0 if IDA can't
+    # produce this kind of file for the database, and -1 if the file can't be
+    # created.
+    ret = idc.gen_file(
         type_map[file_type],
         output_path,
         idaapi.inf_get_min_ea(),
         idaapi.inf_get_max_ea(),
         flags,
-    ):
-      raise ToolError(f"Failed to generate {file_type} file at {output_path}")
+    )
+    if ret <= 0:
+      # IDA creates the file before it finds out that it has nothing to write.
+      with contextlib.suppress(OSError):
+        if os.path.getsize(output_path) == 0:
+          os.remove(output_path)
+      reason = (
+          "the file can't be created"
+          if ret < 0
+          else f"IDA can't produce a {file_type} file for this database"
+      )
+      raise ToolError(
+          f"Failed to generate {file_type} file at {output_path}: {reason}"
+      )
 
   return output_path

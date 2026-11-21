@@ -22,7 +22,6 @@
 
 import logging
 import re
-import traceback
 from typing import Annotated, Any, List, Union
 
 from gateway.forward import DatabaseId
@@ -36,6 +35,10 @@ from sqlglot import exp
 from sqlglot.optimizer.simplify import simplify
 
 logging.getLogger("sqlglot").setLevel(logging.ERROR)
+
+# sqlglot underlines the offending token of a parse error with terminal
+# escape sequences, whatever the output is.
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 
 def _to_signed_64(val: int) -> int:
@@ -464,11 +467,10 @@ async def sql_query(
         if item is not None:
           results.append(item)
     except Exception as e:
-      results.append(
-          QueryResult(
-              error=f"Error executing SQL: {str(e)}\n{traceback.format_exc()}"
-          )
-      )
+      # Only the message goes to the client; the traceback goes to the log.
+      logging.debug("sql_query failed: %s", q, exc_info=True)
+      message = _ANSI_ESCAPE_RE.sub("", str(e))
+      results.append(QueryResult(error=f"Error executing SQL: {message}"))
 
   return (
       results[0] if len(results) == 1 and not isinstance(sql, list) else results

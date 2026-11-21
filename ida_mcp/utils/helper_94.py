@@ -41,7 +41,7 @@ def get_callees(func_start: int) -> list[Function]:
     raise ToolError("Hex-Rays decompiler is not available/loaded.")
 
   if not get_func_bounds(func_start):
-    raise ToolError(f"No function found containing address {func_start}")
+    raise ToolError(f"No function found containing address {func_start:#x}")
 
   hf = ida_hexrays.hexrays_failure_t()
   dcr = ida_hexrays.decomp_ranges_t(func_start)

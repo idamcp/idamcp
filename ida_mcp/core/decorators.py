@@ -273,6 +273,19 @@ def _inject_async_exc(tid: int, exc_type: type[BaseException]) -> int:
   return _set_async_exc(tid, ctypes.py_object(exc_type))
 
 
+def _can_set_cancelled_off_main_thread() -> bool:
+  """Whether another thread may call ida_kernwin.set_cancelled() in idalib.
+
+  In IDA 9.3's idalib the call never returns when a thread other than IDA's
+  main thread makes it; ida_kernwin.clr_cancelled() and user_cancelled()
+  behave the same. In IDA 9.4's they return at once. Versions before 9.3
+  weren't tried and are treated like 9.3: a native cancel that is left out
+  costs less than a thread that never comes back.
+  """
+  version = getattr(idaapi, "IDA_SDK_VERSION", 0)
+  return isinstance(version, int) and version >= 940
+
+
 # Waits between the re-interrupts of a cancelled or timed-out operation while it
 # keeps running: pulse()s after a cancel, repeated deadlines after a timeout. A
 # re-interrupt is needed when the first interrupt was swallowed, e.g., raised
@@ -322,7 +335,10 @@ def cancellation_profile(
   Args:
     token: Token whose cancellation interrupts the scope, or None.
     native_ida_cancel: Whether an interrupt also sets IDA's cancel flag, which
-      long-running IDA functions poll.
+      long-running IDA functions poll. In headless mode before IDA 9.4 the
+      flag can't be set from another thread (see
+      _can_set_cancelled_off_main_thread), so there an interrupt only stops
+      Python code.
     timeout: Seconds the scope may run before it is interrupted, or None for no
       limit.
 
@@ -359,9 +375,15 @@ def cancellation_profile(
         return
       if is_timeout:
         timed_out = True
-      if native_ida_cancel and getattr(idaapi, "is_headless", False):
-        ida_kernwin.set_cancelled()
+      # The Python interrupt comes first, so that nothing that happens while
+      # cancelling IDA's own operation can keep it from being delivered.
       _inject_async_exc(tid, _OperationInterrupt)
+      if (
+          native_ida_cancel
+          and getattr(idaapi, "is_headless", False)
+          and _can_set_cancelled_off_main_thread()
+      ):
+        ida_kernwin.set_cancelled()
 
     if native_ida_cancel and not getattr(idaapi, "is_headless", False):
       # In GUI mode, set_cancelled() marshals to the main thread.

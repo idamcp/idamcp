@@ -23,7 +23,7 @@
 """This module provides tools for working with types in IDA Pro."""
 
 import re
-from typing import Annotated, Any, List, Tuple
+from typing import Annotated, Any
 
 import ida_ida
 from ida_mcp.core.decorators import jsonrpc
@@ -103,30 +103,6 @@ def list_enums(
   return results
 
 
-def parse_decls_safe(decls: str, hti_flags: int) -> Tuple[int, List[str]]:
-  """Parses C declarations safely using official IDAPython bindings."""
-  messages: list[str] = []
-
-  # Define a callback to capture compiler error strings if supported by SWIG
-  # wrapper
-  def error_printer(msg: str) -> None:
-    messages.append(msg)
-
-  try:
-    # In standard IDAPython, parse_decls takes a callable to print errors
-    errno = ida_typeinf.parse_decls(None, decls, error_printer, hti_flags)  # type: ignore
-  except Exception:  # pylint: disable=broad-exception-caught
-    # Fallback to passing None for printer_t* if callable callback is not
-    # supported
-    try:
-      errno = ida_typeinf.parse_decls(None, decls, None, hti_flags)  # type: ignore
-    except Exception:  # pylint: disable=broad-exception-caught
-      errno = -1
-    messages = ["Parser error (detailed warnings suppressed)"]
-
-  return errno, messages
-
-
 @jsonrpc
 @idawrite
 def declare_type(
@@ -143,30 +119,17 @@ def declare_type(
   if not c_decl:
     return "C declaration can't be an empty string"
 
-  # PT_SIL: Suppress warning dialogs
-  # PT_EMPTY: Allow empty types (maybe unnecessary?)
-  # PT_TYP: Print back status messages with struct tags
-  flags = (
-      ida_typeinf.PT_SIL
-      | getattr(ida_typeinf, "PT_EMPTY", 0)
-      | ida_typeinf.PT_TYP
+  # parse_decls() takes HTI_* flags, and always uses HTI_DCL. The PT_* flags
+  # are for other functions and have other values: PT_EMPTY, for one, is
+  # HTI_PAK2, which packs every struct to 2 bytes.
+  # IDAPython can't pass a printer for the parser's messages, so the number of
+  # errors is all that is known.
+  errno = ida_typeinf.parse_decls(  # type: ignore
+      None, c_decl, None, ida_typeinf.HTI_DCL
   )
-  errno, messages = parse_decls_safe(c_decl, flags)
-
-  if messages:
-    pretty_messages = "\n".join(messages)
-  else:
-    pretty_messages = ""
   if errno > 0:
-    if pretty_messages:
-      pretty_messages = f"\n\nErrors:\n{pretty_messages}"
-    return (
-        f"Failed to parse type:\n{c_decl}\nError Number:"
-        f" {errno}{pretty_messages}"
-    )
-  elif pretty_messages:
-    pretty_messages = f"\n\nInfo:\n{pretty_messages}"
-  return f"success{pretty_messages}"
+    return f"Failed to parse type:\n{c_decl}\nError Number: {errno}"
+  return "success"
 
 
 @jsonrpc
@@ -265,9 +228,27 @@ def get_struct_at_address(
     member_name = member.name
     member_size = member.type.get_size()
 
+    # The get_*() calls below report 0xff for a byte that has no value (.bss,
+    # or past the end of a segment), so check the bytes they are going to
+    # read first.
+    if member.type.is_ptr():
+      read_size = 8 if ida_ida.inf_is_64bit() else 4
+    elif member_size in (1, 2, 4, 8):
+      read_size = member_size
+    else:
+      read_size = min(member_size, 16)
+    has_value = True
+    if read_size > 0:
+      try:
+        helper.read_defined_bytes(member_addr, read_size)
+      except ToolError:
+        has_value = False
+
     # Try to get value based on size
     try:
-      if member.type.is_ptr():
+      if not has_value:
+        value_str = "<uninitialized>"
+      elif member.type.is_ptr():
         # Pointer
         is_64bit = ida_ida.inf_is_64bit()
         if is_64bit:
@@ -328,7 +309,7 @@ def get_stack_frame_variables_internal(
 
   if not helper.get_func_bounds(address):
     if raise_error:
-      raise ToolError(f"No function found at address {address}")
+      raise ToolError(f"No function found at address {address:#x}")
     return []
 
   tif = ida_typeinf.tinfo_t()
@@ -346,7 +327,11 @@ def get_stack_frame_variables_internal(
       var_type = str(udm.type)
       members.append(
           StackFrameVariable(
-              name=name, offset=hex(offset), size=hex(size), type=var_type
+              name=name,
+              offset=hex(offset),
+              size=hex(size),
+              type=var_type,
+              fp_offset=hex(helper.soff_to_fpoff(address, offset)),
           )
       )
   return members

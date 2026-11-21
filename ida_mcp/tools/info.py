@@ -187,13 +187,20 @@ def get_function_by_address(
   return helper.get_function(helper.parse_and_check_ea(address))
 
 
+def _no_screen_ea_message() -> str:
+  message = "Current screen EA doesn't exist"
+  if getattr(idaapi, "is_headless", False):
+    message += ": not available in headless mode"
+  return message
+
+
 @jsonrpc
 @idaread
 def get_current_address() -> str:
   """Get the address currently selected by the user."""
   screen_ea = idaapi.get_screen_ea()
   if not helper.is_address_valid(screen_ea):
-    return "Current screen EA doesn't exist"
+    return _no_screen_ea_message()
   return hex(screen_ea)
 
 
@@ -203,7 +210,7 @@ def get_current_function() -> Function | str:
   """Get the function currently selected by the user."""
   screen_ea = idaapi.get_screen_ea()
   if not helper.is_address_valid(screen_ea):
-    return "Current screen EA doesn't exist"
+    return _no_screen_ea_message()
   return helper.get_function(screen_ea)
 
 
@@ -789,14 +796,21 @@ def list_local_types(
         if c_decl_output:
           out += f"a declaration:\n{c_decl_output}\n"
       else:
-        simple_decl = tif._print(  # pylint: disable=protected-access
+        # A typedef, an enum, or a forward declaration. PRTYPE_DEF prints
+        # what the type is defined as; without it, only its name is printed.
+        decl = tif._print(  # pylint: disable=protected-access
             type_name,  # type: ignore
-            ida_typeinf.PRTYPE_1LINE
+            ida_typeinf.PRTYPE_MULTI
             | ida_typeinf.PRTYPE_TYPE
-            | ida_typeinf.PRTYPE_SEMI,
+            | ida_typeinf.PRTYPE_SEMI
+            | ida_typeinf.PRTYPE_DEF,
         )
-        if simple_decl:
-          out += f"an incomplete(forward) declaration:\n{simple_decl}\n\n"
+        if decl:
+          if tif.is_forward_decl():
+            out += "an incomplete(forward) declaration:\n"
+          else:
+            out += "a declaration:\n"
+          out += f"{decl.rstrip()}\n\n"
     except Exception:  # pylint: disable=broad-except
       continue
   return out.strip()
@@ -886,6 +900,11 @@ def get_operand(
 ) -> Operand:
   """Get the operand of an instruction."""
   ea = helper.parse_and_check_ea(address)
+
+  # decode_insn() also decodes the bytes of a data item, and the result would
+  # describe an instruction that isn't there.
+  if not idaapi.is_code(idaapi.get_flags(ea)):
+    raise ToolError(f"Address {ea:#x} is not an instruction")
 
   insn = idaapi.insn_t()
   if not idaapi.decode_insn(insn, ea):

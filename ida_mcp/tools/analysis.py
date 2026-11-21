@@ -23,6 +23,7 @@
 
 import collections
 import contextlib
+import dataclasses
 import json
 import logging
 from typing import Annotated, Literal
@@ -39,6 +40,7 @@ from ida_mcp.core.synchronization import idaread
 from ida_mcp.core.synchronization import idawrite
 from ida_mcp.utils import helper
 from ida_mcp.utils.address_range import AddressRangeManager
+import ida_nalt
 import ida_typeinf
 import ida_xref
 import idaapi
@@ -417,7 +419,7 @@ def _get_func_block_ranges(
   """Get the basic block containing the specified address."""
   bounds = helper.get_func_bounds(address)
   if not bounds:
-    raise ToolError(f"{address} isn't in a function")
+    raise ToolError(f"{address:#x} isn't in a function")
   addr_range = AddressRangeManager()
   fc = ida_gdl.FlowChart(bounds=(bounds.start_ea, bounds.end_ea))
   for block in fc:
@@ -585,6 +587,9 @@ def get_entry_points() -> list[Function]:
     address = ida_entry.get_entry(ordinal)
     func = helper.get_function(address, raise_error=False)
     if func is not None:
+      # An entry point isn't always the start of its function; report where
+      # the entry is.
+      func["address"] = hex(address)
       result.append(func)
   return result
 
@@ -1122,17 +1127,121 @@ def undefine(
   """Clear code/data definitions in a range (GUI: 'U')."""
 
   ea = helper.parse_and_check_ea(address)
+  if size < 1:
+    return f"Failed to undefine at {address}: size must be at least 1"
   size = min(size, idaapi.inf_get_max_ea() - ea)
   if ida_bytes.del_items(ea, ida_bytes.DELIT_SIMPLE, size):
     return f"Successfully undefined range [{address}, {ea + size:#x})"
   return f"Failed to undefine range [{address}, {ea + size:#x})"
 
 
-def _make_code(ea: int) -> bool:
+@dataclasses.dataclass
+class _SavedItem:
+  """What is needed to define an instruction or data item again."""
+
+  ea: int
+  size: int
+  flags: int
+  tif: ida_typeinf.tinfo_t | None
+  opinfo: ida_nalt.opinfo_t | None
+  strtype: int | None
+
+
+def _snapshot_items(ea: int, size: int) -> list[_SavedItem]:
+  """Describes every defined item that overlaps [ea, ea + size)."""
+  items = []
+  cur = ida_bytes.get_item_head(ea)
+  end = ea + size
+  while cur < end:
+    flags = ida_bytes.get_full_flags(cur)
+    item_size = max(ida_bytes.get_item_size(cur), 1)
+    if not ida_bytes.is_unknown(flags):
+      tif = ida_typeinf.tinfo_t()
+      has_tif = ida_nalt.get_tinfo(tif, cur)
+      opinfo = ida_nalt.opinfo_t()
+      has_opinfo = ida_bytes.get_opinfo(opinfo, cur, 0, flags) is not None
+      items.append(
+          _SavedItem(
+              ea=cur,
+              size=item_size,
+              flags=flags,
+              tif=tif if has_tif else None,
+              opinfo=opinfo if has_opinfo else None,
+              strtype=(
+                  ida_nalt.get_str_type(cur)
+                  if ida_bytes.is_strlit(flags)
+                  else None
+              ),
+          )
+      )
+    cur += item_size
+  return items
+
+
+def _restore_items(items: list[_SavedItem]) -> None:
+  """Defines the items recorded by _snapshot_items() again."""
+  for item in items:
+    ea, size, flags = item.ea, item.size, item.flags
+    ida_bytes.del_items(ea, ida_bytes.DELIT_SIMPLE, size)
+    if ida_bytes.is_code(flags):
+      idc.create_insn(ea)
+      continue
+    if ida_bytes.is_strlit(flags):
+      ida_bytes.create_strlit(ea, size, item.strtype)
+    elif ida_bytes.is_struct(flags) and item.opinfo is not None:
+      ida_bytes.create_struct(ea, size, item.opinfo.tid)
+    else:
+      ida_bytes.create_data(
+          ea, flags & ida_bytes.DT_TYPE, size, idaapi.BADADDR
+      )
+    if ida_bytes.is_off0(flags) and item.opinfo is not None:
+      idaapi.op_offset_ex(ea, 0, item.opinfo.ri)
+    elif flags & ida_bytes.MS_0TYPE and hasattr(ida_bytes, "set_op_type"):
+      ida_bytes.set_op_type(ea, flags & ida_bytes.MS_0TYPE, 0)
+    if item.tif is not None and not ida_nalt.get_tinfo(
+        ida_typeinf.tinfo_t(), ea
+    ):
+      ida_nalt.set_tinfo(ea, item.tif)
+    # The cross-references of an offset (a pointer, or a pointer member of a
+    # struct) come back when the item is analysed again.
+    helper.reanalyze_range(ea, ea + size)
+
+
+def _is_code_head(ea: int) -> bool:
+  flags = ida_bytes.get_flags(ea)
+  return ida_bytes.is_code(flags) and ida_bytes.is_head(flags)
+
+
+def _recreate_insn(ea: int) -> bool:
   # We don't check the result of del_items, because if the item has been
   # undefined, del_items returns failure.
   ida_bytes.del_items(ea, ida_bytes.DELIT_SIMPLE, 1)
   return idc.create_insn(ea) != 0
+
+
+def _convert_to_code(ea: int) -> tuple[bool, list[_SavedItem]]:
+  """Turns the bytes at ea, which aren't an instruction yet, into one.
+
+  The item that contains ea is undefined first. If no instruction can be
+  created, that item is defined again, so that a failed call changes nothing.
+
+  Args:
+    ea: the address of the instruction to create.
+
+  Returns:
+    Whether the instruction was created, and what was undefined to make room
+    for it (for a caller that has to take the conversion back).
+  """
+  insn = idaapi.insn_t()
+  if idaapi.decode_insn(insn, ea) <= 0:
+    # The bytes aren't an instruction (or have no value, as in .bss): leave
+    # the existing item alone.
+    return False, []
+  saved = _snapshot_items(ea, 1)
+  if _recreate_insn(ea):
+    return True, saved
+  _restore_items(saved)
+  return False, []
 
 
 @jsonrpc
@@ -1145,11 +1254,16 @@ def make_code(
   """Convert raw bytes to instructions at an address (GUI: 'C').
 
   This operation automatically undefines (GUI: 'U') any existing item at the
-  specified address to allow for the creation of a new instruction.
+  specified address to allow for the creation of a new instruction. If no
+  instruction can be created there, the existing item is kept.
   """
   ea = helper.parse_and_check_ea(address)
 
-  if _make_code(ea):
+  if _is_code_head(ea):
+    created = _recreate_insn(ea)
+  else:
+    created, _ = _convert_to_code(ea)
+  if created:
     return f"Successfully created code at {address}"
   return f"Failed to make code at {address}"
 
@@ -1165,10 +1279,23 @@ def make_function(
 
   To ensure success, this operation first undefines (GUI: 'U') any existing
   item at the address and converts it to code before establishing the function
-  definition.
+  definition. If no function can be created there, the existing item is kept.
   """
   ea = helper.parse_and_check_ea(address)
-  if _make_code(ea) and ida_funcs.add_func(ea):
+  if _is_code_head(ea):
+    created = _recreate_insn(ea) and ida_funcs.add_func(ea)
+  else:
+    created, saved = _convert_to_code(ea)
+    if created and not ida_funcs.add_func(ea):
+      # Take the conversion back: undefine the new code, then define what was
+      # there before.
+      end = max(
+          [ida_bytes.get_item_end(ea)] + [item.ea + item.size for item in saved]
+      )
+      ida_bytes.del_items(ea, ida_bytes.DELIT_SIMPLE, end - ea)
+      _restore_items(saved)
+      created = False
+  if created:
     return f"Successfully created function at {ea:#x}"
   return f"Failed to create function at {ea:#x}"
 

@@ -1179,9 +1179,94 @@ _SEARCH_RESULTS_NOTE = (
 )
 
 
+def _schema_label(schema: Any) -> str:
+  """Returns a short label for the type that a JSON schema describes."""
+  if not isinstance(schema, dict):
+    return "any"
+  if "enum" in schema:
+    return " | ".join(json.dumps(value) for value in schema["enum"])
+  if "$ref" in schema:
+    return schema["$ref"].rsplit("/", 1)[-1]
+  for key in ("anyOf", "oneOf"):
+    if key in schema:
+      return " | ".join(_schema_label(branch) for branch in schema[key])
+  if schema.get("type") == "array":
+    return f"{_schema_label(schema.get('items'))}[]"
+  return schema.get("type") or "any"
+
+
+def _referenced_definition(schema: Any) -> tuple[str, bool] | None:
+  """Finds the `$defs` entry that a parameter's schema refers to.
+
+  Args:
+    schema: the JSON schema of one parameter.
+
+  Returns:
+    The name of the entry and whether the parameter is a list of such
+    objects, or None if the schema refers to no entry.
+  """
+  if not isinstance(schema, dict):
+    return None
+  if "$ref" in schema:
+    return schema["$ref"].rsplit("/", 1)[-1], False
+  if schema.get("type") == "array":
+    found = _referenced_definition(schema.get("items"))
+    return (found[0], True) if found else None
+  for key in ("anyOf", "oneOf"):
+    for branch in schema.get(key, ()):
+      if found := _referenced_definition(branch):
+        return found
+  return None
+
+
+def _object_fields_sections(tool: Tool) -> list[str]:
+  """Lists the fields of the objects that the tool's parameters take.
+
+  fastmcp's Markdown shows such a parameter as `object` or `object[]`, which
+  doesn't tell the caller what to put into the object.
+  """
+  parameters = tool.parameters
+  if not isinstance(parameters, dict):
+    return []
+  definitions = parameters.get("$defs") or {}
+  lines = []
+  for name, schema in (parameters.get("properties") or {}).items():
+    found = _referenced_definition(schema)
+    if found is None or found[0] not in definitions:
+      continue
+    definition = definitions[found[0]]
+    required = set(definition.get("required") or ())
+    if lines:
+      lines.append("")
+    if found[1]:
+      lines.append(f"**Fields of each `{name}` item**")
+    else:
+      lines.append(f"**Fields of `{name}`**")
+    for field, field_schema in (definition.get("properties") or {}).items():
+      label = _schema_label(field_schema)
+      if field in required:
+        label += ", required"
+      elif isinstance(field_schema, dict) and "default" in field_schema:
+        label += f", default {json.dumps(field_schema['default'])}"
+      line = f"- `{field}` ({label})"
+      if isinstance(field_schema, dict) and field_schema.get("description"):
+        line += f": {field_schema['description']}"
+      lines.append(line)
+  return lines
+
+
 def _serialize_search_results(tools: Sequence[Tool]) -> str:
   """Serializes search_tools results to Markdown and appends the note."""
-  markdown = serialize_tools_for_output_markdown(tools)
+  if tools:
+    blocks = []
+    for tool in tools:
+      block = serialize_tools_for_output_markdown([tool])
+      if fields := _object_fields_sections(tool):
+        block = "\n".join([block, "", *fields])
+      blocks.append(block)
+    markdown = "\n\n".join(blocks)
+  else:
+    markdown = serialize_tools_for_output_markdown(tools)
   return f"{markdown}\n\n{_SEARCH_RESULTS_NOTE}"
 
 

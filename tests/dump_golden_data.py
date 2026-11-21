@@ -533,7 +533,7 @@ def dump_xrefs_from() -> dict:
       if bounds:
         func_name = idaapi.get_func_name(bounds.start_ea)
         func_dict = {
-            "address": hex(xref.to),
+            "address": hex(bounds.start_ea),
             "name": func_name,
             "size": hex(bounds.end_ea - bounds.start_ea),
         }
@@ -558,7 +558,7 @@ def dump_xrefs_to() -> dict:
       if bounds:
         func_name = idaapi.get_func_name(bounds.start_ea)
         func_dict = {
-            "address": hex(xref.frm),
+            "address": hex(bounds.start_ea),
             "name": func_name,
             "size": hex(bounds.end_ea - bounds.start_ea),
         }
@@ -600,7 +600,7 @@ def dump_xrefs_to_field() -> dict:
         if bounds:
           func_name = idaapi.get_func_name(bounds.start_ea)
           func_dict = {
-              "address": hex(xref.frm),
+              "address": hex(bounds.start_ea),
               "name": func_name,
               "size": hex(bounds.end_ea - bounds.start_ea),
           }

@@ -134,6 +134,10 @@ Most tools in this project have been thoroughly tested and verified across:
 *   **IDA Pro 9.3 + Python 3.13**
 *   **IDA Pro 9.4 + Python 3.13**
 
+In headless mode on IDA 9.3 and earlier, a tool timeout or cancellation
+interrupts Python code (e.g., in `idapython_eval`) but can't set IDA's cancel
+flag, so an IDA operation that is already running isn't stopped early.
+
 ### Prerequisites
 
 *   **OS**: Linux, macOS, or Windows.
@@ -308,7 +312,8 @@ example of all available settings (showing defaults):
     repopulating it if changes are detected. Because entry points represent
     static binary exports (functions and global data symbols) and are not
     expected to change after initial auto-analysis completes, this option
-    defaults to `False`.
+    defaults to `False`. Entry points added with the `add_entry_points` tool
+    are picked up without it.
 *   **rebuild_strings_on_data_patch**: If `True`, patching non-function bytes
     that do not belong to any existing string marks the `strings` table dirty so
     the next `strings` query rebuilds it (for example, after decrypting strings

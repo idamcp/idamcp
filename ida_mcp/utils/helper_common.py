@@ -24,14 +24,18 @@ import contextlib
 import dataclasses
 import functools
 import re
+import string
 import struct
 from typing import Any, NamedTuple
 
+import ida_auto
+import ida_bytes
 import ida_hexrays
 import ida_ida
 import ida_idp
 import ida_kernwin
 from ida_mcp.core.synchronization import idaread
+from ida_mcp.utils.hexdump import is_defined
 import ida_nalt
 import ida_segment
 import ida_typeinf
@@ -155,12 +159,92 @@ def refresh_decompiler_widget():
     vu.refresh_ctext()
 
 
+def _refresh_pseudocode_views(func_ea: int) -> None:
+  """Redoes the open Pseudocode views that show the function at func_ea."""
+  if not idaapi.is_idaq():
+    return
+
+  for letter in string.ascii_uppercase:
+    widget = ida_kernwin.find_widget(f"Pseudocode-{letter}")
+    if widget is None:
+      continue
+    vu = ida_hexrays.get_widget_vdui(widget)
+    if vu is not None and vu.cfunc and vu.cfunc.entry_ea == func_ea:
+      vu.refresh_view(True)
+
+
 def refresh_decompiler_ctext(address: int):
-  with contextlib.suppress(ToolError):
-    error = ida_hexrays.hexrays_failure_t()
-    cfunc = decompile_func(address, error)
-    if cfunc is not None:
-      cfunc.refresh_func_ctext()
+  """Makes the decompiler forget its result for the function at address.
+
+  The decompiler keeps the last result of each function and doesn't notice
+  every database change: stack frame edits and operand conversions leave the
+  cached result as it was. After this call the next decompilation is done
+  again, and so are the open Pseudocode views of the function.
+
+  Args:
+    address: an address belonging to the function. Does nothing if it belongs
+      to no function or the decompiler isn't available.
+  """
+  if not ida_hexrays.init_hexrays_plugin():
+    return
+  start_ea = idc.get_func_attr(address, idc.FUNCATTR_START)
+  if start_ea == idc.BADADDR:
+    return
+  # mark_cfunc_dirty() needs the entry address: given another address of the
+  # function, it returns True and leaves the cached result in place.
+  ida_hexrays.mark_cfunc_dirty(start_ea)
+  _refresh_pseudocode_views(start_ea)
+
+
+def read_defined_bytes(address: int, size: int) -> bytes:
+  """Reads size bytes at address, all of which must have a value.
+
+  ida_bytes.get_bytes() and get_byte()/get_word()/... report 0xff for a byte
+  that has no value (.bss, or past the end of a segment), so they can't tell
+  such a byte from a real 0xff.
+
+  Args:
+    address: the address of the first byte.
+    size: the number of bytes to read.
+
+  Returns:
+    The bytes.
+
+  Raises:
+    ToolError if size isn't positive or a byte in the range has no value.
+  """
+  if size <= 0:
+    raise ToolError(f"size must be positive, got {size}")
+  result = ida_bytes.get_bytes_and_mask(address, size)
+  if result is None:
+    raise ToolError(f"Failed to read {size:#x} bytes at {address:#x}")
+  data, mask = result
+  for index in range(size):
+    if not is_defined(mask, index):
+      raise ToolError(f"The address {address + index:#x} is not initialized.")
+  return data
+
+
+def reanalyze_range(start_ea: int, end_ea: int) -> None:
+  """Re-analyses [start_ea, end_ea) and returns when that range is done.
+
+  Unlike ida_auto.auto_wait(), this only processes the given range, so it
+  doesn't wait for an auto-analysis that is still running elsewhere.
+  """
+  ida_auto.plan_range(start_ea, end_ea)
+  while ida_auto.auto_make_step(start_ea, end_ea):
+    pass
+
+
+def get_operand_count(address: int) -> int:
+  """Returns the number of operands of the instruction at address."""
+  insn = idaapi.insn_t()
+  if idaapi.decode_insn(insn, address) <= 0:
+    return 0
+  count = 0
+  while count < idaapi.UA_MAXOP and insn.ops[count].type != idaapi.o_void:
+    count += 1
+  return count
 
 
 def is_address_valid(address: int) -> bool:
@@ -362,8 +446,10 @@ def decompile_checked(address: int) -> ida_hexrays.cfunc_t:
     )
 
   message = f"Decompilation failed for function at {address:#x}"
-  if error.str:
-    message += f": {error.str}"
+  # desc() is the reason, e.g. "too big function"; str is empty for most
+  # failures.
+  if reason := error.desc():
+    message += f": {reason}"
   if error.errea != idaapi.BADADDR:
     message += f" (error address: {error.errea:#x})"
   raise ToolError(message)
@@ -454,6 +540,9 @@ __all__ = [
     "ida_segment_perm2str",
     "is_window_active",
     "parse_and_check_ea",
+    "read_defined_bytes",
+    "reanalyze_range",
+    "get_operand_count",
     "refresh_decompiler_ctext",
     "refresh_decompiler_widget",
     "is_address_valid",

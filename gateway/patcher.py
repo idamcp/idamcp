@@ -426,8 +426,10 @@ async def patch_assembly(
     res = await forward_to(
         database_id, "patch_bytes", {"reqs": patch_bytes_reqs}
     )
-    if "success" not in res.lower() and not errors:
-      return res
+    # The backend returns exactly "success" when every patch was applied. Any
+    # other text lists what failed and what was patched.
+    if res != "success":
+      return "\n".join(errors + [res])
 
   if not errors:
     return "success"
