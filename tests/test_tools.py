@@ -83,7 +83,9 @@ def normalize_text(text: str) -> str:
     text = text.replace(f"a{i}: ", "")
   lines = []
   for line in text.split("\n"):
-    lines.append(" ".join(line.split()))
+    # IDA 9.5+ (GarbleNames = 0) keeps the leading '.' on ELF PLT thunk names
+    # (e.g. "call ._Z...") instead of garbling it to '_' ("call __Z...").
+    lines.append(" ".join(line.split()).replace("call ._Z", "call __Z"))
   return "\n".join(lines).strip()
 
 
@@ -1269,37 +1271,57 @@ for ea in (0x10d0, 0x10a0):
     )
     self.assertEqual(result_no_bytes, result)
 
+  @contextlib.asynccontextmanager
+  async def _demangled_names_as_comments(self):
+    """Temporarily sets demangled names to comments (IDA <= 9.4 default).
+
+    IDA 9.5 defaults DemangleNames to DEMNAM_NAME | DEMNAM_GCC3, whereas
+    golden_data.json was recorded with DEMNAM_CMNT | DEMNAM_GCC3.
+    """
+    prev = await self._eval("import idaapi; idaapi.inf_get_demnames()")
+    await self._eval(
+        "import idaapi;"
+        " idaapi.inf_set_demnames(idaapi.DEMNAM_CMNT | idaapi.DEMNAM_GCC3)"
+    )
+    try:
+      yield
+    finally:
+      await self._eval(f"import idaapi; idaapi.inf_set_demnames({prev!r})")
+
   async def verify_disassemble_function(self):
     # Load golden data (callee_func is 0x11e0 to 0x1208)
     golden_path = os.path.join("tests", "golden_data.json")
     with open(golden_path, "r") as f:
       golden = json.load(f)["disassemble_function"]["0x11e0"]
 
-    # Explicit include_bytes=True matches golden
-    result_with_bytes = await self.run_tool(
-        "disassemble_function", address="0x11e0", include_bytes=True
-    )
-    self.assertEqual(normalize_text(result_with_bytes), normalize_text(golden))
+    async with self._demangled_names_as_comments():
+      # Explicit include_bytes=True matches golden
+      result_with_bytes = await self.run_tool(
+          "disassemble_function", address="0x11e0", include_bytes=True
+      )
+      self.assertEqual(
+          normalize_text(result_with_bytes), normalize_text(golden)
+      )
 
-    # Default include_bytes is False
-    result = await self.run_tool("disassemble_function", address="0x11e0")
-    self.assertIsInstance(result, str)
-    self.assertIn("push    rbp", result)
-    self.assertIn("mov     rbp, rsp", result)
-    self.assertNotIn(" 55 ", result)
-    self.assertNotIn(" 48 89 E5 ", result)
+      # Default include_bytes is False
+      result = await self.run_tool("disassemble_function", address="0x11e0")
+      self.assertIsInstance(result, str)
+      self.assertIn("push    rbp", result)
+      self.assertIn("mov     rbp, rsp", result)
+      self.assertNotIn(" 55 ", result)
+      self.assertNotIn(" 48 89 E5 ", result)
 
-    # Explicit include_bytes=False matches default
-    result_no_bytes = await self.run_tool(
-        "disassemble_function", address="0x11e0", include_bytes=False
-    )
-    self.assertEqual(normalize_text(result_no_bytes), normalize_text(result))
+      # Explicit include_bytes=False matches default
+      result_no_bytes = await self.run_tool(
+          "disassemble_function", address="0x11e0", include_bytes=False
+      )
+      self.assertEqual(normalize_text(result_no_bytes), normalize_text(result))
 
-    # Verify opcode setting is restored after include_bytes=False
-    restored = await self.run_tool(
-        "disassemble_function", address="0x11e0", include_bytes=True
-    )
-    self.assertEqual(normalize_text(restored), normalize_text(golden))
+      # Verify opcode setting is restored after include_bytes=False
+      restored = await self.run_tool(
+          "disassemble_function", address="0x11e0", include_bytes=True
+      )
+      self.assertEqual(normalize_text(restored), normalize_text(golden))
 
   async def verify_get_ida_view(self):
     # Load golden data
@@ -1307,32 +1329,35 @@ for ea in (0x10d0, 0x10a0):
     with open(golden_path, "r") as f:
       golden = json.load(f)["ida_view"]["0x11e0_0x120e"]
 
-    # Explicit include_bytes=True matches golden
-    result_with_bytes = await self.run_tool(
-        "get_ida_view", address="0x11e0", count=11, include_bytes=True
-    )
-    self.assertIsInstance(result_with_bytes, str)
-    self.assertEqual(normalize_text(result_with_bytes), normalize_text(golden))
+    async with self._demangled_names_as_comments():
+      # Explicit include_bytes=True matches golden
+      result_with_bytes = await self.run_tool(
+          "get_ida_view", address="0x11e0", count=11, include_bytes=True
+      )
+      self.assertIsInstance(result_with_bytes, str)
+      self.assertEqual(
+          normalize_text(result_with_bytes), normalize_text(golden)
+      )
 
-    # Default include_bytes is False
-    result = await self.run_tool(
-        "get_ida_view", address="0x11e0", count=11
-    )
-    self.assertIsInstance(result, str)
-    self.assertIn("push    rbp", result)
-    self.assertNotIn(" 55 ", result)
+      # Default include_bytes is False
+      result = await self.run_tool(
+          "get_ida_view", address="0x11e0", count=11
+      )
+      self.assertIsInstance(result, str)
+      self.assertIn("push    rbp", result)
+      self.assertNotIn(" 55 ", result)
 
-    # Explicit include_bytes=False matches default
-    result_no_bytes = await self.run_tool(
-        "get_ida_view", address="0x11e0", count=11, include_bytes=False
-    )
-    self.assertEqual(normalize_text(result_no_bytes), normalize_text(result))
+      # Explicit include_bytes=False matches default
+      result_no_bytes = await self.run_tool(
+          "get_ida_view", address="0x11e0", count=11, include_bytes=False
+      )
+      self.assertEqual(normalize_text(result_no_bytes), normalize_text(result))
 
-    # Verify opcode/bytes setting is restored after include_bytes=False
-    restored = await self.run_tool(
-        "get_ida_view", address="0x11e0", count=11, include_bytes=True
-    )
-    self.assertEqual(normalize_text(restored), normalize_text(golden))
+      # Verify opcode/bytes setting is restored after include_bytes=False
+      restored = await self.run_tool(
+          "get_ida_view", address="0x11e0", count=11, include_bytes=True
+      )
+      self.assertEqual(normalize_text(restored), normalize_text(golden))
 
   async def verify_get_stack_frame_variables(self):
     # Load golden data
@@ -2579,13 +2604,14 @@ for ea in (0x10d0, 0x10a0):
       self.assertNotEqual(deleted, original[0])
       self.assertTrue(deleted.endswith("_4058"), deleted)
 
-      # IDA replaces invalid characters; the result says what was stored.
+      # IDA rewrites leading digits and control characters even when
+      # GarbleNames = 0 (IDA 9.5+ default); the result says what was stored.
       result = await self.run_tool(
           "rename_addresses",
-          reqs=[{"address": "0x405c", "new_name": "1 bad name!"}],
+          reqs=[{"address": "0x405c", "new_name": "1\tbad\tname"}],
       )
-      self.assertIn("_1_bad_name_", result)
-      self.assertEqual((await self._eval(get_names))[1], "_1_bad_name_")
+      self.assertIn("_1_bad_name", result)
+      self.assertEqual((await self._eval(get_names))[1], "_1_bad_name")
     finally:
       result = await self.run_tool(
           "rename_addresses",
