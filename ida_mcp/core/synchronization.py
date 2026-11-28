@@ -33,6 +33,7 @@ from typing import Any, Callable
 
 import ida_auto
 import ida_kernwin
+from ida_mcp.core import change_log
 from ida_mcp.core import ida_thread
 from ida_mcp.core.decorators import cancellation_profile
 from ida_mcp.core.decorators import get_cancellation_token
@@ -178,6 +179,8 @@ class _IDACall:
       # does not count.
       with cancellation_profile(
           self.token, native_ida_cancel=True, timeout=self.timeout
+      ), change_log.attribute(
+          getattr(self.ff, "__name__", "unknown")
       ):
         self.result = self.ff()
         self.success = True
