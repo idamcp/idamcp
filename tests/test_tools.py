@@ -354,6 +354,7 @@ class TestIDAMCP(unittest.IsolatedAsyncioTestCase):
         self.verify_sql_entries_table,
         self.verify_local_types_sync,
         self.verify_safe_eval,
+        self.verify_eval_structured_result,
         self.verify_function_address_is_function_start,
         self.verify_declare_type_natural_layout,
         self.verify_set_types_reports_failures,
@@ -3932,6 +3933,48 @@ for name in ("LocalTypesSyncRenamed", "LocalTypesSyncUnseen"):
       _safe_eval_math("1 + (2 < 3)")
 
     print("Safe Eval Unit Tests passed successfully.")
+
+  async def verify_eval_structured_result(self):
+    # Default config, parameter omitted: result_type only, no result_json.
+    res = await self.run_tool("idapython_eval", code="1 + 1")
+    self.assertEqual(res["result"], "2")
+    self.assertEqual(res["result_type"], "int")
+    self.assertNotIn("result_json", res)
+
+    # Per-call parameter.
+    res = await self.run_tool(
+        "idapython_eval",
+        code="{'n': len(list(idautils.Functions())) > 0, 't': (1, 2)}",
+        return_json=True,
+    )
+    self.assertEqual(res["result_type"], "dict")
+    self.assertEqual(res["result_json"], {"n": True, "t": [1, 2]})
+    self.assertIsInstance(res["result"], str)
+
+    res = await self.run_tool(
+        "idapython_eval",
+        code="ida_funcs.get_func(next(iter(idautils.Functions())))",
+        return_json=True,
+    )
+    self.assertEqual(res["result_type"], "ida_funcs.func_t")
+    self.assertNotIn("result_json", res)
+    self.assertIn("not JSON serializable", res["result_json_error"])
+
+    # Config fallback when the parameter is omitted, and explicit override.
+    toggle = (
+        "from shared.config import load_config\n"
+        "load_config()['eval_result_json'] = {}"
+    )
+    await self.run_tool("idapython_eval", code=toggle.format(True))
+    try:
+      res = await self.run_tool("idapython_eval", code="[1, 2]")
+      self.assertEqual(res["result_json"], [1, 2])
+      res = await self.run_tool(
+          "idapython_eval", code="[1, 2]", return_json=False
+      )
+      self.assertNotIn("result_json", res)
+    finally:
+      await self.run_tool("idapython_eval", code=toggle.format(False))
 
   async def verify_safe_eval_via_patch_assembly(self):
     # 1. Switch to ARM64 database

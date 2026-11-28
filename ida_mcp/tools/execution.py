@@ -28,6 +28,7 @@ from collections.abc import Awaitable, Callable
 import contextlib
 import inspect
 import io
+import json
 import sys
 import traceback
 from typing import Annotated, Any, Dict
@@ -47,6 +48,7 @@ _base_globals: Dict[str, Any] = {}
 _persistent_globals: Dict[str, Any] = {}
 _CANCEL_EXC_NAME = "__idamcp_cancelled_error__"
 _USER_CODE_FILENAME = "<idapython_eval>"
+_NO_VALUE = object()
 
 
 # Adapted from ida-nexus: _protect_operation_interrupt in ida_nexus/_runtime.py.
@@ -141,6 +143,19 @@ def _type_name(value: Any) -> str:
   return f"{module}.{value_type.__qualname__}"
 
 
+def _to_json_value(value: Any) -> tuple[bool, Any]:
+  """Returns (True, value as JSON would round-trip it) or (False, error).
+
+  Strict: no `default=` fallback and no NaN/Infinity, so only values that are
+  valid JSON as-is are accepted. Tuples become lists and dict keys become
+  strings, exactly as the JSON-RPC layer would send them.
+  """
+  try:
+    return True, json.loads(json.dumps(value, allow_nan=False))
+  except (TypeError, ValueError, RecursionError) as e:
+    return False, f"{type(e).__name__}: {e}"
+
+
 # Adapted from ida-nexus: _invoke_callable in ida_nexus/_runtime.py.
 def _invoke_callable(
     function: Callable[..., Any],
@@ -177,11 +192,12 @@ def _execute_user_code(
     namespace: Dict[str, Any],
     runtime: Dict[str, Any],
     filename: str = _USER_CODE_FILENAME,
+    no_value: Any = None,
 ) -> Any:
   """Compile and execute user Python code with expression/entrypoint/result conventions."""
   stripped = code.strip()
   if not stripped:
-    return None
+    return no_value
 
   module = ast.parse(stripped, filename=filename, mode="exec")
   _protect_cancellation(module)
@@ -237,7 +253,9 @@ def _execute_user_code(
     entrypoint = _find_entrypoint()
     if entrypoint is not None:
       return _invoke_callable(entrypoint, runtime)
-    return namespace.get("result")
+    if "result" in namespace:
+      return namespace["result"]
+    return no_value
   finally:
     namespace.pop("result", None)
 
@@ -528,12 +546,21 @@ def idapython_eval(
         " the output printed so far. Time spent waiting for other tool calls to"
         " finish does not count.",
     ] = 360.0,
+    return_json: Annotated[
+        bool | None,
+        "Also return the value of the last expression as native JSON in"
+        " result_json (or the reason it can't be, in result_json_error)."
+        " Omit to use the server's eval_result_json setting (off by default).",
+    ] = None,
 ) -> Dict[str, Any]:
   """Execute Python code in IDA context.
 
   Returns dict with result/result_type/stdout/stderr: result is str() of the
   value, and result_type its type, e.g. "int" or "ida_funcs.func_t" (both are
-  empty if the code raises). Has access to all IDA API modules.
+  empty if the code raises). With return_json=True (or the eval_result_json
+  config option when return_json is omitted), the value is also returned as
+  native JSON in result_json (or the reason it isn't JSON in result_json_error).
+  Has access to all IDA API modules.
   Supports Jupyter-style evaluation (returns the value of the last expression).
   Each call runs in a fresh namespace unless persist_globals is set; objects
   that must outlive the call (hooks, timers, callbacks) need persist_globals.
@@ -543,6 +570,11 @@ def idapython_eval(
   a file.
   """
   del timeout  # Enforced by @idawrite.
+  if return_json is None:
+    # pylint: disable-next=g-import-not-at-top
+    from shared.config import load_config as _load_config
+
+    return_json = bool(_load_config().get("eval_result_json"))
   namespace = _prepare_namespace(persist_globals)
 
   stdout_capture = _output_capture("stdout")
@@ -550,6 +582,7 @@ def idapython_eval(
   traceback_text = ""
   result_text = ""
   result_type = ""
+  json_result: tuple[bool, Any] | None = None
 
   try:
     try:
@@ -562,13 +595,19 @@ def idapython_eval(
             namespace,
             namespace,
             filename=_USER_CODE_FILENAME,
+            no_value=_NO_VALUE,
         )
-        if inspect.isawaitable(result_value):
+        has_value = result_value is not _NO_VALUE
+        if not has_value:
+          result_value = None
+        elif inspect.isawaitable(result_value):
           result_value = asyncio.run(_await(result_value))
         # Stringify before the namespace is cleared, since __str__ may use
         # globals defined by the snippet.
         result_text = str(result_value)
         result_type = _type_name(result_value)
+        if return_json and has_value:
+          json_result = _to_json_value(result_value)
     except (Exception, SystemExit) as exc:  # pylint: disable=broad-exception-caught
       # Catch both Exception and SystemExit so `sys.exit()` in user scripts is
       # reported cleanly in stderr instead of terminating the worker/GUI thread.
@@ -619,9 +658,13 @@ def idapython_eval(
   stderr = stderr_capture.getvalue()
   if traceback_text and stderr and not stderr.endswith("\n"):
     stderr += "\n"
-  return {
+  output: Dict[str, Any] = {
       "result": result_text,
       "result_type": result_type,
       "stdout": stdout_capture.getvalue(),
       "stderr": stderr + traceback_text,
   }
+  if json_result is not None:
+    ok, value = json_result
+    output["result_json" if ok else "result_json_error"] = value
+  return output

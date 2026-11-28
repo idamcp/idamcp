@@ -80,6 +80,7 @@ _DEFAULT_CONFIG = {
     # grows past the limit.
     "max_tool_response_bytes": "8m",
     "max_eval_output_bytes": "1m",
+    "eval_result_json": False,
 }
 _SIZE_OPTIONS = ("max_tool_response_bytes", "max_eval_output_bytes")
 # Binary multiples, as in most size settings ("8m" is 8 MiB).
@@ -249,6 +250,7 @@ def load_config(config_path: str | None = None) -> dict[str, Any]:
   _set_option_from_env(config, "always_visible_tools")
   _set_option_from_env(config, "show_decompiler_warnings")
   _set_option_from_env(config, "omitted_decompiler_warnings")
+  _set_option_from_env(config, "eval_result_json")
 
   # Size options take a string with a unit, so they are read from the
   # environment as is and parsed together with the config file's value. They

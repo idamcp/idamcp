@@ -274,7 +274,8 @@ example of all available settings (showing defaults):
   "show_decompiler_warnings": false,
   "omitted_decompiler_warnings": ["WARN_GUESSED_TYPE", "WARN_UNDEF_LVAR"],
   "max_tool_response_bytes": "8m",
-  "max_eval_output_bytes": "1m"
+  "max_eval_output_bytes": "1m",
+  "eval_result_json": false
 }
 ```
 
@@ -392,6 +393,14 @@ example of all available settings (showing defaults):
     with the first part of the value. `0` means no limit. Keep it well below
     `max_tool_response_bytes`: JSON escaping can double the size of
     escape-heavy output. Defaults to `"1m"`.
+*   **eval_result_json**: Default for the `return_json` parameter of
+    `idapython_eval`, used when a call omits it. When enabled, `idapython_eval`
+    also returns the value of the last expression as native JSON in
+    `result_json` (tuples become lists, dict keys become strings). If the value
+    is not valid JSON (for example an IDA object, or NaN), `result_json_error`
+    says why instead. `result` stays a string either way. Off by default
+    because JSON-valued results would otherwise be sent twice. Agents can
+    enable it per call with `return_json=true` without changing this setting.
 
 </details>
 
@@ -432,6 +441,8 @@ example of all available settings (showing defaults):
     with a comma-separated list of warning names (e.g., `WARN_GUESSED_TYPE`
     to show "possibly undefined" warnings too); an empty value shows all
     warnings.
+*   **EVAL_RESULT_JSON**: Set to `true`, `1`, or `yes` to enable
+    `eval_result_json`.
 
 </details>
 
