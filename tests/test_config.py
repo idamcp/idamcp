@@ -197,6 +197,17 @@ class TestConfig(unittest.TestCase):
       config = shared.config.load_config(config_path="/nonexistent")
       self.assertTrue(config.get("gui_undo_points"))
 
+  def test_gui_refresh_views_default(self):
+    """Test gui_refresh_views is on by default."""
+    config = shared.config.load_config(config_path="/nonexistent")
+    self.assertTrue(config.get("gui_refresh_views"))
+
+  def test_gui_refresh_views_env(self):
+    """Test GUI_REFRESH_VIEWS environment variable."""
+    with mock.patch.dict("os.environ", {"GUI_REFRESH_VIEWS": "0"}):
+      config = shared.config.load_config(config_path="/nonexistent")
+      self.assertFalse(config.get("gui_refresh_views"))
+
   def test_autostart_and_hotkey_defaults(self):
     """Test autostart is off and the hotkey is Ctrl-Alt-M by default."""
     config = shared.config.load_config(config_path="/nonexistent")
