@@ -2924,7 +2924,7 @@
           "tags": []
         }
       },
-      "description": "Execute Python code in IDA context.\n\nReturns dict with result/result_type/stdout/stderr: result is str() of the\nvalue, and result_type its type, e.g. \"int\" or \"ida_funcs.func_t\" (both are\nempty if the code raises). Has access to all IDA API modules.\nSupports Jupyter-style evaluation (returns the value of the last expression).\nEach call runs in a fresh namespace unless persist_globals is set; objects\nthat must outlive the call (hooks, timers, callbacks) need persist_globals.\nstdout, stderr, and result are each limited to max_eval_output_bytes (1 MiB\nby default): code that prints more is stopped, and the call fails with an\nerror that includes the output so far. Print less, or write large output to\na file.",
+      "description": "Execute Python code in IDA context.\n\nReturns dict with result/result_type/stdout/stderr: result is str() of the\nvalue, and result_type its type, e.g. \"int\" or \"ida_funcs.func_t\" (both are\nempty if the code raises). With return_json=True (or the eval_result_json\nconfig option when return_json is omitted), the value is also returned as\nnative JSON in result_json (or the reason it isn't JSON in result_json_error).\nHas access to all IDA API modules.\nSupports Jupyter-style evaluation (returns the value of the last expression).\nEach call runs in a fresh namespace unless persist_globals is set; objects\nthat must outlive the call (hooks, timers, callbacks) need persist_globals.\nstdout, stderr, and result are each limited to max_eval_output_bytes (1 MiB\nby default): code that prints more is stopped, and the call fails with an\nerror that includes the output so far. Print less, or write large output to\na file.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -2940,6 +2940,18 @@
             "default": false,
             "description": "If true, the code runs in one namespace shared by all callers, so variables, functions, and imports persist across calls and are visible to every agent. If false, the code runs in a fresh namespace that is discarded after the call.",
             "type": "boolean"
+          },
+          "return_json": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Also return the value of the last expression as native JSON in result_json (or the reason it can't be, in result_json_error). Omit to use the server's eval_result_json setting (off by default)."
           },
           "timeout": {
             "default": 360.0,
