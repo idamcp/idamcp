@@ -58,6 +58,8 @@ from pydantic import AliasChoices
 from pydantic import BaseModel
 from pydantic import ConfigDict
 from pydantic import Field
+from gateway import crash_recovery
+from gateway.crash_recovery import CrashRecovery
 from shared import load_options
 from shared import registry
 from shared.config import load_config
@@ -131,6 +133,13 @@ class DatabaseInfo(Metadata):
           bool,
           "Whether the database is currently busy executing a tool or"
           " running its auto-analysis",
+      ]
+  ]
+  crash_recovery: NotRequired[
+      Annotated[
+          CrashRecovery,
+          "Present only when crash leftovers were found and handled while"
+          " opening; message says what happened to unsaved changes",
       ]
   ]
 
@@ -397,6 +406,13 @@ class HeadlessManager:
           " using idalib_headless_close before opening a new one."
       )
 
+    try:
+      spawn_path, recovery = crash_recovery.prepare(
+          path, str(CONFIG.get("crash_recovery", crash_recovery.DEFAULT_MODE))
+      )
+    except crash_recovery.RecoveryError as e:
+      raise ToolError(str(e)) from e
+
     self._pending_spawns += 1
     try:
       # Determine command
@@ -422,7 +438,7 @@ class HeadlessManager:
           python_path,
           "-m",
           "ida_mcp.headless",
-          path,
+          spawn_path,
           *options.to_cli(),
           *(["--disable-auto-analysis"] if disable_auto_analysis else []),
           stdin=asyncio.subprocess.DEVNULL,
@@ -575,6 +591,8 @@ class HeadlessManager:
     # As in list_available_databases: no tool call is under way yet, so the
     # database is busy only while it is still being analysed.
     metadata["busy"] = info["auto_analysis_status"] == "in_progress"
+    if recovery is not None:
+      metadata["crash_recovery"] = recovery
     return metadata
 
   async def _wait_for_analysis(

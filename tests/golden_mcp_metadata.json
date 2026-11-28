@@ -2854,6 +2854,33 @@
           "busy": {
             "type": "boolean"
           },
+          "crash_recovery": {
+            "description": "What was done about crash leftovers found before opening.",
+            "properties": {
+              "action": {
+                "enum": [
+                  "backup",
+                  "prefer_unpacked"
+                ],
+                "type": "string"
+              },
+              "backup_path": {
+                "type": "string"
+              },
+              "message": {
+                "type": "string"
+              },
+              "packed_database": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "action",
+              "backup_path",
+              "message"
+            ],
+            "type": "object"
+          },
           "crc32": {
             "type": "string"
           },
@@ -3030,6 +3057,33 @@
                 },
                 "busy": {
                   "type": "boolean"
+                },
+                "crash_recovery": {
+                  "description": "What was done about crash leftovers found before opening.",
+                  "properties": {
+                    "action": {
+                      "enum": [
+                        "backup",
+                        "prefer_unpacked"
+                      ],
+                      "type": "string"
+                    },
+                    "backup_path": {
+                      "type": "string"
+                    },
+                    "message": {
+                      "type": "string"
+                    },
+                    "packed_database": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "action",
+                    "backup_path",
+                    "message"
+                  ],
+                  "type": "object"
                 },
                 "crc32": {
                   "type": "string"
