@@ -46,6 +46,9 @@ from fastmcp.server.transforms.search import serialize_tools_for_output_markdown
 from fastmcp.tools import Tool
 from fastmcp.tools import ToolResult
 
+from gateway.trace import trace_logger_from_config
+from gateway.trace import TraceLogger
+
 try:
   # FastMCP 4 ships the MCP types as mcp_types; FastMCP 3 uses the mcp SDK,
   # which in both cases provides the same classes under mcp.types.
@@ -81,6 +84,8 @@ logging.basicConfig(level=logging.ERROR)
 CONFIG = load_config()
 REGISTRY_DIR = pathlib.Path(CONFIG["registry_dir"])
 UDS_DIR = pathlib.Path(CONFIG["uds_dir"])
+# JSONL trace of forwarded tool calls; None unless `trace_dir` is configured.
+TRACE: TraceLogger | None = trace_logger_from_config(CONFIG)
 
 
 def _cleanup_stale_registry_file(
@@ -995,6 +1000,50 @@ class RegistryEventHandler(FileSystemEventHandler):
 
 async def forward_to(target: str, tool_name: str, args: dict[str, Any]) -> Any:
   """Forwards a tool call to the running backend server."""
+  trace = TRACE
+  if trace is None:
+    return await _forward_to_backend(target, tool_name, args)
+
+  call_id = trace.new_call_id()
+  start = time.monotonic()
+  fields = {
+      "call_id": call_id,
+      "tool": tool_name,
+      "database_id": target,
+      "args": {k: v for k, v in args.items() if k != "database_id"},
+  }
+  try:
+    result = await _forward_to_backend(target, tool_name, args)
+  except asyncio.CancelledError:
+    trace.emit(
+        "tool_call",
+        **fields,
+        duration_ms=round((time.monotonic() - start) * 1000, 1),
+        outcome="cancelled",
+    )
+    raise
+  except Exception as e:
+    trace.emit(
+        "tool_call",
+        **fields,
+        duration_ms=round((time.monotonic() - start) * 1000, 1),
+        outcome="error",
+        error=str(e),
+    )
+    raise
+  trace.emit(
+      "tool_call",
+      **fields,
+      duration_ms=round((time.monotonic() - start) * 1000, 1),
+      outcome="ok",
+  )
+  return result
+
+
+async def _forward_to_backend(
+    target: str, tool_name: str, args: dict[str, Any]
+) -> Any:
+  """Sends a tool call to the backend over RPC and maps errors to ToolError."""
   logging.info(
       "[Gateway] forward_to started for target=%s, tool=%s", target, tool_name
   )

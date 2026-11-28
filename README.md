@@ -274,7 +274,8 @@ example of all available settings (showing defaults):
   "show_decompiler_warnings": false,
   "omitted_decompiler_warnings": ["WARN_GUESSED_TYPE", "WARN_UNDEF_LVAR"],
   "max_tool_response_bytes": "8m",
-  "max_eval_output_bytes": "1m"
+  "max_eval_output_bytes": "1m",
+  "trace_dir": ""
 }
 ```
 
@@ -392,6 +393,17 @@ example of all available settings (showing defaults):
     with the first part of the value. `0` means no limit. Keep it well below
     `max_tool_response_bytes`: JSON escaping can double the size of
     escape-heavy output. Defaults to `"1m"`.
+*   **trace_dir**: If set, the Gateway writes one JSON line per forwarded tool
+    call (tool, `database_id`, arguments with strings truncated to 256
+    characters, duration, outcome, error message) to
+    `<trace_dir>/gateway-<UTC timestamp>-<id>.jsonl`. Results are not recorded.
+    Files are created with mode `0600`. Empty (the default) disables tracing.
+    For bug reports, `python3 install.py logs` (or `python3 -m gateway.logs`)
+    writes `idamcp-logs-<timestamp>.zip` with these traces, the headless
+    backend logs (`<tmp>/idamcp_backend_*.log`), the registry entries, the
+    effective configuration (known options only) and environment information.
+    It works while the Gateway is stopped. The files can contain file paths,
+    tool arguments and backend output; review the archive before sharing it.
 
 </details>
 
@@ -432,6 +444,8 @@ example of all available settings (showing defaults):
     with a comma-separated list of warning names (e.g., `WARN_GUESSED_TYPE`
     to show "possibly undefined" warnings too); an empty value shows all
     warnings.
+*   **TRACE_DIR**: Directory for the Gateway's JSONL tool-call trace (see
+    `trace_dir`).
 
 </details>
 
